@@ -1,0 +1,397 @@
+name: Build macOS Plugin
+
+on:
+  push:
+    branches: [ main, master, ranroby76/supabase ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  PLUGIN_NAME: "Grex"
+  PLUGIN_VERSION: "1.0.0"
+  # JUCE 9.0.1 - the release the Windows build already uses.  Pinned, not
+  # tracking a branch: JUCE point releases have moved text-measuring and
+  # GlyphArrangement APIs before now, so a version bump must be one we chose.
+  # (villain-vst pins 8.0.12 the same way; Grex is simply further forward.)
+  JUCE_VERSION: "9.0.1"
+
+jobs:
+  build_mac_plugin:
+    name: Build macOS VST3 + AU + CLAP
+    runs-on: macos-15
+
+    env:
+      # SIGNING_ENABLED must be set HERE, at job level, not in the workflow-level
+      # env block above.  The `secrets` context is not available to
+      # workflow-level env, nor to a step's `if:` condition - mirroring the
+      # secret into a job env var is the only way to branch on "do we have a
+      # certificate".  Every signing step below tests this, so a run with no
+      # secrets configured still builds and still uploads a DMG.
+      SIGNING_ENABLED: ${{ secrets.MACOS_CERTIFICATE }}
+      KEYCHAIN_PASSWORD: "actions-keychain-pw"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install Dependencies
+        run: |
+          brew install ninja
+          brew install cmake || brew upgrade cmake
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      # JUCE and CLAP both land under libs/, which is the layout villain-vst
+      # uses and the layout the CMakeLists autodetects.  Because the paths match
+      # what a local Windows checkout has, no -D flags are strictly needed -
+      # they are passed anyway so the log states plainly what was used.
+      - name: Clone JUCE
+        run: |
+          git clone --depth 1 --branch ${{ env.JUCE_VERSION }} https://github.com/juce-framework/JUCE.git libs/JUCE
+          echo "JUCE ${{ env.JUCE_VERSION }} -> libs/JUCE"
+
+      # --recursive is REQUIRED: clap and clap-helpers are submodules of
+      # clap-juce-extensions, and clap_juce_extensions_plugin() fails at
+      # configure time without them.
+      - name: Setup CLAP Extensions
+        run: |
+          git clone --recursive https://github.com/free-audio/clap-juce-extensions.git libs/CLAP_Extensions
+          echo "CLAP extensions -> libs/CLAP_Extensions"
+
+      - name: Verify Assets Are Present
+        run: |
+          # juce_add_binary_data ABORTS THE WHOLE BUILD if it cannot open a
+          # listed source, and the error names no file.  Failing here instead
+          # turns "mystery build failure" into a list of what is missing.
+          MISSING=0
+
+          for f in "assets/back.png" "assets/icon.ico"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing $f"
+              MISSING=1
+            fi
+          done
+
+          if [ ! -d "assets/instrumet images" ]; then
+            echo "::error::missing 'assets/instrumet images' folder (note the spelling - it must match the CMakeLists exactly)"
+            MISSING=1
+          else
+            COUNT=$(find "assets/instrumet images" -maxdepth 1 -name "*.png" | wc -l | tr -d ' ')
+            echo "instrument/kit images found: $COUNT"
+          fi
+
+          # EXISTS-checked in CMake, so these are warnings not errors: a missing
+          # one means a slot shows no picture, not a broken build.
+          for f in "assets/SP_WORLD.png" "assets/SP_ORIENTAL.png"; do
+            if [ ! -f "$f" ]; then
+              echo "::warning::$f not found - that pack will show no picture"
+            fi
+          done
+
+          if [ "$MISSING" = "1" ]; then
+            echo "Assets tree as checked out:"
+            ls -la assets || true
+            exit 1
+          fi
+
+      - name: Import Signing Certificate
+        if: ${{ env.SIGNING_ENABLED != '' }}
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > certificate.p12
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+
+          security import certificate.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,productsign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+
+          echo "Available signing identities:"
+          security find-identity -v -p codesigning build.keychain
+
+          rm certificate.p12
+
+      # ONE configure, all three formats.  villain-vst splits VST3+CLAP from AU
+      # into two build trees, but it HAS to: its CMakeLists gates each format
+      # behind its own option and its AU pass deliberately turns CLAP off.
+      # Grex has no such switches - juce_add_plugin takes FORMATS VST3 AU and
+      # clap_juce_extensions_plugin adds the CLAP target beside them - so a
+      # second full configure would just compile 55k lines a second time.
+      #
+      # ASIO is not passed: the CMakeLists wraps that whole block in if(WIN32),
+      # so a macOS configure never looks for the SDK.
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DJUCE_DIR="${{ github.workspace }}/libs/JUCE" \
+            -DCLAP_EXTENSIONS_DIR="${{ github.workspace }}/libs/CLAP_Extensions" \
+            -DBETELGEUSE_ASSETS_PATH="${{ github.workspace }}/assets"
+
+      - name: Build Plugin
+        run: cmake --build build --config Release --parallel
+
+      # PRODUCT_NAME is "Grex" but the CMake target is BetelgeuseArranger, so
+      # the artefacts FOLDER carries the target name while the BUNDLES carry the
+      # product name.  That mismatch is exactly what a hard-coded path gets
+      # wrong, hence the find.
+      - name: Verify Builds
+        id: find_plugins
+        run: |
+          echo "=== Build artefacts tree ==="
+          find build \( -name "*.vst3" -o -name "*.clap" -o -name "*.component" \) | head -20
+
+          FAIL=0
+
+          VST3_PATH=$(find build -type d -name "Grex.vst3" | head -1)
+          AU_PATH=$(find build -type d -name "Grex.component" | head -1)
+          CLAP_PATH=$(find build -maxdepth 6 -name "Grex.clap" | head -1)
+
+          echo "VST3_PATH=$VST3_PATH" >> $GITHUB_OUTPUT
+          echo "AU_PATH=$AU_PATH"     >> $GITHUB_OUTPUT
+          echo "CLAP_PATH=$CLAP_PATH" >> $GITHUB_OUTPUT
+
+          arch_of() {
+            BIN=$(find "$1/Contents/MacOS" -type f 2>/dev/null | head -1)
+            if [ -n "$BIN" ]; then
+              lipo -info "$BIN"
+            else
+              echo "  (no binary found inside $1)"
+            fi
+          }
+
+          if [ -n "$VST3_PATH" ]; then
+            echo "VST3 found: $VST3_PATH"
+            arch_of "$VST3_PATH"
+          else
+            echo "::error::VST3 NOT found"
+            FAIL=1
+          fi
+
+          if [ -n "$AU_PATH" ]; then
+            echo "AU found: $AU_PATH"
+            arch_of "$AU_PATH"
+          else
+            echo "::error::AU NOT found"
+            FAIL=1
+          fi
+
+          if [ -n "$CLAP_PATH" ]; then
+            echo "CLAP found: $CLAP_PATH"
+            if [ -d "$CLAP_PATH/Contents/MacOS" ]; then
+              arch_of "$CLAP_PATH"
+            fi
+          else
+            echo "::warning::CLAP not found (non-critical)"
+          fi
+
+          if [ "$FAIL" = "1" ]; then
+            exit 1
+          fi
+
+      - name: Create Entitlements File
+        run: |
+          cat > entitlements.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.cs.allow-jit</key>
+              <true/>
+              <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+              <true/>
+              <key>com.apple.security.cs.disable-library-validation</key>
+              <true/>
+              <key>com.apple.security.device.audio-input</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+          echo "Created entitlements.plist"
+
+      # Written out as a script so the retry action below can re-run the whole
+      # sign + notarize + staple sequence.  Apple's notary service times out or
+      # 500s often enough that a single-shot submission is the commonest reason
+      # one of these workflows goes red on a build that was actually fine -
+      # which is why villain-vst wraps it in a retry too.
+      - name: Create Notarization Script
+        if: ${{ env.SIGNING_ENABLED != '' }}
+        env:
+          VST3_PATH: ${{ steps.find_plugins.outputs.VST3_PATH }}
+          AU_PATH: ${{ steps.find_plugins.outputs.AU_PATH }}
+          CLAP_PATH: ${{ steps.find_plugins.outputs.CLAP_PATH }}
+        run: |
+          # First heredoc is UNQUOTED so the paths are baked in as literals.
+          cat > notarize_all.sh << EOF
+          #!/bin/bash
+          set -e
+          VST3_PATH="${VST3_PATH}"
+          AU_PATH="${AU_PATH}"
+          CLAP_PATH="${CLAP_PATH}"
+          KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD}"
+          EOF
+
+          # Second heredoc is QUOTED so nothing else expands now - APPLE_ID and
+          # friends must be read from the environment at RUN time, which is
+          # where the retry action supplies them.
+          cat >> notarize_all.sh << 'EOF'
+
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security list-keychains -d user -s build.keychain
+
+          IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | grep -o '"[^"]*"' | sed 's/"//g')
+
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No Developer ID Application certificate found"
+            security find-identity -v -p codesigning build.keychain
+            exit 1
+          fi
+
+          echo "Signing with: $IDENTITY"
+
+          sign_and_notarize() {
+            BUNDLE="$1"
+            ZIP_NAME="$2"
+
+            if [ -z "$BUNDLE" ] || [ ! -e "$BUNDLE" ]; then
+              echo "skip $ZIP_NAME (not built)"
+              return 0
+            fi
+
+            NAME=$(basename "$BUNDLE")
+            echo "=== Processing $NAME ==="
+
+            # Inner binaries first, outermost last.  A bundle signature covers
+            # what is inside it, so signing the outside first would be
+            # invalidated by every inner signature that followed.
+            find "$BUNDLE" -type f \( -name "*.dylib" -o -name "*.so" \) \
+              -exec codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp --entitlements entitlements.plist {} \;
+
+            find "$BUNDLE" -type d -name "*.framework" \
+              -exec codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp {} \;
+
+            codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp --entitlements entitlements.plist "$BUNDLE"
+            codesign --verify --strict --verbose=2 "$BUNDLE"
+
+            /usr/bin/ditto -c -k --keepParent "$BUNDLE" "$ZIP_NAME"
+
+            xcrun notarytool submit "$ZIP_NAME" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$TEAM_ID" \
+              --wait
+
+            # Staple the BUNDLE, not only the disk image.  A stapled bundle
+            # stays notarised after someone drags it out of the DMG, which is
+            # exactly what every user does with a plugin.
+            xcrun stapler staple "$BUNDLE"
+            echo "$NAME done"
+          }
+
+          sign_and_notarize "$VST3_PATH" "Grex_VST3.zip"
+          sign_and_notarize "$AU_PATH"   "Grex_AU.zip"
+          sign_and_notarize "$CLAP_PATH" "Grex_CLAP.zip"
+          EOF
+
+          chmod +x notarize_all.sh
+          echo "--- notarize_all.sh header ---"
+          head -8 notarize_all.sh
+
+      - name: Sign & Notarize All with Retry
+        if: ${{ env.SIGNING_ENABLED != '' }}
+        uses: nick-fields/retry@v3
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_USERNAME }}
+          APPLE_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          retry_wait_seconds: 60
+          command: ./notarize_all.sh
+
+      - name: Create DMG
+        env:
+          VST3_PATH: ${{ steps.find_plugins.outputs.VST3_PATH }}
+          AU_PATH: ${{ steps.find_plugins.outputs.AU_PATH }}
+          CLAP_PATH: ${{ steps.find_plugins.outputs.CLAP_PATH }}
+        run: |
+          mkdir -p dmg_contents/VST3 dmg_contents/AU dmg_contents/CLAP
+
+          if [ -n "$VST3_PATH" ]; then
+            cp -R "$VST3_PATH" dmg_contents/VST3/
+          fi
+
+          if [ -n "$AU_PATH" ]; then
+            cp -R "$AU_PATH" dmg_contents/AU/
+          fi
+
+          if [ -n "$CLAP_PATH" ] && [ -e "$CLAP_PATH" ]; then
+            cp -R "$CLAP_PATH" dmg_contents/CLAP/
+          else
+            rmdir dmg_contents/CLAP
+          fi
+
+          cat > dmg_contents/README.txt << 'README'
+          Grex - Fanan Team
+          =================
+
+          Drag each plugin to its install location:
+
+          VST3  ->  /Library/Audio/Plug-Ins/VST3/
+          AU    ->  /Library/Audio/Plug-Ins/Components/
+          CLAP  ->  /Library/Audio/Plug-Ins/CLAP/
+
+          Then restart your DAW.
+          README
+
+          hdiutil create \
+            -volname "Grex v${PLUGIN_VERSION}" \
+            -srcfolder dmg_contents \
+            -ov -format UDZO \
+            "Grex_Mac_v${PLUGIN_VERSION}.dmg"
+
+          ls -lh "Grex_Mac_v${PLUGIN_VERSION}.dmg"
+
+      - name: Notarize & Staple DMG
+        if: ${{ env.SIGNING_ENABLED != '' }}
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_USERNAME }}
+          APPLE_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+        run: |
+          # The bundles inside are already stapled; notarising the DMG itself
+          # as well is what stops Gatekeeper warning on the download.
+          xcrun notarytool submit "Grex_Mac_v${PLUGIN_VERSION}.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$TEAM_ID" \
+            --wait
+
+          xcrun stapler staple "Grex_Mac_v${PLUGIN_VERSION}.dmg"
+          xcrun stapler validate "Grex_Mac_v${PLUGIN_VERSION}.dmg"
+          echo "DMG is signed, notarized, and stapled"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Grex-Mac-v${{ env.PLUGIN_VERSION }}
+          path: Grex_Mac_v*.dmg
+          if-no-files-found: error
+
+      - name: Cleanup Keychain
+        if: always()
+        run: security delete-keychain build.keychain 2>/dev/null || true

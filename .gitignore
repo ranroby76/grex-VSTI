@@ -1,0 +1,104 @@
+# ============================================================================
+# Grex VSTi - what does NOT belong in the repository
+#
+# The repo needs exactly three things to build on CI: CMakeLists.txt, src/ and
+# assets/.  Everything below is either generated, downloaded, huge, or private.
+# ============================================================================
+
+# ---- Build output ----------------------------------------------------------
+build/
+build_*/
+out/
+x64/
+Debug/
+Release/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*_artefacts/
+
+# ---- IDE / editor ----------------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# ---- Dependencies fetched at build time ------------------------------------
+# The workflow git-clones both of these into libs/ on every run, and locally
+# they are your own checkouts.  Committing them would add hundreds of MB and
+# then go stale.
+libs/
+JUCE/
+ASIOSDK/
+
+# ---- JUCE generated --------------------------------------------------------
+**/JuceLibraryCode/
+
+# ---- SAMPLE AND STYLE LIBRARIES - never commit ------------------------------
+# These are the two that would actually break the repository.  The .frb blobs
+# and the Yamaha style library are hundreds of MB and are content, not code.
+sounds/
+styles/
+Sounds/
+Styles/
+*.frb
+*.sfz
+*.sty
+*.STY
+*.prs
+*.PRS
+
+# ---- Runtime data the plugin writes into the project root -------------------
+# GrexPaths and the diagnostic writers both land here, so this folder appears
+# on any machine the plugin has actually been run on.
+Grex VSTI/
+instruments_presets/
+style_instruments_presets/
+sets/
+*.bset
+*.ins
+*.sins
+*.drm
+
+# ---- Plugin-written settings / diagnostics ---------------------------------
+grex_*.xml
+grex_*.txt
+grex_license.key
+
+# ---- Packaged artefacts ----------------------------------------------------
+*.zip
+*.7z
+*.rar
+*.exe
+*.msi
+*.dmg
+*.pkg
+*.vst3
+*.clap
+*.component
+
+# ---- Signing material - MUST never be committed ----------------------------
+*.p12
+*.pfx
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*_base64
+mac_cert_base64
+entitlements.plist
+
+# ---- Logs and backups ------------------------------------------------------
+*.log
+backup*/
+*.bak
+*~
+
+# ---- OS noise --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
