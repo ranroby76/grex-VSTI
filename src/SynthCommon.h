@@ -25,7 +25,10 @@ namespace Betel
         enum Stage { Idle, Attack, Hold, Decay, Sustain, Release };
         enum Curve { Exp = 0, Lin = 1, Log = 2 };   // decay/release shape
         Stage stage = Idle;
-        Curve curve = Exp;
+
+        // The curve as a signed exponent — see fallAmount.  `Curve` survives
+        // only as the names of three useful points on it.
+        float curveK = 6.0f;
         float level = 0.0f;
 
         // Attack: exponential overshoot-to-1.5 (Moog-style punch), reaching
@@ -58,19 +61,46 @@ namespace Betel
             return 1.0f - std::exp (-1.0f / ((float) ms * 0.001f * (float) sr));
         }
 
-        // Fraction fallen (0 at segment start, 1 at end) for phase p.
-        static float fallAmount (float p, Curve c)
+        // ── ONE FORMULA, ONE SIGNED EXPONENT ─────────────────────────────
+        //
+        //      fall(p, k) = (1 - e^-kp) / (1 - e^-k)        k != 0
+        //                 = p                               k == 0
+        //
+        // The three hard-coded shapes were exactly three points on this curve,
+        // which is why the change costs nothing in fidelity:
+        //
+        //      Exp  =  k = +6     concave: steep start, gentle tail
+        //      Lin  =  k =  0     constant slope
+        //      Log  =  k = -4     convex: holds near the top, then drops
+        //
+        // Larger POSITIVE k is a TIGHTER release — the note leaves the audible
+        // range earlier as a fraction of the labelled time.  At k=6 it is still
+        // above -40 dB for 73% of the release, which is the "airy" tail; at
+        // k=10 that falls to 46%, at k=14 to 33%.  It still reaches exact
+        // silence at p=1 whatever k is, so the labelled time stays honest.
+        //
+        // Negative k swells instead: the level holds and then drops, which is
+        // what the string/choir/pad families want.
+        static float fallAmount (float p, float k)
         {
             p = juce::jlimit (0.0f, 1.0f, p);
-            switch (c)
-            {
-                case Lin: return p;
-                case Log: // convex: slow start, steep finish — holds then drops
-                    return (std::exp (4.0f * p) - 1.0f) / (std::exp (4.0f) - 1.0f);
-                case Exp:
-                default:  // concave: steep start, gentle finish
-                    return (1.0f - std::exp (-6.0f * p)) / (1.0f - std::exp (-6.0f));
-            }
+
+            // Near zero the exponential form is numerically useless (0/0) and
+            // the answer is simply linear.
+            if (std::abs (k) < 1.0e-3f) return p;
+
+            return (1.0f - std::exp (-k * p)) / (1.0f - std::exp (-k));
+        }
+
+        /** The legacy three-way selector as exponents, for loading old presets
+            and for the panel's EXP / LIN / LOG shortcut buttons. */
+        static constexpr float kCurveExp = 6.0f;
+        static constexpr float kCurveLin = 0.0f;
+        static constexpr float kCurveLog = -4.0f;
+
+        static float legacyCurveToK (int c)
+        {
+            return c == Lin ? kCurveLin : (c == Log ? kCurveLog : kCurveExp);
         }
 
         void noteOn (float attackMs, float holdMs, float decayMs, float sustain, double sr)
@@ -114,7 +144,7 @@ namespace Betel
                 case Decay:
                     segPhase += segInc;
                     if (segPhase >= 1.0) { level = sustainLevel; stage = Sustain; }
-                    else level = segStart + (segEnd - segStart) * fallAmount ((float) segPhase, curve);
+                    else level = segStart + (segEnd - segStart) * fallAmount ((float) segPhase, curveK);
                     break;
                 case Sustain:
                     level = sustainLevel;
@@ -122,7 +152,7 @@ namespace Betel
                 case Release:
                     segPhase += segInc;
                     if (segPhase >= 1.0) { level = 0.0f; stage = Idle; }
-                    else level = segStart + (segEnd - segStart) * fallAmount ((float) segPhase, curve);
+                    else level = segStart + (segEnd - segStart) * fallAmount ((float) segPhase, curveK);
                     break;
                 case Idle:
                     break;
@@ -137,6 +167,31 @@ namespace Betel
     // State Variable Filter (per-voice, per-channel-of-audio)
     // type: 0=LP, 1=HP, 2=BP, 3=Notch
     //==========================================================================
+    // ── THE "NO RESONANCE" VALUE FOR A TONE-SHAPING SVF ──────────────────────
+    //
+    // SVFFilter::process takes `resonance` 0..0.99 and turns it into the damping
+    // term k = 2 - 2 * resonance, where k is 1/Q.  So resonance 0 is NOT the
+    // neutral setting it reads as - it is k = 2, Q = 0.5, a CRITICALLY DAMPED
+    // pole pair.  That curve is already -6 dB at the stated cutoff and reaches
+    // -3 dB at 0.64x it, so the filter starts working half an octave below where
+    // the dial says and then rolls off lazily instead of at a clean 12 dB/oct.
+    //
+    // On a kick that is audible and unflattering: the beater click at 2-5 kHz is
+    // shaved an octave before the corner while the 200-500 Hz body is left at
+    // -0.1 dB, which is a dulled transient over an intact box - the character
+    // that gets described as plastic.
+    //
+    // Butterworth is the honest "no resonance" answer for a filter whose job is
+    // to remove range rather than colour it: k = sqrt(2), Q = 0.7071, maximally
+    // flat passband, -3 dB exactly at the dial, no peak at the corner.
+    //
+    //     k = 2 - 2r = sqrt(2)   ->   r = (2 - sqrt(2)) / 2 = 0.29289322
+    //
+    // USE THIS RATHER THAN 0.0f for any SVF stage that is meant to be neutral.
+    // A literal 0.0f at a call site is almost always this constant written by
+    // someone who read the parameter name and not the coefficient.
+    static constexpr float kSvfButterworthReso = 0.29289322f;
+
     struct SVFFilter
     {
         float ic1eq = 0.0f, ic2eq = 0.0f;

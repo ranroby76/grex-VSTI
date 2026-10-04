@@ -1,4 +1,6 @@
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 //==============================================================================
 // DrumsPopup.h  —  Phase 3.3 rework.
 //
@@ -39,8 +41,10 @@
 #include "InstrEditPanel.h"      // DrumKitParams / DrumElementParams / DrumKitFxParams / GoldSlider / InstrEditStyle
 #include "DrumKitRegistry.h"
 #include "DrumElementRoles.h"
+#include "ChorusConvolver.h"  // Betel::logKnobTaper / logKnobTaperInv — the send curve
 #include "InstrumentPreset.h"   // SAVE KIT / LOAD KIT share the .drm format
 #include "BetelStateXml.h"     // user-kit (*.bdk) file serialization
+#include "DrumSplitEq.h"       // the EQ's slider rule: silence .. unity .. +24 dB
 
 class DrumsPopup : public juce::DocumentWindow
 {
@@ -243,20 +247,20 @@ private:
             return lo + juce::jlimit (0.0f, 100.0f, sliderVal) / 100.0f * (hi - lo);
         }
 
-        // Piecewise map for EQ bands (unity at slider=50).
-        //   slider  0   -> -60 dB (silence)
-        //   slider  50  ->   0 dB (unity)
-        //   slider  100 -> +20 dB (max boost)
+        // EQ bands: THE SLIDER RULE, one definition for every drum EQ slider
+        // (DrumSplitEq.h) - the bottom half is silence .. unity, the top half
+        // unity .. +24 dB.
+        //   slider  0   -> the band muted
+        //   slider  50  -> unity
+        //   slider  100 -> +24 dB
+        // Each slider is the volume of its own band - the EQ is a real split.
         static float sliderToEqDb (float v)
         {
-            v = juce::jlimit (0.0f, 100.0f, v);
-            return v <= 50.0f ? -60.0f + (v / 50.0f) * 60.0f
-                              : ((v - 50.0f) / 50.0f) * 20.0f;
+            return Betel::DrumSplitEq::dbFromPosition (juce::jlimit (0.0f, 100.0f, v) / 100.0f);
         }
         static float eqDbToSlider (float db)
         {
-            return db <= 0.0f ? juce::jlimit (0.0f, 50.0f,  50.0f + db * (50.0f / 60.0f))
-                              : juce::jlimit (50.0f, 100.0f, 50.0f + db * (50.0f / 20.0f));
+            return 100.0f * Betel::DrumSplitEq::positionFromDb (db);
         }
 
         // Per-key Pitch:  slider 0..100  ↔  -24..+24 semitones (unity at 50)
@@ -279,15 +283,22 @@ private:
     };
 
     //==========================================================================
-    // SWEET sits FIRST because it is the one a player reaches for.  The five
-    // stages after it are the engineer's rack — the same controls, fully
-    // separated, for when the three purposeful ones are not enough.
-    enum FxTab { TabSweet = 0, TabEq, TabSat, TabComp, TabRev, TabDel, TabPan, NumFxTabs };
+    // FIVE PAGES, AND THE LAST ONE IS THE WAY OUT OF THE KIT.
+    //
+    // SWEET, REV and DEL are gone from this rack.  All three are GLOBAL effects
+    // now — one instance per section, shared by every channel in it — so a
+    // per-kit page for any of them would either change nothing or change it for
+    // the whole hand without saying so.
+    //
+    // What remains is what is genuinely per-kit: EQ, saturation, compression
+    // and pan.  SENDS is how the kit reaches everything else.
+    enum FxTab { TabEq = 0, TabSat, TabComp, TabSweet, TabPan, TabSends, NumFxTabs };
     static constexpr const char* kFxTabNames [NumFxTabs] = {
-        "SWEET", "EQ", "SAT", "COMP", "REV", "DEL", "PAN"
+        "EQ", "SAT", "COMP", "SWEET", "PAN", "SENDS"
     };
     static constexpr const char* kFxFrameTitles [NumFxTabs] = {
-        "SWEETENER", "10-BAND EQ", "SATURATION", "COMPRESSOR", "REVERB", "DELAY", "PAN"
+        "10-BAND EQ", "SATURATION", "COMPRESSOR", "SWEETENER", "PAN",
+        "SENDS TO GLOBAL EFFECTS  (chorus / reverb / delay)"
     };
 
     //==========================================================================
@@ -432,7 +443,7 @@ private:
 
             kickMixVariantBtn.setClickingTogglesState (true);   // off = EDM, on = WOOD
             kickMixVariantBtn.setColour (juce::TextButton::buttonColourId,   juce::Colour (0xFF2A2A2A));
-            kickMixVariantBtn.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xFF6B4A2A));
+            kickMixVariantBtn.setColour (juce::TextButton::buttonOnColourId, juce::Colour (Betel::Pal::kAccentShade));
             kickMixVariantBtn.setColour (juce::TextButton::textColourOnId,   juce::Colours::white);
             kickMixVariantBtn.setColour (juce::TextButton::textColourOffId,  juce::Colours::white);
             kickMixVariantBtn.onClick = [this] { refreshKickMixControls(); writeSliderToKey(); };
@@ -453,6 +464,12 @@ private:
             }
 
             // ── FX sliders — one set per tab, all 0..100 step-1 GoldSliders ───
+            // The name argument is unused by mountFxSlider — the label lives on
+            // the slider itself — so it is passed empty rather than fetched from
+            // a Component name GoldSlider never sets.
+            for (int i = 0; i < kNumSends; ++i)
+                mountFxSlider (sendSliders[i], {});
+
             mountFxSlider (swMixSlider,    "MIX");
             mountFxSlider (swDepthSlider,  "DEPTH");
             mountFxSlider (swWindowSlider, "WINDOW");
@@ -575,6 +592,12 @@ private:
                 &delTimeSlider,  &delFbSlider,  &delDrySlider, &delWetSlider
             };
             for (auto* k : fxKnobs) k->onChange = [this](float){ writeFxFromUi(); };
+
+            // THE SEND SLIDERS NEED THIS TOO.  They are not in fxKnobs — that
+            // array is a hand-kept std::array with its count spelled out — so
+            // without their own wiring they moved and nothing happened, which
+            // is why the kit stayed dry however far they were pushed.
+            for (auto& sl : sendSliders) sl.onChange = [this](float){ writeFxFromUi(); };
             for (auto& s : eqSliders) s.onChange = [this](float){ writeFxFromUi(); };
 
             // PAN tab: single fader, 0..100 with 50 = centre -> pan -1..+1.
@@ -897,7 +920,7 @@ private:
                     auto fill = barR.toFloat().withWidth (barR.getWidth() * norm);
 
                     g.setColour (db >= kSweetMeterHotDb ? juce::Colour (0xFFCC3322)
-                                                        : juce::Colour (0xFFD4AF37));
+                                                        : juce::Colour (Betel::Pal::kAccentBright));
                     g.fillRect (fill);
                 }
 
@@ -1382,6 +1405,13 @@ private:
             kitGainSlider.setBounds (gainCol);
             auto wetCol = content.removeFromRight (wetW);
             content.removeFromRight (10);
+            // THE RACK'S WET BELONGS TO THE RACK, NOT TO THE SENDS.
+            //
+            // It is the dry/wet of the per-kit chain — EQ, saturation,
+            // compression — and on the SENDS page it sits beside three sliders
+            // it has no effect on whatsoever, which reads as a fourth send that
+            // does nothing.  Hidden there and nowhere else.
+            fxWetSlider.setVisible (activeTab != TabSends);
             fxWetSlider.setBounds (wetCol);
 
             auto laySliders = [&] (std::initializer_list<GoldSlider*> sliders)
@@ -1437,13 +1467,6 @@ private:
                                   &eqSliders[8], &eqSliders[9] });
                     break;
 
-                case TabSweet:
-                    laySliders ({ &swMixSlider, &swDepthSlider, &swWindowSlider,
-                                  &swCeilSlider, &swRatioSlider,
-                                  &swTameSlider, &swFreqSlider,
-                                  &swDriveSlider, &swRndSlider });
-                    break;
-
                 case TabSat:
                     laySliders ({ &satDriveSlider, &satMixSlider });
                     break;
@@ -1453,54 +1476,15 @@ private:
                                   &compReleaseSlider, &compMakeupSlider });
                     break;
 
-                case TabRev:
-                {
-                    // ALGO row above the sliders, mirroring the DEL tab's time
-                    // row - one page, one shape.
-                    auto row = content.removeFromTop (24);
-                    content.removeFromTop (6);
-                    revAlgoBtn.setBounds (row.removeFromLeft (96).reduced (0, 1));
-
-                    // BAND is a two-thumb widget, not a GoldSlider, and
-                    // laySliders takes GoldSlider* - so it gets its own column
-                    // off the right and the six sliders share what is left.
-                    const int bandW = juce::jmax (56, content.getWidth() / 8);
-                    revBand.setBounds (content.removeFromRight (bandW).reduced (2, 0));
-
-                    laySliders ({ &revSizeSlider, &revDampSlider, &revWetSlider,
-                                  &revDrySlider, &revTailSlider, &revPreSlider });
+                case TabSweet:
+                    laySliders ({ &swMixSlider, &swDepthSlider, &swWindowSlider,
+                                  &swTameSlider, &swFreqSlider, &swDriveSlider,
+                                  &swRndSlider, &swCeilSlider, &swRatioSlider });
                     break;
-                }
 
-                case TabDel:
-                {
-                    auto row = content.removeFromTop (24);
-                    content.removeFromTop (6);
-
-                    delSyncBtn .setBounds (row.removeFromLeft (72).reduced (0, 1));
-                    row.removeFromLeft (6);
-                    delSig44Btn.setBounds (row.removeFromLeft (48).reduced (0, 1));
-                    delSig34Btn.setBounds (row.removeFromLeft (48).reduced (0, 1));
-                    row.removeFromLeft (10);
-
-                    const auto& divs = delDivTable();
-                    const int nd = (int) divs.size();
-                    const int dw = juce::jmax (32, row.getWidth() / juce::jmax (1, nd));
-                    for (int d = 0; d < 5; ++d)
-                    {
-                        if (d < nd)
-                        {
-                            delDivBtns[d].setButtonText (divs[(size_t) d]);
-                            delDivBtns[d].setBounds (row.getX() + d * dw, row.getY(),
-                                                     dw - 2, row.getHeight());
-                        }
-                        else delDivBtns[d].setBounds (0, 0, 0, 0);
-                    }
-
-                    laySliders ({ &delTimeSlider, &delFbSlider,
-                                  &delDrySlider, &delWetSlider });
+                case TabSends:
+                    laySliders ({ &sendSliders[0], &sendSliders[1], &sendSliders[2] });
                     break;
-                }
 
                 case TabPan:
                     laySliders ({ &panSlider });
@@ -1524,7 +1508,7 @@ private:
             {
                 const bool on = (t == activeTab);
                 tabButtons[t].setColour (juce::TextButton::buttonColourId,
-                                         on ? juce::Colour (0xFFCC6600)
+                                         on ? juce::Colour (Betel::Pal::kAccent)
                                             : juce::Colour (0xFF2A2A2A));
                 // Black on the amber fill — see InstrEditStyle::styleSquareButton.
                 tabButtons[t].setColour (juce::TextButton::textColourOffId,
@@ -1558,33 +1542,29 @@ private:
 
             switch (activeTab)
             {
-                case TabSweet:
-                    for (auto* s : { &swMixSlider, &swDepthSlider, &swWindowSlider,
-                                     &swTameSlider, &swFreqSlider, &swDriveSlider,
-                                     &swRndSlider, &swCeilSlider,
-                                     &swRatioSlider }) s->setVisible (true);
-                    for (auto* b : { &swSoftBtn, &swPeakBtn, &swTameBtn, &swRoundBtn }) b->setVisible (true);
-                    break;
                 case TabEq:   for (auto& s : eqSliders) s.setVisible (true); break;
                 case TabSat:  satDriveSlider.setVisible (true); satMixSlider.setVisible (true); break;
                 case TabComp: compThreshSlider.setVisible (true); compRatioSlider.setVisible (true);
                               compAttackSlider.setVisible (true); compReleaseSlider.setVisible (true);
                               compMakeupSlider.setVisible (true); break;
-                case TabRev:  revSizeSlider.setVisible (true); revDampSlider.setVisible (true);
-                              revWetSlider.setVisible (true);
-                              revDrySlider.setVisible (true);
-                              revTailSlider.setVisible (true); revPreSlider.setVisible (true);
-                              revBand.setVisible (true); revAlgoBtn.setVisible (true); break;
-                case TabDel:  showDelayRow (true);
-                              delTimeSlider.setVisible (true); delFbSlider.setVisible (true);
-                              delDrySlider.setVisible (true);
-                              delWetSlider.setVisible (true); break;
+                case TabSweet:
+                    for (auto* sl : { &swMixSlider, &swDepthSlider, &swWindowSlider,
+                                      &swTameSlider, &swFreqSlider, &swDriveSlider,
+                                      &swRndSlider, &swCeilSlider,
+                                      &swRatioSlider }) sl->setVisible (true);
+                    for (auto* b : { &swSoftBtn, &swPeakBtn, &swTameBtn,
+                                     &swRoundBtn }) b->setVisible (true);
+                    break;
                 case TabPan:  panSlider.setVisible (true); break;
+                case TabSends:
+                    for (auto& s : sendSliders) s.setVisible (true);
+                    break;
                 default: break;
             }
 
             for (int t = 0; t < NumFxTabs; ++t) fxEnableBtns[t].setVisible (false);
-            if (activeTab != TabPan) fxEnableBtns[activeTab].setVisible (true);
+            if (activeTab != TabPan && activeTab != TabSends)
+                fxEnableBtns[activeTab].setVisible (true);
             
             layoutActiveFxTab();
             repaint();
@@ -1689,6 +1669,56 @@ private:
 
             const juce::String folder = folderForPage (component);
 
+            // ── THE LOW-ZONE PAGES, ANSWERED BY RANGE ────────────────────────
+            if (isLowZonePage (component))
+            {
+                const auto range = lowZoneRangeFor (component);
+
+                for (const auto& f : lowZoneFolders())
+                {
+                    // Kit-filtered first, then unfiltered - the same two-step the
+                    // folder path below uses, and for the same reason: a GLOBAL
+                    // component is catalogued under its own stem, not the kit's,
+                    // so the filtered query matches nothing for it.
+                    gather (reg->getElementsForComponent (f, kitKey));
+                    gather (reg->getElementsForComponent (f));
+                }
+
+                out.erase (std::remove_if (out.begin(), out.end(),
+                                           [&range] (int k)
+                                           { return k < range.first || k > range.second; }),
+                           out.end());
+
+                // ── THE FALLBACK IS FOR 23..34 ONLY, AND THAT IS NOT AN
+                //    OVERSIGHT ────────────────────────────────────────────────
+                //
+                // xgLowKeySubstitute in Channel.cpp clones 25..34 from donors
+                // already in the kit, so those keys sound on a library with no
+                // low-zone blob at all and the page must be able to reach them.
+                //
+                // NOTHING clones 13..22.  Those keys exist only if revo_first or
+                // gm_first is installed, so an empty UNDER GM page is the honest
+                // answer rather than a bug - the same rule LOW KICK follows for
+                // note 35.  Listing keys that carry no sample would give the
+                // player sliders that write nowhere.
+                if (out.empty() && component.trim().equalsIgnoreCase ("lower_gm"))
+                    for (int k = range.first; k <= range.second; ++k)
+                        out.push_back (k);
+
+                // KEY 33 IS SOFT KICK'S, NOT LOWER GM'S.  It sits inside this
+                // page's range, and an install still carrying the old the_second
+                // would even supply it from a low-zone folder - but it has its
+                // own page now, and one key under two pages is two sliders
+                // disagreeing about one drum.  Dropped from both the gathered
+                // keys and the no-blob fallback above.
+                out.erase (std::remove (out.begin(), out.end(),
+                                        Betel::DrumKitRegistry::kSoftKickKey),
+                           out.end());
+
+                std::sort (out.begin(), out.end());
+                return out;
+            }
+
             gather (reg->getElementsForComponent (folder, kitKey));
 
             // GLOBAL COMPONENTS DO NOT CARRY THE KIT'S NAME.
@@ -1717,28 +1747,24 @@ private:
             // low_kick/ used to be in that list.  It is not any more: note 35
             // comes out of the kick blob with the rest of the kit, so it has a
             // real ElementHandle and needs no constant.
-            // ── XG LOW KEYS BELONG TO THE COMPONENT THEY BORROW FROM ──────────
+            // ── THE XG LOW KEYS BELONG TO THE LOW-ZONE COMPONENTS ─────────────
             //
-            // Keys 25..34 carry no samples of their own.  xgLowKeySubstitute
-            // clones them from a DONOR already in the kit, so each one belongs on
-            // the page that owns its donor - not all on KICK, which is what I
-            // wrongly did when adding note 33.  Straight off the table in
-            // Channel.cpp:
+            // Keys 25..34 used to carry no samples of their own: xgLowKeySubstitute
+            // cloned each from a DONOR already in the kit, so each one was listed
+            // on the page that owned its donor - 25..29/31 on SNARE, 30/32/34 on
+            // STICK, 33 on KICK.
             //
-            //   25 Brush Tap        -> 38  snare
-            //   26 Brush Swirl      -> 38  snare
-            //   27 Brush Slap       -> 38  snare
-            //   28 Brush Tap Swirl  -> 38  snare
-            //   29 Snare Roll       -> 38  snare
-            //   30 Castanet         -> 37  stick
-            //   31 Snare Soft       -> 38  snare
-            //   32 Sticks           -> 37  stick
-            //   33 Bass Drum Soft   -> 36  KICK   <- the only one
-            //   34 Open Rim Shot    -> 37  stick
+            // They are supplied for real now - the_second over 23..34, and
+            // revo_first overriding 25..28 on a Revo! kit - as GLOBALS merged
+            // into every kit.  So they are their own family and appear on their
+            // own page (LOWER GM).  Listing them on the donor pages as well
+            // would put one key under two sets of channel controls, which is how
+            // two sliders end up disagreeing about one drum.
             //
-            // Grouping them with their donor is also what makes the fan-out
-            // right: move SNARE and the brush taps move with it, because they
-            // are that snare.
+            // THE FALLBACK IS KEPT AND IS NOT A DUPLICATE.  A library with no
+            // low-zone blob still gets the clones from composeDrumKit, and the
+            // query above returns nothing for this page - so the keys are added
+            // here only when the registry did not already supply them.
             {
                 const auto c = component.trim().toLowerCase();
                 auto addAll = [&out] (std::initializer_list<int> ks)
@@ -1748,23 +1774,25 @@ private:
                             out.push_back (k);
                 };
 
-                // 33 goes to KICK and not to LOW KICK: its donor is 36.
-                if      (c == "kick")  addAll ({ 33 });
-                else if (c == "snare") addAll ({ 25, 26, 27, 28, 29, 31 });
-                else if (c == "stick") addAll ({ 30, 32, 34 });
+                // the_first's fallback used to live here, listing all of
+                // 13..34.  It has moved into the low-zone branch above, which
+                // returns before this point and applies it to LOWER GM only -
+                // see the note there on why 13..22 gets none.
+                juce::ignoreUnused (addAll);
             }
 
             //------------------------------------------------------------------
-            // SPLIT THE ONE KICK FOLDER INTO TWO PAGES.
+            // SPLIT THE ONE KICK FOLDER INTO THREE PAGES.
             //
             // Everything above answered "what keys does kick/ carry", which is
-            // now both kicks at once -- the re-sampled blobs hold 35 and 36 in a
-            // single SFZ.  The two drums still want their own channel controls,
-            // so the page keeps only its own share:
+            // now all three kicks at once -- the re-sampled kit blobs hold 35
+            // and 36 in a single SFZ, and the two key-33 blobs sit beside them.
+            // The three drums want their own channel controls, so each page
+            // keeps only its own share:
             //
-            //   LOW KICK -> 35 alone
-            //   KICK     -> everything else the folder carries (36, plus the
-            //               XG 33 clone added above)
+            //   SOFT KICK -> 33 alone (the family's soft or EDM kick)
+            //   LOW KICK  -> 35 alone
+            //   KICK      -> everything else the kit's kick file carries (36)
             //
             // Doing it here rather than in the registry keeps the catalog
             // honest about what the file contains, and puts the split in the one
@@ -1784,18 +1812,55 @@ private:
                     out.clear();
                     if (present) out.push_back (kLowKickKey);
                 }
+                else if (c == "soft_kick")
+                {
+                    // KEY 33 SOUNDS ON THIS KIT IF ANY OF THREE THINGS SUPPLIES
+                    // IT: a key-33 blob (33_soft_kick / 33_edm_kick), an older
+                    // low-zone blob that still carries 33, or - failing both -
+                    // composeDrumKit's clone of the kit's own kick, which needs
+                    // the kit to HAVE a kick.  `out` holds exactly that at this
+                    // point: the keys this kit's kick/ files map.
+                    //
+                    // Same honesty rule as LOW KICK: if nothing can make 33
+                    // sound the page shows "no keys" rather than a slider that
+                    // writes nowhere.  Which of the two blobs a kit gets is not
+                    // this page's business - the engine picks by kit family, and
+                    // the editor writes per-KEY parameters, so an edit to 33
+                    // lands on whichever sample is there.
+                    bool sounds33 = ! out.empty();
+                    for (const auto& gName : reg->getGlobalComponentNames())
+                    {
+                        if (sounds33) break;
+                        for (const auto& h : reg->getElementsForKit (gName))
+                            if (h.midiKey == Betel::DrumKitRegistry::kSoftKickKey)
+                            { sounds33 = true; break; }
+                    }
+
+                    out.clear();
+                    if (sounds33) out.push_back (Betel::DrumKitRegistry::kSoftKickKey);
+                }
                 else if (c == "kick")
                 {
-                    out.erase (std::remove (out.begin(), out.end(), kLowKickKey),
+                    // KICK owns 36 and whatever else the kit's kick file maps -
+                    // never 35 (LOW KICK's) and never 33 (SOFT KICK's).  33 can
+                    // reach this list on the unfiltered retry above, because the
+                    // two key-33 blobs live in kick/ as globals.
+                    out.erase (std::remove_if (out.begin(), out.end(),
+                                               [] (int k)
+                                               {
+                                                   return k == kLowKickKey
+                                                       || k == Betel::DrumKitRegistry::kSoftKickKey;
+                                               }),
                                out.end());
                 }
                 else if (out.empty() && c == "clap")
                 {
                     out = { 39 };   // still a pinned global
                 }
-                // the_first/ is skipped by the scan AND has no pinned key - the
-                // global was retired in favour of xgLowKeySubstitute - so it
-                // legitimately edits nothing until that decision is revisited.
+                // The low-zone components need no case here: revo_first,
+                // gm_first and the_second are catalogued like any other, and
+                // both low-zone PAGES return from the branch further up before
+                // ever reaching this block.
             }
 
             std::sort (out.begin(), out.end());
@@ -1837,8 +1902,71 @@ private:
         //----------------------------------------------------------------------
         static juce::String folderForPage (const juce::String& pageId)
         {
-            return pageId.trim().equalsIgnoreCase ("low_kick") ? juce::String ("kick")
-                                                               : pageId;
+            // SOFT KICK joins LOW KICK here: its two blobs live in kick/ too, so
+            // every registry question the page asks goes to that folder.
+            const auto p = pageId.trim();
+            return (p.equalsIgnoreCase ("low_kick") || p.equalsIgnoreCase ("soft_kick"))
+                       ? juce::String ("kick")
+                       : pageId;
+        }
+
+        //----------------------------------------------------------------------
+        // THE TWO LOW-ZONE PAGES ARE KEY RANGES, NOT FOLDERS.
+        //
+        // UNDER GM used to be one page over one folder, the_first, covering the
+        // whole of 13..34.  That folder is gone: the span is now served by three
+        // components, and WHICH of them supplies a key depends on the kit.
+        //
+        //     13..22   revo_first | gm_first   (kit-dependent)
+        //     23..24   the_second               (common)
+        //     25..28   revo_first overrides the_second
+        //     29..34   the_second               (common)
+        //
+        // A page tied to a FOLDER cannot express that.  It would have to pick
+        // revo_first or gm_first without knowing which kit is loaded, and it
+        // would show 25..28 on whichever page owned revo_first rather than
+        // alongside the neighbouring keys they sound with.
+        //
+        // So these two pages ask a different question - WHICH KEYS IN MY RANGE
+        // does this kit actually map - and gather across every low-zone folder
+        // to answer it.  That is exact rather than approximate: revo_first and
+        // gm_first are mutually exclusive within one kit (resolveDrumKitParams
+        // merges one and skips the other), so a union of the two can never show
+        // a key twice or a key the kit does not have.
+        //
+        // It also makes the edit land correctly with no further thought: the
+        // editor writes per-KEY parameters, so an edit to key 13 reaches
+        // whichever component supplied 13, without the page ever having to know
+        // which one that was.
+        //
+        // the_first is still in the folder list so a library that has NOT been
+        // re-blobbed keeps both pages working off the old single component.
+        //----------------------------------------------------------------------
+        static constexpr int kUnderGmLoKey = 13, kUnderGmHiKey = 22;
+        static constexpr int kLowerGmLoKey = 23, kLowerGmHiKey = 34;
+
+        static bool isLowZonePage (const juce::String& pageId)
+        {
+            const auto p = pageId.trim().toLowerCase();
+            return p == "under_gm" || p == "lower_gm";
+        }
+
+        static std::pair<int, int> lowZoneRangeFor (const juce::String& pageId)
+        {
+            return pageId.trim().equalsIgnoreCase ("under_gm")
+                     ? std::pair<int, int> { kUnderGmLoKey, kUnderGmHiKey }
+                     : std::pair<int, int> { kLowerGmLoKey, kLowerGmHiKey };
+        }
+
+        /** Every component that can supply a key below 35, newest first.  Order
+            is immaterial - the gather de-duplicates by key - but keeping the
+            live three ahead of legacy the_first documents which is which. */
+        static const std::vector<juce::String>& lowZoneFolders()
+        {
+            static const std::vector<juce::String> f {
+                "revo_first", "gm_first", "the_second", "the_first"
+            };
+            return f;
         }
 
         /** MIDI 35: the sub-kick, and the ONLY key the LOW KICK page owns.  KICK
@@ -1849,21 +1977,40 @@ private:
 
         static const std::vector<ComponentEntry>& componentOrder()
         {
-            // UNDER GM (the_first) IS NOT A SOUND SOURCE.
+            // UNDER GM AND LOWER GM ARE REAL PAGES.
             //
-            // Its blob is skipped by the registry scan and the global was retired
-            // in favour of xgLowKeySubstitute, so it owns no samples and no keys.
-            // Everything in the 25..34 region is a CLONE of a donor that KICK,
-            // SNARE or STICK already owns - and is now reachable from those pages
-            // - so a page of its own would be an empty button standing in for
-            // sounds three other pages already control.
+            // The sub-GM keys used to be excluded from the row entirely: their
+            // blob was skipped by the scan and everything in 25..34 was a CLONE
+            // of a donor that KICK, SNARE or STICK already owned.  Both halves of
+            // that changed - the skip went, and real blobs now supply the span -
+            // so those keys belong to their own pages rather than being borrowed
+            // from three others.  They lead the row because they own the lowest
+            // keys in the kit.
+            //
+            // TWO PAGES, NOT ONE, because the span is not uniform: 13..22 is
+            // kit-dependent (revo_first or gm_first) and 23..34 is shared, with
+            // revo_first overriding 25..28 on a Revo! kit.  See the note above
+            // keysForComponent on why both are keyed by RANGE and not by folder.
+            //
+            // xgLowKeySubstitute in Channel.cpp is untouched and still stands as
+            // the fallback for a library with no low-zone blob: composeDrumKit
+            // skips any key a real element already maps, so installing the blobs
+            // simply switches the clones off.
             //
             // LOW KICK AND KICK ARE TWO PAGES OVER ONE FOLDER.  Both resolve to
             // kick/, split by key: LOW KICK owns 35, KICK owns the rest.  They
             // are kept apart because they are two drums with two sets of
             // channel controls, which is the whole point -- but they are now one
             // FILE, so the REPLACE droplist on either page swaps both at once.
+            // SOFT KICK IS THE THIRD PAGE OVER kick/.  Key 33 has its own two
+            // blobs there (33_soft_kick / 33_edm_kick, one chosen per kit
+            // family), so it is a drum with its own channel controls rather than
+            // one of LOWER GM's XG fillers.  It sits before LOW KICK because 33
+            // is below 35, which keeps the row in playing order.
             static const std::vector<ComponentEntry> order = {
+                { "under_gm",  "UNDER GM" },
+                { "lower_gm",  "LOWER GM" },
+                { "soft_kick", "SOFT KICK" },
                 { "low_kick",  "LOW KICK" },
                 { "kick",      "KICK"     },
                 { "stick",     "STICK"    },
@@ -1901,7 +2048,17 @@ private:
                 // honestly if the kick folder is missing, instead of offering a
                 // page with nothing behind it.
                 const juce::String f (e.folder);
-                if (! have (folderForPage (f)) && f != "clap") continue;
+
+                // A low-zone PAGE is present when ANY component that can feed
+                // its range is installed - it is not a folder, so asking for one
+                // by name would hide both pages on every library.
+                const bool present =
+                    isLowZonePage (f)
+                        ? std::any_of (lowZoneFolders().begin(), lowZoneFolders().end(),
+                                       [&have] (const juce::String& g) { return have (g); })
+                        : have (folderForPage (f));
+
+                if (! present && f != "clap") continue;
 
                 componentButtons[(int) componentNames.size()].setButtonText (e.label);
                 componentNames.push_back (f);
@@ -1931,6 +2088,14 @@ private:
             if (owner.onGetDrumKitRegistry)
                 if (const auto* reg = owner.onGetDrumKitRegistry())
                     hasAlts = reg->componentHasAlternatives (folderForPage (component));
+
+            // NO REPLACE ON SOFT KICK.  The page reads kick/, which does have
+            // alternatives - but those are the KITS' kick files (35 + 36), and a
+            // swap started here would re-source those two drums from a page that
+            // shows neither.  Key 33's own sample is picked by kit family, not by
+            // the user, so there is nothing on this page to swap.
+            if (component.trim().equalsIgnoreCase ("soft_kick"))
+                hasAlts = false;
 
             componentSwapBtn.setVisible (hasAlts);
 
@@ -2139,6 +2304,15 @@ private:
                 for (const int k : keysForComponent ("low_kick"))
                     if (std::find (keys.begin(), keys.end(), k) == keys.end())
                         keys.push_back (k);
+
+                // AND NEVER KEY 33.  A kit's kick file carries 35 and 36 only;
+                // re-sourcing 33 onto it would ask for an element the file does
+                // not have and silence the soft kick.  SOFT KICK hides REPLACE,
+                // and KICK never lists 33, so this cannot normally be reached -
+                // it is here so that no path through a kick swap ever can.
+                keys.erase (std::remove (keys.begin(), keys.end(),
+                                         Betel::DrumKitRegistry::kSoftKickKey),
+                            keys.end());
             }
 
             for (const int k : keys)
@@ -2168,6 +2342,12 @@ private:
             updatingFromState = true;
 
             fxWetSlider.setValue (Map::toSlider (kitState.fx.fxWet, 0.0f, 1.0f), juce::dontSendNotification);
+
+            // The sends.  revWet / delWet / sweet.mix are the fields that always
+            // existed — a kit that had reverb arrives with a reverb send.
+            setSendVal (kSendChorus, kitState.fx.chorusSend);
+            setSendVal (kSendReverb, kitState.fx.revWet);
+            setSendVal (kSendDelay,  kitState.fx.delWet);
 
             // EQ — piecewise mapping centred on unity (dB 0 → slider 50).
             for (int i = 0; i < 10; ++i)
@@ -2225,10 +2405,15 @@ private:
                 styleSweetStages();   // dontSendNotification skips onClick
             }
 
-            const bool fxEn[NumFxTabs] = { kitState.fx.sweet.enabled,
-                                          kitState.fx.eqEnabled, kitState.fx.satEnabled,
-                                          kitState.fx.compEnabled, kitState.fx.revEnabled,
-                                          kitState.fx.delEnabled, false };
+            // ORDER FOLLOWS THE FxTab ENUM: Eq, Sat, Comp, Pan, Sends.  PAN and
+            // SENDS have no enable button — pan is always in effect, and a send
+            // of zero is already off — so both are false and their buttons stay
+            // hidden (see the guard in selectFxTab).
+            const bool fxEn[NumFxTabs] = { kitState.fx.eqEnabled,
+                                           kitState.fx.satEnabled,
+                                           kitState.fx.compEnabled,
+                                           kitState.fx.sweet.enabled,
+                                           false, false };
             for (int t = 0; t < NumFxTabs; ++t)
             {
                 fxEnableBtns[t].setToggleState (fxEn[t], juce::dontSendNotification);
@@ -2278,7 +2463,16 @@ private:
 
             {
                 auto& sw = kitState.fx.sweet;
-                sw.mix         = Map::toEngine (swMixSlider   .getValue(), 0.0f,    1.0f);
+
+                // sw.mix IS NOT SET HERE.  swMixSlider belongs to the SWEET page,
+                // which no longer exists — the widget survives only because the
+                // sweetener's other controls are read from its siblings — and it
+                // still sits at its construction default of 100.  Reading it
+                // wrote a full-strength mix on every write-back, and the enable
+                // derived from it below then latched the sweetener ON.  Toggling
+                // the EQ was enough to trigger it.
+                //
+                // The mix is the SEND now, set further down with the other five.
                 sw.softenDepth = Map::toEngine (swDepthSlider .getValue(), -1.0f,   1.0f);
                 sw.softenMs    = Map::toEngine (swWindowSlider.getValue(), 1.0f,  150.0f);
                 sw.peakCeilDb  = Map::toEngine (swCeilSlider  .getValue(), 3.0f,   24.0f);
@@ -2291,14 +2485,36 @@ private:
                 sw.softenOn    = swSoftBtn .getToggleState();
                 sw.tameOn      = swTameBtn .getToggleState();
                 sw.roundOn     = swRoundBtn.getToggleState();
-                sw.enabled     = fxEnableBtns[TabSweet].getToggleState();
             }
 
             kitState.fx.eqEnabled   = fxEnableBtns[TabEq ].getToggleState();
             kitState.fx.satEnabled  = fxEnableBtns[TabSat].getToggleState();
             kitState.fx.compEnabled = fxEnableBtns[TabComp].getToggleState();
-            kitState.fx.revEnabled  = fxEnableBtns[TabRev].getToggleState();
-            kitState.fx.delEnabled  = fxEnableBtns[TabDel].getToggleState();
+            // ── THE THREE SENDS ──────────────────────────────────────────────
+            //
+            // revWet and delWet are the fields that already existed and already
+            // persisted; the chorus send is the new one.  Each enable is DERIVED
+            // from its send, so one slider means one thing and there is no second
+            // switch to leave in the wrong position.
+            kitState.fx.revWet     = getSendVal (kSendReverb);
+            kitState.fx.delWet     = getSendVal (kSendDelay);
+            kitState.fx.chorusSend = getSendVal (kSendChorus);
+
+            kitState.fx.revEnabled   = kitState.fx.revWet    > 0.0f;
+            kitState.fx.delEnabled   = kitState.fx.delWet    > 0.0f;
+
+            // AFTER the send is set, not before.  Deriving this while sw.mix
+            // still held a stale slider reading is what switched the sweetener
+            // on by itself.
+            // The sweetener is an INSERT again, so its mix is its own control on
+            // the SWEET page and its enable is that page's button — not derived
+            // from a send that no longer exists.
+            kitState.fx.sweet.mix     = Map::toEngine (swMixSlider.getValue(), 0.0f, 1.0f);
+            kitState.fx.sweet.enabled = fxEnableBtns[TabSweet].getToggleState();
+
+            // A send has no base — the ceiling is the rack's own level now.
+            kitState.fx.revWetBase  = 1.0f;
+            kitState.fx.delWetBase  = 1.0f;
 
             if (owner.onKitFxChanged) owner.onKitFxChanged (kitState.fx);
         }
@@ -2326,7 +2542,7 @@ private:
                 {
                     b.setButtonText (juce::String ("E ") + kKitAbbrev[kitIdx]);
                     b.setColour (juce::TextButton::buttonColourId,
-                                 juce::Colour (0xFF3A2A1A));
+                                 juce::Colour (Betel::Pal::kTintPanelDeep));
                 }
                 else
                 {
@@ -2357,7 +2573,7 @@ private:
                 const bool isSelected = (mk == selectedKey);
 
                 juce::Colour fill;
-                if (isSelected)        fill = juce::Colour (0xFFCC6600);   // edited key — orange
+                if (isSelected)        fill = juce::Colour (Betel::Pal::kAccent);   // edited key — orange
                 else if (isBlack)      fill = juce::Colour (0xFF141414);   // black key
                 else                   fill = juce::Colour (0xFFE8E8E8);   // white key
 
@@ -2533,7 +2749,7 @@ private:
         /** GREEN while empty, ORANGE once a file is loaded. */
         void styleSfzLoad (bool loaded)
         {
-            const auto fill = loaded ? juce::Colour (0xFFCC6600) : juce::Colour (0xFF1E7A3C);
+            const auto fill = loaded ? juce::Colour (Betel::Pal::kAccent) : juce::Colour (0xFF1E7A3C);
             sfzLoadBtn.setColour (juce::TextButton::buttonColourId,   fill);
             sfzLoadBtn.setColour (juce::TextButton::buttonOnColourId, fill);
             sfzLoadBtn.setColour (juce::TextButton::textColourOffId,  juce::Colours::white);
@@ -2544,7 +2760,7 @@ private:
             unmistakable rather than a barely-tinted fill. */
         void styleSfzToggle (bool on)
         {
-            const auto amber = juce::Colour (0xFFCC6600);
+            const auto amber = juce::Colour (Betel::Pal::kAccent);
             const auto text  = on ? amber : juce::Colours::white;
             sfzToggleBtn.setColour (juce::TextButton::buttonColourId,   juce::Colour (0xFF2A2A2A));
             sfzToggleBtn.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xFF3A2A14));
@@ -2692,6 +2908,44 @@ private:
         float revWetBase = 1.0f;
         float delWetBase = 0.5f;
         GoldSlider panSlider     { "PAN",  0.0f, 100.0f, 50.0f };
+
+        // ── THE THREE SENDS ──────────────────────────────────────────────────
+        //
+        // Three, matching SectionSendFx::Slot — chorus, reverb, delay.  Order
+        // matches that enum so the page and the rack cannot drift apart.  All
+        // three default to 0: a kit that has never been dialled is dry, not
+        // dropped into effects nobody asked for.
+        //
+        // The sweetener is a per-kit INSERT again (its own page below) — a
+        // shaper cannot be fed by a send.
+        enum { kSendChorus = 0, kSendReverb, kSendDelay, kNumSends };
+
+        GoldSlider sendSliders [kNumSends] {
+            { "CHORUS", 0.0f, 100.0f, 0.0f },
+            { "REVERB", 0.0f, 100.0f, 0.0f },
+            { "DELAY",  0.0f, 100.0f, 0.0f }
+        };
+
+        // ── LOG TAPER, NOT LINEAR ────────────────────────────────────────────
+        //
+        // A linear send puts every usable amount in the bottom of the travel:
+        // 20% of a reverb is already a lot, so the top four fifths of the
+        // slider are all "drowned" and the useful range is a nudge off zero.
+        //
+        // The same curve the mix knob uses — half rotation is -20 dB — so a
+        // send at the middle contributes a tenth, and fine control lives where
+        // the amounts actually are.
+        float getSendVal (int i) const
+        {
+            return Betel::logKnobTaper (juce::jlimit (0.0f, 1.0f,
+                                            sendSliders[i].getValue() * 0.01f));
+        }
+        void  setSendVal (int i, float v)
+        {
+            sendSliders[i].setValue (juce::jlimit (0.0f, 100.0f,
+                                        Betel::logKnobTaperInv (v) * 100.0f),
+                                     juce::dontSendNotification);
+        }
 
         // ── Kick MIX controls (per-key, notes 35 & 36 only) ───────────────────
         // Equal-power blend between the kit's own kick and a supplemental EDM or

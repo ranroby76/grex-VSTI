@@ -1,5 +1,4 @@
 
-
 #pragma once
 //==============================================================================
 // DrumKitRegistry.h
@@ -56,6 +55,224 @@ namespace Betel
     class DrumKitRegistry
     {
     public:
+        /** The XG sub-GM zone: the whole span of keys that sit below GM.
+
+            Yamaha XG kits map below GM's floor of 35, from Surdo Mute at 13 up
+            to Open Rim Shot at 34 — twenty-two keys.
+
+            THESE TWO CONSTANTS NO LONGER DESCRIBE ANY LIVE COMPONENT.  One blob
+            (the_first) used to carry the whole span; it has been split three
+            ways and deleted — see the split below, whose four constants are what
+            the live components actually use.  This pair survives only as the
+            zone of legacy the_first, for a library that has not been re-blobbed.
+
+            Anything a blob holds outside its own zone belongs to a kit's own
+            components and is dropped at catalog time; see the clamp in
+            loadBlob. */
+        static constexpr int kXgLowZoneLoKey = 13;
+        static constexpr int kXgLowZoneHiKey = 34;
+
+        /** The XG upper-percussion zone: the span the_last is allowed to supply.
+
+            Bongo H at 60 up to Jingle Bell at 83 — twenty-four keys.  Note the
+            top is 83, not GM's 81: keys 82 Shaker and 83 Jingle Bell are GM2 /
+            XG percussion that Yamaha styles use heavily (one Korg conversion put
+            331 hits on key 82 alone), and the_last is what supplies them. */
+        static constexpr int kXgHighZoneLoKey = 60;
+        static constexpr int kXgHighZoneHiKey = 83;
+
+        //======================================================================
+        // THE SUB-GM ZONE IS SPLIT IN TWO, AND ONE HALF IS KIT-DEPENDENT
+        //
+        // A Revo! kit (bank LSB 8) does not use the XG map below 29.  Yamaha's
+        // Drum Kit Assign List puts hi-hat articulations on 13..22 and a
+        // tambourine plus three no-rim snares on 25..28, where a Standard kit
+        // has surdos, scratches, metronome clicks and brush taps.  One global
+        // component cannot serve both readings, so the_first has been broken up:
+        //
+        //     13..22   KIT-DEPENDENT   revo_first | gm_first
+        //     23..24   COMMON          the_second   (Seq Click L/H — identical)
+        //     25..28   KIT-DEPENDENT   revo_first OVERRIDES the_second
+        //     29..34   COMMON          the_second   (kick and snare — compatible)
+        //
+        // revo_first's span is therefore 13..28 and DELIBERATELY NOT CONTIGUOUS
+        // in content: its blob simply holds nothing at 23..24, and the clamp
+        // below only ever DISCARDS regions outside a span — it never demands
+        // that one be filled.  So a span is the right shape for it even though
+        // two keys in the middle belong to somebody else.
+        //
+        // gm_first stops at 22 because the XG reading of 25..28 is what
+        // the_second already carries; a GM install needs no second opinion.
+        //
+        // ON OCTAVE CORRECTION.  An earlier version of this note claimed the
+        // correction only fires when EVERY key sits outside the zone, and warned
+        // that a +12 revo_first export would therefore go uncorrected.  BOTH
+        // CLAIMS WERE WRONG.  The test below is on the SPAN — blobLo and blobHi
+        // against the zone — so a +12 export of any of these three lands wholly
+        // outside its zone and is corrected:
+        //
+        //     revo_first  +12 -> 25..34, shifts to 13..22
+        //     gm_first    +12 -> 25..34, shifts to 13..22
+        //     the_second  +12 -> 35..46, shifts to 23..34
+        //
+        // The one case that genuinely will not self-correct is a blob whose span
+        // is WIDER than its zone: no single octave brings it fully inside, the
+        // shift stays 0, and the clamp discards whatever falls outside.  That
+        // shows up as missing keys, not as keys in the wrong place.
+        //======================================================================
+        static constexpr int kLowSplitKitLoKey    = 13;   // revo_first / gm_first floor
+        static constexpr int kLowSplitKitHiKey    = 22;   // gm_first ceiling
+        static constexpr int kRevoExtraHiKey      = 28;   // revo_first also owns 25..28
+        static constexpr int kLowSplitCommonLoKey = 23;   // the_second floor
+        static constexpr int kLowSplitCommonHiKey = 34;   // the_second ceiling
+
+        //======================================================================
+        // KEY 33 — THE SOFT KICK — HAS ITS OWN TWO BLOBS
+        //
+        // XG's key 33 is BASS DRUM SOFT, and it is not a garnish: measured across
+        // the 830-style library, 214 styles play it and in 118 of them it is the
+        // ONLY kick in the section.  the_second used to carry one generic soft
+        // kick there for every kit, so a Dance-kit style whose four-on-the-floor
+        // lives on 33 played an acoustic soft kick under a synth groove.
+        //
+        // the_second is now re-sampled WITHOUT 33, and the key is served by one
+        // of two blobs that live in the ordinary kick folder:
+        //
+        //     kick/33_soft_kick.frb   every kit that is not electronic
+        //     kick/33_edm_kick.frb    the electronic / analog family
+        //
+        // WHICH ONE IS DECIDED BY THE COMPOSED KIT, not by the requested program.
+        // drumFamilyFor already folds every requested kit onto one of the nine
+        // composed families, and the electronic ones fold onto exactly two:
+        // 024 Electro (Dance, Break, House, EDM, Trap, Dubstep, Hit, 80s R&B,
+        // PSR-E Dance/House, and HipHop - drumKitPCMap sends PC 56 there) and
+        // 025 TR-808 (Analog, Analog T8/T9, Drum Machine).  Keying the choice on
+        // those two means the soft-kick choice can never disagree with the kit
+        // the channel actually builds - there is one table deciding both, not
+        // two that could drift.
+        //
+        // NOT "056".  The composed 056 kit is an SFX kit that only a hand pick
+        // reaches (no style program change points at it, per drumKitPCMap), so
+        // it stays on the soft kick it always had from the_second.  Revo! and
+        // Ambient styles (drum bank LSB 8/9) all compose onto 000 Standard via
+        // revoFallbackFamily, so they take the soft kick too.
+        //
+        // THEY ARE GLOBALS, NOT KIT COMPONENTS, DESPITE THE FOLDER.  Their stems
+        // start with a number, and the scan names a kit by its numeric prefix,
+        // so without the special case below both files would join a phantom
+        // kit "33" - and 33_soft_kick is authored at key 45 (+12, the Genos
+        // Kontakt export offset), which the unzoned 35..81 window would accept
+        // as that phantom kit's LOW TOM.  They are recognised by stem, zoned to
+        // exactly [33, 33], octave-corrected by the same detector the low-zone
+        // blobs use, and kept out of the REPLACE droplists.
+        //======================================================================
+        static constexpr int kSoftKickKey = 33;
+
+        static bool isSoftKickStem (const juce::String& stem) noexcept
+        {
+            return stem.trim().equalsIgnoreCase ("33_soft_kick");
+        }
+
+        static bool isEdmKickStem (const juce::String& stem) noexcept
+        {
+            return stem.trim().equalsIgnoreCase ("33_edm_kick");
+        }
+
+        static bool isKick33Stem (const juce::String& stem) noexcept
+        {
+            return isSoftKickStem (stem) || isEdmKickStem (stem);
+        }
+
+        /** True when the COMPOSED kit (drumFamilyFor's answer: "000".."056")
+            is one of the two electronic families, and so takes 33_edm_kick. */
+        static bool usesEdmKick33 (const juce::String& composedKitName) noexcept
+        {
+            const auto k = composedKitName.trim();
+            return k == "024" || k == "025";
+        }
+
+        /** How a GLOBAL component relates to the kit-type split above.
+
+            The registry catalogs components at scan time, when nothing is known
+            about which style will load.  Revo-ness is a property of the STYLE
+            (its drum bank LSB), so the choice between revo_first and gm_first
+            cannot be made here — it is made at kit-composition time in
+            SamplePlayerEngine::resolveDrumKitParams, which asks this. */
+        enum class LowZoneKind
+        {
+            NotLowZone,   // low_kick, the_lasts, clap ... nothing to do with 13..34
+            KitAgnostic,  // the_second (and legacy the_first): merged for every kit
+            RevoOnly,     // revo_first: merged ONLY when the style asked for a Revo! kit
+            GmOnly,       // gm_first:   merged ONLY when it did not
+            SoftKick33,   // 33_soft_kick: key 33 for every NON-electronic composed kit
+            EdmKick33     // 33_edm_kick:  key 33 for the electronic families (usesEdmKick33)
+        };
+
+        //======================================================================
+        // KEYS A COMPONENT MAPS BUT MUST NOT CONTRIBUTE
+        //
+        // the_last carries the whole 60..83 upper-percussion span, and two of
+        // those drums are unwanted in a ballad library: MIDI 78 Mute Cuica and
+        // 79 Open Cuica.  They are the 19th and 20th keys the blob maps, the
+        // blob being all 24 keys of its zone in order.
+        //
+        // ── SILENCED BY KEY, NOT BY POSITION.  THIS MATTERS ──────────────────
+        //
+        // There was once a COUNT cap here - "keep the 18 lowest keys" - and it
+        // was removed because a positional rule silences whatever happens to sit
+        // at that position.  When the blob was re-sampled from 18 keys to 24, the
+        // same cap started cutting 78..83 and took key 82 Shaker with it, the
+        // single most-used key above the GM ceiling across the whole style
+        // library.  Nothing announced that; the Shaker simply stopped.
+        //
+        // Naming the two keys outright cannot drift that way.  Re-sample the
+        // blob, add keys, reorder it - 78 and 79 are still the two Cuicas, and
+        // everything else still sounds.
+        //
+        // ── AND IT IS DONE AT CATALOG TIME, BESIDE THE ZONE CLAMP ────────────
+        //
+        // So the editor and the engine agree.  Dropping these at MERGE time
+        // instead would leave REST GM showing two keys that can never sound -
+        // sliders that write nowhere, which is the fault the LOW KICK page was
+        // fixed for.  A key the catalog does not carry is absent from both.
+        //======================================================================
+        static bool isSilencedComponentKey (const juce::String& componentName,
+                                            int key) noexcept
+        {
+            const auto n = componentName.trim();
+            if (! (n.equalsIgnoreCase ("the_last") || n.equalsIgnoreCase ("the_lasts")))
+                return false;
+
+            return key == 78 || key == 79;   // Mute Cuica / Open Cuica
+        }
+
+        static LowZoneKind lowZoneKindFor (const juce::String& componentName)
+        {
+            const auto n = componentName.trim();
+            auto is = [&n] (const char* a, const char* b)
+            {
+                return n.equalsIgnoreCase (a) || n.equalsIgnoreCase (b);
+            };
+
+            if (is ("revo_first", "revo_firsts")) return LowZoneKind::RevoOnly;
+            if (is ("gm_first",   "gm_firsts"))   return LowZoneKind::GmOnly;
+            if (is ("the_second", "the_seconds")) return LowZoneKind::KitAgnostic;
+
+            // The two key-33 blobs.  Their catalog name is the full stem (see the
+            // special case in loadKit), so this is the name that arrives here.
+            if (isSoftKickStem (n)) return LowZoneKind::SoftKick33;
+            if (isEdmKickStem  (n)) return LowZoneKind::EdmKick33;
+
+            // LEGACY.  the_first was the single component covering the whole of
+            // 13..34 before the split.  It is still recognised so an install
+            // that has not been re-blobbed keeps working, but it is merged AFTER
+            // the new trio (see resolveDrumKitParams), so where both are present
+            // the split wins and the_first only fills what nothing else did.
+            if (is ("the_first",  "the_firsts"))  return LowZoneKind::KitAgnostic;
+
+            return LowZoneKind::NotLowZone;
+        }
+
         //======================================================================
         // ElementHandle — one entry in the flat element catalog.  Identifies
         // exactly one region inside one preset inside one loaded blob, plus
@@ -101,36 +318,25 @@ namespace Betel
         // of component blobs indexed.  A blob that fails to open OR carries no
         // role-tagged region (e.g. a stray melodic file) is silently skipped.
         //======================================================================
-        // TEMP diagnostics -> D:\\workspace\\BetelgeuseArranger\\grex_drum.txt
-        static void regLog (const juce::String& line, bool reset = false)
-        {
-            juce::File f ("D:/workspace/BetelgeuseArranger/grex_drum.txt");
-            if (reset) f.replaceWithText (line + juce::newLine);
-            else       f.appendText     (line + juce::newLine);
-        }
-
         int scanFolder (const juce::File& folder, const juce::String& accessCode)
         {
-            regLog ("=== drum scanFolder ===", true);
-            regLog ("folder=" + folder.getFullPathName()
-                    + "  isDir=" + juce::String ((int) folder.isDirectory()));
             if (! folder.isDirectory()) return 0;
 
             int loaded = 0;
             juce::Array<juce::File> files;
             folder.findChildFiles (files, juce::File::findFiles, true, "*.frb");
-            regLog ("frbFound=" + juce::String (files.size()));
 
             //------------------------------------------------------------------
             // COMPONENT INDEX — built from the FOLDER STRUCTURE, before any of
             // the skips below.
             //
-            // This has to be independent of what becomes a "kit", because four
-            // of the ten folders never do: clap/ and kickmix/ are `continue`d a
-            // few lines down and loaded as pinned globals, and the_first/ is
-            // skipped outright.  Indexing off the kit list would therefore leave
-            // those editors pointing at nothing.  (low_kick/ was on this list
-            // until the sub-kick moved inside the kick blobs.)
+            // This has to be independent of what becomes a "kit", because two
+            // of the folders never do: clap/ and kickmix/ are `continue`d a
+            // few lines down and loaded as pinned globals.  Indexing off the
+            // kit list would therefore leave those editors pointing at nothing.
+            // (low_kick/ was on this list until the sub-kick moved inside the
+            // kick blobs; the_first/ was on it until its skip was removed and
+            // it became a real global component.)
             //
             // Indexing off the directory gives every folder the same treatment:
             // what files are in it, and which kit each one belongs to.  That is
@@ -142,6 +348,13 @@ namespace Betel
             {
                 const auto comp = f.getParentDirectory().getFileName().trim().toLowerCase();
                 if (comp.isEmpty()) continue;
+
+                // The key-33 blobs sit in kick/ but are not a kit's kick: their
+                // numeric "33" prefix would list them in the kick REPLACE droplist
+                // as a kit called "33", and picking it would re-source KICK and
+                // LOW KICK onto a file that carries neither.  They are chosen per
+                // kit family, never swapped, so they are not an alternative.
+                if (isKick33Stem (f.getFileNameWithoutExtension())) continue;
 
                 auto stem = f.getFileNameWithoutExtension();
                 const int us = stem.indexOfChar ('_');
@@ -158,9 +371,6 @@ namespace Betel
                 std::sort (c.second.begin(), c.second.end(),
                            [] (const ComponentFile& a, const ComponentFile& b)
                            { return a.kitKey < b.kitKey; });
-                regLog ("  component '" + c.first + "': "
-                        + juce::String ((int) c.second.size()) + " file(s)"
-                        + (c.second.size() > 1 ? "" : "   <<< no alternatives"));
             }
             for (const auto& f : files)
             {
@@ -172,39 +382,15 @@ namespace Betel
                 // shared file: every re-sampled kick blob carries its own note
                 // 35 beside its note 36, so there is nothing left to pin and
                 // nothing to skip.
-                if (f.getFileName().equalsIgnoreCase ("the_first.frb")) continue;
+                // the_first.frb WAS skipped here, back when the sub-GM keys were
+                // filled by cloning from the kit itself.  The skip was removed
+                // when a real blob replaced the clones, and that blob has since
+                // been split into revo_first / gm_first / the_second — all three
+                // GLOBAL, all catalogued through this same path, none skipped.
                 // kickmix/EDM.frb + WOOD.frb are supplemental crossfade layers
                 // for notes 35/36, not kits -- loaded separately below.
                 if (f.getParentDirectory().getFileName().equalsIgnoreCase ("kickmix")) continue;
                 if (loadKit (f, accessCode)) ++loaded;
-            }
-            regLog ("kitsLoaded=" + juce::String (loaded));
-
-            // Velocity-layer census.  If a kit reports keys == layers it is a
-            // SINGLE-LAYER blob and velocity can only change its LEVEL, never its
-            // timbre -- worth knowing, because that is the ceiling on how
-            // expressive it can ever be.
-            for (const auto& k : kits)
-            {
-                if (k == nullptr) continue;
-                std::array<int, 128> perKey {};
-                for (const auto& e : k->elements)
-                    if (e.midiKey >= 0 && e.midiKey < 128) ++perKey[(size_t) e.midiKey];
-
-                int keys = 0, layers = 0, maxLayers = 0;
-                for (int n = 0; n < 128; ++n)
-                    if (perKey[(size_t) n] > 0)
-                    {
-                        ++keys;
-                        layers   += perKey[(size_t) n];
-                        maxLayers = juce::jmax (maxLayers, perKey[(size_t) n]);
-                    }
-
-                regLog ("  kit '" + k->name + "': " + juce::String (keys) + " keys, "
-                        + juce::String (layers) + " layers (max "
-                        + juce::String (maxLayers) + "/key)"
-                        + (maxLayers <= 1 ? "   <<< SINGLE-LAYER: velocity can only change level"
-                                          : juce::String()));
             }
 
             // Decode the shared forced globals once.
@@ -234,7 +420,6 @@ namespace Betel
             // registry must not even open them.
             if (FullKitMap::isFullKitName (file.getFileNameWithoutExtension()))
             {
-                regLog ("  skip (full kit): " + file.getFileName());
                 return false;
             }
 
@@ -249,8 +434,7 @@ namespace Betel
             {
                 lastError = "Failed to open " + file.getFileName()
                           + ": " + juce::String (info->reader->getError());
-                regLog ("  OPEN-FAIL " + file.getFileName()
-                        + ": " + juce::String (info->reader->getError()));
+
                 return false;
             }
 
@@ -277,8 +461,12 @@ namespace Betel
                 auto stem = file.getFileNameWithoutExtension();
                 const int us = stem.indexOfChar ('_');
                 const juce::String prefix = (us > 0) ? stem.substring (0, us) : stem;
+                // The key-33 blobs are GLOBALS despite their numeric prefix:
+                // "33_soft_kick" must not collapse onto a kit named "33".  See
+                // the note beside kSoftKickKey.
                 const bool numericKit = prefix.isNotEmpty()
-                                     && prefix.containsOnly ("0123456789");
+                                     && prefix.containsOnly ("0123456789")
+                                     && ! isKick33Stem (stem);
                 info->isGlobal = ! numericKit;
                 info->name = (numericKit ? prefix : stem).trim().toLowerCase();
                 if (info->name.isEmpty())
@@ -293,15 +481,125 @@ namespace Betel
                                       .trim().toLowerCase();
             }
 
+            // ── A ZONED COMPONENT OWNS ITS SPAN AND NOTHING ELSE ─────────────
+            //
+            // Written when one blob covered the whole sub-GM span; it now reads
+            // for all four zoned components, which is what the clamp below has
+            // always actually enforced.  Beyond that zone it would also
+            // carry kick, side stick, snare, hand clap, toms and hats.  As a
+            // GLOBAL that is offered to every kit, and the merge in
+            // resolveDrumKitParams gap-fills: the kit's own element wins where
+            // it has one, the global lands where it does not.  So extra keys are
+            // discarded on a complete kit and FILLED IN on an incomplete one —
+            // which quietly puts Standard's snare on a Brush kit and Standard's
+            // hats on an Electro kit.  Kit identity is the whole point of having
+            // nine kits.
+            //
+            // Clamped HERE, at catalog time, rather than at the merge: the
+            // editor's keysForComponent reads the registry directly, so a merge-
+            // only clamp would leave the UNDER GM page showing controls for keys
+            // that cannot sound.  One place, one answer.
+            //
+            // This is the mirror of the_lasts' kTheLastsMaxNotes cap, which
+            // exists for exactly the same reason at the other end of the kit.
+            // A range is used rather than a count because this component's job
+            // is a fixed span of the XG map, not "however many it happens to
+            // hold".
+            // A component whose job is a FIXED SPAN of the map declares it here.
+            // Everything else (kick, snare, stick, metal, tom, clap, kickmix)
+            // has no zone and is left exactly as it was.
+            // MATCHED ON THE FOLDER *OR* THE BLOB'S OWN STEM, both spellings.
+            //
+            // Keying this on the folder name alone was too fragile: a blob that
+            // is not in a folder of exactly that name falls to the UNZONED path,
+            // which takes the raw 35..81 window with no shift and no clamp - so
+            // a +12 sub-GM export's raw keys 35..46 are accepted at face value
+            // and land on the kit's toms and hi-hats. Key 41 is a SNARE ROLL and
+            // 44 is STICKS, which is a screech on a tom and a scratch on a hat.
+            //
+            // Silent, and it only shows on kits with a hole there, so it reads
+            // as a random bad sample rather than a mapping fault. Accept every
+            // spelling instead: the folder (the_first / the_last) and the blob
+            // stem (the_firsts / the_lasts, and the singular forms).
+            const auto zoneTag = [&info] (const char* folder, const char* stem)
+            {
+                return info->component.equalsIgnoreCase (folder)
+                    || info->name     .equalsIgnoreCase (folder)
+                    || info->name     .equalsIgnoreCase (stem);
+            };
+
+            int zoneLo = -1, zoneHi = -1;
+            if      (zoneTag ("the_first", "the_firsts"))
+            {   zoneLo = kXgLowZoneLoKey;      zoneHi = kXgLowZoneHiKey;      }
+            else if (zoneTag ("the_second", "the_seconds"))
+            {   zoneLo = kLowSplitCommonLoKey; zoneHi = kLowSplitCommonHiKey; }
+            else if (zoneTag ("revo_first", "revo_firsts"))
+            {   zoneLo = kLowSplitKitLoKey;    zoneHi = kRevoExtraHiKey;      }
+            else if (zoneTag ("gm_first",   "gm_firsts"))
+            {   zoneLo = kLowSplitKitLoKey;    zoneHi = kLowSplitKitHiKey;    }
+            else if (zoneTag ("the_last",  "the_lasts"))
+            {   zoneLo = kXgHighZoneLoKey;     zoneHi = kXgHighZoneHiKey;     }
+            // The key-33 blobs own exactly one key.  A zone of [33, 33] is what
+            // lets the octave detector below repair a +12 export by itself:
+            // 33_soft_kick authored at 45 lies outside the zone and lands inside
+            // after -12, so it moves; a blob authored at 33 is already inside,
+            // fails the detector's first test, and stays exactly where it is.
+            // Neither file needs to announce which kind of export it is.
+            else if (isKick33Stem (info->name))
+            {   zoneLo = kSoftKickKey;         zoneHi = kSoftKickKey;         }
+            const bool hasZone = (zoneLo >= 0);
+
+            // ── OCTAVE CORRECTION, DETECTED RATHER THAN ASSUMED ───────────────
+            //
+            // The first the_first export was authored an octave high: its keys
+            // ran 25..46 where the XG zone is 13..34.  The sample names track the
+            // written keys, so the offset is in the export, not in the audio.
+            //
+            // A hard-coded -12 would become a trap the day the exporter is
+            // fixed — a correct blob would then be shifted DOWN into 1..22.  So
+            // the shift is derived instead: it applies only when EVERY key the
+            // blob maps sits outside the zone AND lands inside it after the
+            // shift.  A correctly authored blob is already inside the zone, the
+            // test fails on the first condition, and nothing moves.
+            //
+            // Only whole octaves are considered, and only for this component.
+            int zoneKeyShift = 0;
+            if (hasZone)
+            {
+                int blobLo = 128, blobHi = -1;
+                for (const auto& p : presets)
+                    for (const auto& r : p.regions)
+                    {
+                        const int a = (int) r.keyRangeLow, b = (int) r.keyRangeHigh;
+                        const int kk = (a == b) ? a : (int) r.rootKey;
+                        if (kk < 0 || kk > 127) continue;
+                        blobLo = juce::jmin (blobLo, kk);
+                        blobHi = juce::jmax (blobHi, kk);
+                    }
+
+                if (blobHi >= blobLo
+                    && ! (blobLo >= zoneLo && blobHi <= zoneHi))
+                {
+                    // Closest octave first, both directions.  The guard is what
+                    // makes this safe: the shift is taken only if it brings the
+                    // WHOLE span inside the zone, so a correctly authored blob
+                    // fails at the `already inside` test above and never moves.
+                    for (const int oct : { -12, 12, -24, 24, -36, 36, -48, 48 })
+                        if (blobLo + oct >= zoneLo && blobHi + oct <= zoneHi)
+                        {
+                            zoneKeyShift = oct;
+                            break;
+                        }
+                }
+            }
+
             // Walk every preset / region; catalog only regions with a real role.
             int cataloged = 0;
-            int totalRegions = 0;
             for (int pi = 0; pi < (int) presets.size(); ++pi)
             {
                 const auto& preset = presets[(size_t) pi];
                 for (int ri = 0; ri < (int) preset.regions.size(); ++ri)
                 {
-                    ++totalRegions;
                     const auto& region = preset.regions[(size_t) ri];
 
                     // ── Resolve the GM key of this drum element ──────────────
@@ -309,20 +607,57 @@ namespace Betel
                     // unset, so derive the key in priority order:
                     //   1. single-key range (lokey == hikey) — how drum elements
                     //      are authored (one key per element);
-                    //   2. rootKey, if it lands in the GM percussion span;
+                    //   2. rootKey;
                     //   3. otherwise skip the region.
-                    // Role follows the key (GM role = note - 34) unless the blob
-                    // explicitly tagged one (v3+).
+                    //
+                    // THE ACCEPTANCE WINDOW DEPENDS ON WHETHER THE COMPONENT HAS
+                    // A ZONE, AND IT MUST BE TESTED AFTER THE OCTAVE SHIFT.
+                    //
+                    // A zoned component is filtered by its zone, so the raw
+                    // window has to be wide open: the_last's blob is authored at
+                    // 72..95 and a raw window ending at 81 would throw away keys
+                    // 84..95 — half the component — BEFORE the shift that makes
+                    // them legal ever ran.  Order matters here, not just range.
+                    //
+                    // An unzoned component (kick, snare, stick, metal, tom …)
+                    // keeps the original 35..81 GM span exactly, so nothing
+                    // about those changes.
+                    //
+                    // Role follows the key unless the blob explicitly tagged one
+                    // (v3+), and it is resolved by getGMRoleForMidiKey rather
+                    // than by `key - 34` here — that arithmetic is only valid
+                    // for 35..83 and runs NEGATIVE below it, which a uint8_t
+                    // cast then wraps into a garbage role.
+                    const int rawLo = hasZone ?   0 : 35;
+                    const int rawHi = hasZone ? 127 : 81;
+
                     const int lo = (int) region.keyRangeLow;
                     const int hi = (int) region.keyRangeHigh;
                     const int rk = (int) region.rootKey;
                     int key = -1;
-                    if (lo == hi && lo >= 35 && lo <= 81)      key = lo;
-                    else if (rk >= 35 && rk <= 81)             key = rk;
+                    if (lo == hi && lo >= rawLo && lo <= rawHi)      key = lo;
+                    else if (rk >= rawLo && rk <= rawHi)             key = rk;
                     if (key < 0) continue;   // unmappable -> skip
 
+                    // Octave correction, then the zone.  Both are no-ops for a
+                    // component with no zone, and the shift is 0 for a blob
+                    // already authored inside its zone.
+                    key += zoneKeyShift;
+
+                    if (hasZone && (key < zoneLo || key > zoneHi))
+                        continue;
+
+                    // Named keys this component must not contribute — applied
+                    // AFTER the octave correction, so it is the key the player
+                    // actually hears that is tested, not the key as authored.
+                    if (isSilencedComponentKey (info->component, key)
+                        || isSilencedComponentKey (info->name, key))
+                        continue;
+
                     int roleId = region.elementRoleId;
-                    if (roleId == 0) roleId = key - 34;
+                    if (roleId == 0)
+                        roleId = (int) DrumRoles::getGMRoleForMidiKey (key);
+                    if (roleId == 0) continue;   // no role -> nothing to catalog
 
                     // ── EVERY velocity layer, not just the loudest ───────────
                     // A velocity-layered blob carries SEVERAL regions per key --
@@ -354,29 +689,6 @@ namespace Betel
                     info->elements.push_back (h);
                     ++cataloged;
                 }
-            }
-
-            {
-                juce::String extra;
-                if (! presets.empty() && ! presets[0].regions.empty())
-                {
-                    const auto& r0 = presets[0].regions[0];
-                    extra = "  r0(rk=" + juce::String ((int) r0.rootKey)
-                          + " lo=" + juce::String ((int) r0.keyRangeLow)
-                          + " hi=" + juce::String ((int) r0.keyRangeHigh)
-                          + " role=" + juce::String ((int) r0.elementRoleId) + ")";
-                }
-                int kmin = 128, kmax = -1;
-                for (const auto& e : info->elements)
-                { kmin = juce::jmin (kmin, e.midiKey); kmax = juce::jmax (kmax, e.midiKey); }
-                if (kmax >= 0)
-                    extra += "  keys=" + juce::String (kmin) + ".." + juce::String (kmax);
-
-                regLog ("  " + file.getFileName() + "  name=" + info->name
-                        + " presets=" + juce::String ((int) presets.size())
-                        + " regions=" + juce::String (totalRegions)
-                        + " roleRegions=" + juce::String (cataloged)
-                        + (info->isGlobal ? "  [GLOBAL]" : "") + extra);
             }
 
             if (cataloged == 0)
@@ -424,8 +736,11 @@ namespace Betel
         //======================================================================
 
         /** Every component folder found under <root>/sounds/drums, sorted.
-            One editor per entry: clap, kick, kickmix, low_kick, metal, snare,
-            stick, the_first, the_last, tom. */
+            One editor per entry: clap, gm_first, kick, kickmix, metal,
+            revo_first, snare, stick, the_last, the_second, tom.
+
+            NOT a fixed list - it is whatever the scan found, so a library
+            missing a folder simply has no page for it. */
         std::vector<juce::String> getComponentNames() const
         {
             std::vector<juce::String> out;
@@ -470,8 +785,14 @@ namespace Betel
 
         /** Every catalogued element that came from this folder, optionally
             narrowed to one kit.  Elements only exist for folders the scan
-            actually loads - clap / low_kick / kickmix / the_first are pinned or
-            skipped, so they come back empty by design. */
+            actually loads - kickmix is loaded separately as a crossfade layer
+            and comes back empty by design, and low_kick is a PAGE rather than a
+            folder (note 35 lives in the kick blob).
+
+            the_first was named here as skipped.  It is not: the skip was removed
+            long before the folder was retired, and every low-zone component -
+            revo_first, gm_first, the_second - is catalogued normally and returns
+            its elements like any other. */
         std::vector<ElementHandle> getElementsForComponent (const juce::String& component,
                                                             const juce::String& kitKey = {}) const
         {
@@ -678,20 +999,18 @@ namespace Betel
 
             const auto clapFile = drumsFolder.getChildFile ("clap").getChildFile ("clap.frb");
             if (! clapFile.existsAsFile())
-            { regLog ("global clap: missing " + clapFile.getFullPathName()); return; }
+                return;
 
             BlobReader reader;
             if (! reader.open (clapFile.getFullPathName().toStdString(), accessCode.toStdString()))
-            { regLog ("global clap: open failed - " + juce::String (reader.getError())); return; }
+                return;
 
             const auto& presets = reader.getPresets();
             if (presets.empty() || presets.front().regions.empty())
-            { regLog ("global clap: no usable region"); return; }
+                return;
 
             globalClapSample = reader.getSampleDataFloat (presets.front().regions.front());
             globalClapLoaded = (globalClapSample.numFrames > 0);
-            regLog ("global clap: " + juce::String (globalClapLoaded ? "loaded " : "decode failed ")
-                    + juce::String (globalClapSample.numFrames) + " frames");
         }
 
         bool                            hasGlobalClap()       const noexcept { return globalClapLoaded; }
@@ -722,11 +1041,16 @@ namespace Betel
         //======================================================================
 
         //======================================================================
-        // NOTE: the old "the_first" global (a separate blob for the low keys) is
-        // gone.  The XG extended keys 25..34 are now filled by Channel.cpp's
-        // xgLowKeySubstitute(), which borrows the closest sound the KIT ITSELF
-        // already carries -- so a brush kit's soft kick (XG note 33) is that
-        // kit's own kick, in character, with no extra file to ship.
+        // NOTE: THIS BLOCK IS HISTORY, AND IT DESCRIBES THE ERA BEFORE LAST.
+        //
+        // There was a time when no blob covered the sub-GM keys and 25..34 were
+        // filled entirely by Channel.cpp's xgLowKeySubstitute(), borrowing the
+        // closest sound the kit itself already carried.
+        //
+        // Sampled blobs replaced that, and are now three: revo_first / gm_first
+        // over 13..22 and the_second over 23..34.  xgLowKeySubstitute still runs
+        // and still matters — it is the fallback for a library with no low-zone
+        // blob at all, and for any kit whose blob leaves a hole.
         //======================================================================
 
         //======================================================================
@@ -752,15 +1076,15 @@ namespace Betel
             {
                 const auto f = drumsFolder.getChildFile ("kickmix").getChildFile (fileName);
                 if (! f.existsAsFile())
-                { regLog ("kickmix: missing " + f.getFullPathName()); return; }
+                    return;
 
                 BlobReader reader;
                 if (! reader.open (f.getFullPathName().toStdString(), accessCode.toStdString()))
-                { regLog ("kickmix: open failed " + fileName + " - " + juce::String (reader.getError())); return; }
+                    return;
 
                 const auto& presets = reader.getPresets();
                 if (presets.empty() || presets.front().regions.empty())
-                { regLog ("kickmix: no usable region in " + fileName); return; }
+                    return;
 
                 for (const auto& reg : presets.front().regions)
                 {
@@ -769,9 +1093,7 @@ namespace Betel
                     out.push_back ({ reg, std::move (fs) });
                 }
                 okFlag = ! out.empty();
-                regLog ("kickmix " + fileName + ": "
-                        + juce::String (okFlag ? "loaded " : "decode failed ")
-                        + juce::String ((int) out.size()) + " layers");
+
             };
 
             loadOne ("EDM.frb",  edmKickLayers,  edmKickLoaded);

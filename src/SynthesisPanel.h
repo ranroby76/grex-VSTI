@@ -1,4 +1,5 @@
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 //==============================================================================
 // SynthesisPanel.h  —  Synthesis tab of the InstrEditorWindow.
 //
@@ -10,6 +11,7 @@
 #include "InstrEditPanel.h"
 #include "SliderNorm.h"   // every slider in the sound editors reads 0..100
 #include <cmath>
+#include <vector>         // the amp row is built, not braced - see layoutSliderRow
 
 class SynthesisPanel : public juce::Component
 {
@@ -18,7 +20,8 @@ public:
 
     SynthesisPanel()
     {
-        for (auto* s : { &sA,&sD,&sSus,&sR,&sGain }) { addAndMakeVisible(*s); s->onChange = notifyFn(); }
+        for (auto* s : { &sA,&sD,&sSus,&sR,&sCurve,&sGain,&sVar }) { addAndMakeVisible(*s); s->onChange = notifyFn(); }
+        sVar.setStep (1.0f);   // 0..100, whole numbers
         // 201 whole-number steps, 100 = unity.  Integer detents mean "this one
         // needed 85" is a value you can dial again on the next sound and compare
         // against, and it reads in the same units as the mixer fader's own
@@ -28,14 +31,35 @@ public:
         // dialog.  Forwarded up; the panel does not own the window.
         sGain.onLeftDoubleClick = [this] { if (onBaseUnityRequested) onBaseUnityRequested(); };
 
-        // Amp decay/release CURVE selector — header row above the A/D/S/R sliders.
-        const juce::String ampCurveLabels[3] = { "EXP", "LIN", "LOG" };
-        for (int i = 0; i < 3; ++i)
+        // ── THE ENVELOPE KNOBS READ WHAT THEY MEAN ───────────────────────────
+        //
+        // D and R hold 0..100 because the drag is linear and their scale is not,
+        // so without this the number under them is a knob position rather than a
+        // time.  That is how a release of "70" went from 2.1 s to 629 ms in a
+        // rebuild with nothing on screen to notice it by.
+        sD.displayFn = [] (float ui) { return timeText (expUiToTime (ui, kDecMinS, kDecMaxS)); };
+        sR.displayFn = [] (float ui) { return timeText (expUiToTime (ui, kRelMinS, kRelMaxS)); };
+
+        // SHAPE reads its FAMILIAR NAME and its exponent.  The old EXP/LIN/LOG
+        // buttons were three points on this knob; naming them here gives back
+        // the one thing those buttons really offered — somewhere to aim — while
+        // keeping the ninety-eight positions between them.
+        sCurve.displayFn = [] (float ui)
         {
-            ampCurveBtns[i].setButtonText(ampCurveLabels[i]);
-            ampCurveBtns[i].onClick = [this, i] { setAmpCurve(i); };
-            addAndMakeVisible(ampCurveBtns[i]);
-        }
+            const float k = sliderToCurveK (ui);
+            const juce::String name = k <= -8.0f ? "SWELL"
+                                    : k <  -2.0f ? "LOG"
+                                    : k <=  2.0f ? "LIN"
+                                    : k <   9.0f ? "EXP"
+                                                 : "TIGHT";
+            return name + " " + juce::String (k, 1);
+        };
+
+        // The EXP / LIN / LOG selector that used to sit above the A/D/S/R row is
+        // GONE.  Those were three fixed points on the SHAPE knob beside them —
+        // +6, 0, -4 — so once the knob existed they were three ways of typing a
+        // number you can already dial, and a control that only ever agrees with
+        // another control is one to delete.
 
         addAndMakeVisible(sCut); sCut.onChange = notifyFn();
         addAndMakeVisible(sRes); sRes.onChange = notifyFn();
@@ -106,8 +130,8 @@ public:
         sRange.setRange (0.0, 127.0, 1.0);
         sRange.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
         sRange.setColour (juce::Slider::backgroundColourId, juce::Colour (0xFF2E2E2E));
-        sRange.setColour (juce::Slider::trackColourId,      juce::Colour (0xFFB87A36));
-        sRange.setColour (juce::Slider::thumbColourId,      juce::Colour (0xFFF0B265));
+        sRange.setColour (juce::Slider::trackColourId,      juce::Colour (Betel::Pal::kAccent));
+        sRange.setColour (juce::Slider::thumbColourId,      juce::Colour (Betel::Pal::kAccentLight));
         sRange.setMinAndMaxValues ((double) noteRangeLo, (double) noteRangeHi,
                                    juce::dontSendNotification);
         sRange.onValueChange = [this] { onRangeChanged(); };
@@ -120,7 +144,6 @@ public:
 
         refreshFilterButtons();
         refreshMonoButtons();
-        refreshAmpCurveButtons();
         refreshRangeEnabled();
         updateRangeLabel();
     }
@@ -131,14 +154,15 @@ public:
     void loadParams(const SlotParams& p)
     {
         sA  .setValue (Betel::Norm::envToUi (p.attack, Betel::Norm::kAmpAtkMaxS));
-        sD  .setValue (p.decay   / 7.0f * 100.0f);      // already 0..100
+        sD  .setValue (expTimeToUi (p.decay,   kDecMinS, kDecMaxS));
         sSus.setValue (Betel::Norm::unitToUi (p.sustain));
-        sR  .setValue (p.release / 3.0f * 100.0f);      // already 0..100
+        sR  .setValue (expTimeToUi (p.release, kRelMinS, kRelMaxS));
         sGain.setValue(p.gainPercent);
-        ampCurve = juce::jlimit(0, 2, p.ampCurve);
+        sCurve.setValue (curveKToSlider (p.ampCurveK));
 
         sCut.setValue(p.filterCutoff * 100.0f); sRes.setValue(p.filterReson * 100.0f);
         sKey.setValue(p.filterKeytrack);
+        sVar.setValue((float) juce::jlimit (0, 100, p.variationAmount));
         filterType = juce::jlimit(0, 3, p.filterType);
 
         velCurveBox.setCurve (p.velCurve, juce::dontSendNotification);
@@ -171,21 +195,24 @@ public:
 
         refreshFilterButtons();
         refreshMonoButtons();
-        refreshAmpCurveButtons();
         repaint();
     }
 
     void readInto(SlotParams& p) const
     {
         p.attack  = Betel::Norm::uiToEnv (sA.getValue(), Betel::Norm::kAmpAtkMaxS);
-        p.decay   = sD.getValue() * 0.07f;
+        p.decay   = expUiToTime (sD.getValue(), kDecMinS, kDecMaxS);
         p.sustain = Betel::Norm::uiToUnit (sSus.getValue());
-        p.release = sR.getValue() * 0.03f;
+        p.release = expUiToTime (sR.getValue(), kRelMinS, kRelMaxS);
         p.gainPercent = sGain.getValue();
-        p.ampCurve = ampCurve;
+        // ampCurve (the old 0/1/2) is deliberately left alone: it is still in the
+        // save format so an older build could read the file, and it is still what
+        // an older FILE is read through, but nothing sets it from here any more.
+        p.ampCurveK = sliderToCurveK (sCurve.getValue());
 
         p.filterCutoff = sCut.getValue() / 100.0f; p.filterReson = sRes.getValue() / 100.0f;
         p.filterKeytrack = sKey.getValue();
+        p.variationAmount = juce::jlimit (0, 100, (int) std::lround (sVar.getValue()));
         p.filterType = filterType;
 
         p.velCurve = velCurveBox.getCurve();
@@ -213,9 +240,36 @@ public:
         p.noteRangeHi = noteRangeHi;
     }
 
+    //==========================================================================
+    // THE PER-SOUND GAIN IS A SOLO-ONLY CONTROL NOW.
+    //
+    // Under the gain model a STYLE slot's level is the style's own decision,
+    // taken whole, with the mixer fader as the one adjustment on top.  A GAIN
+    // trim living in the sound editor was a second authority over the same
+    // level - which is what produced a night of "the set's gain keeps
+    // reverting", because a per-sound reset kept flattening a value the set
+    // owned and the editor kept putting back.
+    //
+    // Solo keeps it: nothing competes there, so a per-sound trim is exactly
+    // what it claims to be.
+    //==========================================================================
+    void setGainVisible (bool shouldShow)
+    {
+        if (gainVisible == shouldShow) return;
+        gainVisible = shouldShow;
+        sGain.setVisible (gainVisible);
+        resized();
+    }
+
     /** Non-bass style slots (3..7) use the two-thumb BAND filter instead of the
         classic CUT/RES/KEY + type, and drop the FILTER ENV section (a band has
         no single cutoff to sweep).  Driven by InstrEditorWindow per slot. */
+    /** ENERGY's curve offset, so the velocity display reads what is actually in
+        force rather than only what this slot stores.  Style slots only - ENERGY
+        does not touch the solo bank. */
+    void setEnergyOffset (float curveOffset)
+    { velCurveBox.setEnergyOffset (curveOffset); }
+
     void setBandMode(bool useBand)
     {
         if (bandMode == useBand) return;
@@ -261,17 +315,27 @@ public:
         // ── AMP ENV ──────────────────────────────────────────────────────────
         {
             auto inner = InstrEditStyle::componentFrameContent(secs[0]);
-            const int btnRowH = 22;
-            const int btnW     = (inner.getWidth() - 4) / 3;
-            for (int i = 0; i < 3; ++i)
-                ampCurveBtns[i].setBounds(inner.getX() + i * (btnW + 2),
-                                          inner.getY(), btnW, btnRowH);
-            // Sliders take the space below the curve header (shortened).
+
+            // The 22 px button header that used to sit above this row is gone
+            // with the EXP / LIN / LOG buttons, so the sliders get the whole
+            // frame — SHAPE reads its name in its own readout now.
+            //
             // GAIN joins the amp row because that is where level lives, and it
             // puts the per-sound trim on the first page of the editor — the
             // point of it is quick A/B calibration against the last sound.
-            layoutSliderRow({ &sA,&sD,&sSus,&sR,&sGain },
-                            inner.withTrimmedTop(btnRowH + 6));
+            // VAR joins the AMP row rather than the FILTER row, and not for
+            // space: the filter row is replaced wholesale by the two-thumb band
+            // slider on style slots 3..7, so a control parked there would simply
+            // vanish on five of the eight style sounds. The amp row is the one
+            // that is always present.
+            // GAIN LEAVES THE ROW ENTIRELY when hidden, rather than being made
+            // invisible in place - a reserved gap would read as a missing
+            // control on every style slot.  The remaining five share the width.
+            std::vector<GoldSlider*> ampRow { &sA, &sD, &sSus, &sR, &sCurve };
+            if (gainVisible) ampRow.push_back (&sGain);
+            ampRow.push_back (&sVar);
+
+            layoutSliderRow(ampRow, inner);
         }
 
         // ── FILTER (classic CUT/RES/KEY + type)  or  BAND (two-thumb) ────────
@@ -431,24 +495,32 @@ private:
         return juce::String (nm[n % 12]) + juce::String (n / 12 - 1);
     }
 
-    // Enforce the gap rule for the active mode on (noteRangeLo, noteRangeHi).
+    // Enforce the gap rule on (noteRangeLo, noteRangeHi).
     // A "12-note window" means hi-lo == 11 semitones (one per pitch class).
-    //   mode 1 (bass)  : span LOCKED to exactly 11.
-    //   mode 2 (others): span ≥ 11 (may be wider).
+    //   ALL slots, bass included: span >= 11, free to be wider.
     // loFixed = keep lo and push hi; otherwise keep hi and pull lo.
+    //
+    // THE BASS USED TO BE LOCKED TO EXACTLY 11 and it no longer is.
+    //
+    // The lock came from the octave-fold: a window narrower than 12 semitones
+    // cannot contain every pitch class, so a folded note could have nowhere
+    // legal to land and the fold would not converge.  That argument justifies
+    // a FLOOR of 11 - which is still enforced, here and again in
+    // StylePlayer::setNoteRange - but it never justified a CEILING.  A bass
+    // free to use two octaves folds perfectly well; it simply folds less often.
+    //
+    // Locking it also made the bass the one channel whose ALLOWED NOTES control
+    // behaved unlike every other channel's, which is a worse cost than it looks:
+    // a control that moves differently in one place teaches the player not to
+    // trust it anywhere.
     void applyGapRule (bool loFixed)
     {
-        const int kSpan = 11;   // 12-note window
+        const int kSpan = 11;   // 12-note window, now a FLOOR everywhere
         noteRangeLo = juce::jlimit (0, 127, noteRangeLo);
         noteRangeHi = juce::jlimit (0, 127, noteRangeHi);
         if (noteRangeHi < noteRangeLo) { const int t = noteRangeLo; noteRangeLo = noteRangeHi; noteRangeHi = t; }
 
-        if (noteRangeMode == 1)                    // bass: exact span
-        {
-            if (loFixed) noteRangeHi = noteRangeLo + kSpan;
-            else         noteRangeLo = noteRangeHi - kSpan;
-        }
-        else if (noteRangeHi - noteRangeLo < kSpan) // others: minimum span
+        if (noteRangeHi - noteRangeLo < kSpan)     // every slot: minimum span
         {
             if (loFixed) noteRangeHi = noteRangeLo + kSpan;
             else         noteRangeLo = noteRangeHi - kSpan;
@@ -459,8 +531,7 @@ private:
         if (noteRangeLo < 0)   { noteRangeLo = 0;   noteRangeHi = juce::jmin (127, noteRangeLo + kSpan); }
     }
 
-    // Two-thumb slider moved.  Bass (mode 1) keeps a locked 12-note window —
-    // the un-dragged thumb follows.  Other slots (mode 2) may widen freely but
+    // Two-thumb slider moved.  EVERY slot, bass included, may widen freely but
     // not narrow below 12 notes: at the floor the dragged thumb stops and the
     // other stays put.  Result is written back and the readout refreshed.
     void onRangeChanged()
@@ -470,12 +541,10 @@ private:
         const int  kSpan   = 11;                   // 12-note window
         const bool loMoved = (lo != prevLo);
 
-        if (noteRangeMode == 1)                    // bass: locked span, window slides
-        {
-            if (loMoved) hi = lo + kSpan;
-            else         lo = hi - kSpan;
-        }
-        else if (hi - lo < kSpan)                  // others: floor — stop the dragged thumb
+        // ONE RULE FOR EVERY SLOT.  The bass used to slide a locked 12-note
+        // window here; now it hits the same floor as the rest and is free above
+        // it.  See applyGapRule for why the floor stays and the ceiling went.
+        if (hi - lo < kSpan)                       // floor - stop the dragged thumb
         {
             if (loMoved) lo = hi - kSpan;
             else         hi = lo + kSpan;
@@ -544,7 +613,7 @@ private:
     { return [this](float){ if (onAnythingChanged) onAnythingChanged(); }; }
 
     void setFilterType(int t)  { filterType = t; refreshFilterButtons(); if (onAnythingChanged) onAnythingChanged(); }
-    void setAmpCurve(int c)    { ampCurve = c;   refreshAmpCurveButtons(); if (onAnythingChanged) onAnythingChanged(); }
+    // The buttons are SHORTCUTS now: each jumps the knob to its exact point.
     void setPlayMode(int m)    { playMode = m;   refreshMonoButtons();   if (onAnythingChanged) onAnythingChanged(); }
     void toggleMonoFlag(int i) // 0=HoldStolen 1=RetrigNew 2=RetrigStolen — independent
     {
@@ -553,12 +622,6 @@ private:
         else             monoRetrigStolen = ! monoRetrigStolen;
         refreshMonoButtons();
         if (onAnythingChanged) onAnythingChanged();
-    }
-
-    void refreshAmpCurveButtons()
-    {
-        for (int i = 0; i < 3; ++i)
-            InstrEditStyle::styleSquareButton(ampCurveBtns[i], ampCurve == i);
     }
 
     void refreshFilterButtons()
@@ -594,7 +657,14 @@ private:
         sPort.setAlpha(monoActive ? 1.0f : 0.4f);
     }
 
-    void layoutSliderRow(std::initializer_list<GoldSlider*> sliders, juce::Rectangle<int> bounds)
+    // TWO OVERLOADS ON PURPOSE.  The amp row is BUILT at runtime now, because
+    // GAIN drops out of it on a style slot and an initializer_list cannot be
+    // conditional - so it needs the template.  But a BRACED LIST cannot deduce
+    // a template parameter (it has no type until it is bound), so the other
+    // call sites, which are still written out literally, need the original
+    // signature kept alongside.  Removing it is what broke the FILTER row.
+    template <typename Range>
+    void layoutSliderRow(const Range& sliders, juce::Rectangle<int> bounds)
     {
         const int n = (int) sliders.size();
         if (n <= 0) return;
@@ -605,23 +675,86 @@ private:
             s->setBounds(bounds.getX() + i++ * (w + g), bounds.getY(), w, bounds.getHeight());
     }
 
-    // D and R read 0..100 and map to REAL durations: D 100 = 7 s (linear time
-    // peak->sustain), R 100 = 3 s (linear time current-level->silence).
+    void layoutSliderRow(std::initializer_list<GoldSlider*> sliders, juce::Rectangle<int> bounds)
+    {
+        layoutSliderRow<std::initializer_list<GoldSlider*>>(sliders, bounds);
+    }
+
+    // ── D AND R ARE EXPONENTIAL, AND THAT IS THE WHOLE POINT ─────────────────
+    //
+    // They were linear: R spanned 0-3 s across 100 steps, so EVERYTHING under
+    // 150 ms lived in knob positions 1 to 5.  Five steps out of a hundred for
+    // the entire tight-release region, which is why the knob felt like it did
+    // nothing and then did everything.
+    //
+    // Three decades each instead, so equal knob movement is equal RATIO — the
+    // way time is actually heard:
+    //
+    //      R  5 ms .. 5 s     0-20 SFZ-tight | 30-40 tight | 50-60 natural
+    //                         70-80 long     | 90-100 swell
+    //      D  5 ms .. 20 s    decay legitimately runs long, so it gets more top
+    //
+    // 5 ms at the bottom rather than 0 because below ~3 ms a note-off CLICKS.
+    // The envelope will happily do 0 and it sounds like a fault.
+    //
+    // NOTHING MIGRATES.  SlotParams still stores SECONDS; only the knob's curve
+    // changed.  Every existing preset keeps its exact time and simply shows at
+    // a different position — today's 450 ms lands on 65, 900 ms on 75.
+    static constexpr float kRelMinS = 0.005f, kRelMaxS = 5.0f;
+    static constexpr float kDecMinS = 0.005f, kDecMaxS = 20.0f;
+
+    /** ms under a second, seconds above — the same rule GoldSlider's own "s"
+        unit follows, so the two can never disagree. */
+    static juce::String timeText (float sec)
+    {
+        return sec < 1.0f ? juce::String ((int) std::lround (sec * 1000.0f)) + "ms"
+                          : juce::String (sec, 2) + "s";
+    }
+
+    static float expUiToTime (float ui, float lo, float hi)
+    {
+        return lo * std::pow (hi / lo, juce::jlimit (0.0f, 100.0f, ui) * 0.01f);
+    }
+    static float expTimeToUi (float t, float lo, float hi)
+    {
+        if (t <= lo) return 0.0f;
+        return juce::jlimit (0.0f, 100.0f,
+                             100.0f * std::log (t / lo) / std::log (hi / lo));
+    }
     GoldSlider sA   { "A", 0.0f, 100.0f,   0.0f, "" };
     GoldSlider sD   { "D", 0.0f, 100.0f, 100.0f, "" };
     GoldSlider sSus { "S", 0.0f, 100.0f,   0.0f, "" };
     GoldSlider sR   { "R", 0.0f, 100.0f,  15.0f, "" };
+
+    // ── THE DECAY/RELEASE SHAPE, AS A KNOB ───────────────────────────────────
+    //
+    // 50 is linear.  Below it the level holds and then drops (swell — strings,
+    // choir, pads); above it the fall is front-loaded and the tail leaves
+    // sooner, which is what a tight release is.
+    //
+    //      k = (slider - 50) * 0.4      so  40 = Log(-4), 50 = Lin(0), 65 = Exp(+6)
+    //
+    // The three legacy shapes are exact points on this, which is why the EXP /
+    // LIN / LOG buttons still work: they now just jump the knob.
+    GoldSlider sCurve { "SHAPE", 0.0f, 100.0f, 65.0f, "" };
+
+    static float sliderToCurveK (float ui)  { return (juce::jlimit (0.0f, 100.0f, ui) - 50.0f) * 0.4f; }
+    static float curveKToSlider (float k)   { return juce::jlimit (0.0f, 100.0f, k / 0.4f + 50.0f); }
 
     // Per-sound calibration trim, 0..200 with 100 = UNITY.  Saved with the
     // voice (.ins / .sins / .drm / set), so once a sound is levelled it stays
     // levelled everywhere it loads — the style's own CC 7 and the mixer fader
     // are untouched by it.
     GoldSlider sGain { "GAIN", 0.0f, 200.0f, 100.0f, "" };
+    bool       gainVisible = true;
 
     GoldSlider sCut { "CUT", 0.0f, 100.0f, 100.0f, "" };   // 0..100 display; param stays 0..1
     GoldSlider sRes { "RES", 0.0f, 100.0f, 0.0f,   "" };   // 0..100 display; param stays 0..1
     GoldSlider sKey { "KEY", 0.0f, 100.0f, 0.0f, "" };
-    juce::TextButton ampCurveBtns[3];
+
+    // Melodic pseudo round robin depth. Lives in the AMP row because that row
+    // survives band mode; see the layout comment. 0 = off, and off is default.
+    GoldSlider sVar { "VAR", 0.0f, 100.0f, 0.0f, "" };
     juce::TextButton filtTypeBtns[4];
     int filterType = 0;
 
@@ -643,13 +776,18 @@ private:
 
     juce::TextButton btnPoly, btnMono;
     juce::TextButton monoSubBtns[3];
-    int ampCurve = 0;   // 0=Exp 1=Lin 2=Log
     int playMode = 0;
     bool monoHoldStolen = true, monoRetrigNew = false, monoRetrigStolen = false;
     GoldSlider sPort { "PORT", 0.0f, 100.0f, 22.0f, "" };   // 22 -> ~100 ms
     GoldSlider sOct  { "OCT",  -3.0f, 3.0f, 0.0f, "" };   // 7 steps, -3..+3
 
-    int noteRangeMode = 0;   // 0 hidden / 1 bass-locked / 2 free melodic
+    // 0 = the ALLOWED NOTES row is hidden entirely (drum slots, solo slots).
+    // 1 and 2 both mean VISIBLE AND FREELY EDITABLE now: 1 used to mean
+    // "bass, span locked to 12" and no longer does, so the two behave
+    // identically and only (mode != 0) is ever tested.  The distinction is kept
+    // because SoundsTab still passes 1 for the bass slot and a caller passing a
+    // value the enum no longer honours is better than a silent renumber.
+    int noteRangeMode = 0;
 
     juce::TextButton btnRangeOn;                 // ALLOWED NOTES on/off toggle
     juce::Slider     sRange;                     // two-thumb [lo,hi] window

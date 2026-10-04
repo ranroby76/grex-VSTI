@@ -1,7 +1,12 @@
+
+
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 #include <JuceHeader.h>
 #include <array>
 #include "InstrEditPanel.h"    // GoldSlider — the plugin's own fader look
+#include "EdmKitFiles.h"      // an EDM kit on DRUMS: its own crash pads name the options
                                // (pulls JuceHeader, hence the switch above)
 
 //==============================================================================
@@ -76,7 +81,7 @@ public:
         addAndMakeVisible (btnNPlus);
 
         lblN.setJustificationType (juce::Justification::centred);
-        lblN.setColour (juce::Label::textColourId, juce::Colour (0xFFD4AF37));
+        lblN.setColour (juce::Label::textColourId, juce::Colour (Betel::Pal::kAccentBright));
         lblN.setColour (juce::Label::backgroundColourId, juce::Colour (0xFF101010));
         lblN.setFont (juce::Font (18.0f, juce::Font::bold));
         addAndMakeVisible (lblN);
@@ -86,12 +91,12 @@ public:
         // rust fill so they read as a pair, with a hairline between them rather
         // than a gap — the divider marks two jobs, not two controls.
         btnCrashNow.setButtonText ("CRASH NOW");
-        btnCrashNow.setColour (juce::TextButton::buttonColourId, juce::Colour (0xFF7A2E00));
+        btnCrashNow.setColour (juce::TextButton::buttonColourId, juce::Colour (Betel::Pal::kAccentAlert));
         btnCrashNow.onClick = [this] { if (onManualCrash) onManualCrash(); };
         addAndMakeVisible (btnCrashNow);
 
         btnSave.setButtonText ("SAVE");
-        btnSave.setColour (juce::TextButton::buttonColourId, juce::Colour (0xFF7A2E00));
+        btnSave.setColour (juce::TextButton::buttonColourId, juce::Colour (Betel::Pal::kAccentAlert));
         btnSave.onClick = [this] { if (onSaveSettings) onSaveSettings(); };
         addAndMakeVisible (btnSave);
 
@@ -169,6 +174,39 @@ public:
                           juce::dontSendNotification);
     }
     int  crashVelocity() const         { return (int) velSlider.getValue(); }
+
+    /** Host -> tab, every UI tick: the kit on the DRUMS slot and its EDM edits.
+        On an EDM kit the four options are named after the kit's OWN crash pads
+        (the purple ones) - the ones triggerCrash fires there; on any other kit
+        they are the GM cymbals.  Does nothing unless the kit or its edits
+        changed, so calling it on every tick costs one string compare. */
+    void setDrumsKit (const juce::String& kitName, const juce::String& edmEdits)
+    {
+        const juce::String sig = kitName + "\n" + edmEdits;
+        if (sig == drumsKitSig) return;
+        drumsKitSig = sig;
+
+        std::array<juce::String, 4> labels;
+        for (int i = 0; i < 4; ++i) labels[(size_t) i] = kNoteLabels[i];
+
+        if (kitName.startsWith ("EDM "))
+        {
+            auto kHeap = std::make_unique<edm::Kit>();          // ~37 KB kit: heap
+            if (EdmKitFiles::resolve (kitName, edmEdits, *kHeap))
+            {
+                edm::assignFamilies (*kHeap);
+                int keys[4];
+                edm::crashPads (*kHeap, kCrashKeys, keys);
+                for (int i = 0; i < 4; ++i)
+                    labels[(size_t) i] = keys[i] < 0
+                        ? juce::String ("-- NO CRASH PAD")
+                        : juce::String (keys[i]) + " "
+                            + juce::String (kHeap->cells[(size_t) keys[i]].sound.name()).toUpperCase();
+            }
+        }
+        for (int i = 0; i < 4; ++i)
+            noteToggles[(size_t) i].setButtonText (labels[(size_t) i]);
+    }
     void setCrashNotesMask (juce::uint8 m)
     {
         for (int i = 0; i < 4; ++i) { noteSel[(size_t) i] = (m >> i) & 1; refreshNoteToggle (i); }
@@ -314,9 +352,9 @@ private:
     {
         g.setColour (juce::Colour (0xFF0E0E0E));
         g.fillRoundedRectangle (rr.toFloat(), 6.0f);
-        g.setColour (juce::Colour (0xFF3A3322));
+        g.setColour (juce::Colour (Betel::Pal::kTintPanel));
         g.drawRoundedRectangle (rr.toFloat(), 6.0f, 1.5f);
-        g.setColour (juce::Colour (0xFFD4AF37));
+        g.setColour (juce::Colour (Betel::Pal::kAccentBright));
         g.setFont (juce::Font (16.0f, juce::Font::bold));
         g.drawText (title, rr.withHeight (30).reduced (12, 4), juce::Justification::centredLeft);
     }
@@ -325,7 +363,7 @@ private:
     {
         b.setButtonText (on ? "ON" : "OFF");
         b.setColour (juce::TextButton::buttonColourId,
-                     on ? juce::Colour (0xFFCC6600) : juce::Colour (0xFF2A2A2A));
+                     on ? juce::Colour (Betel::Pal::kAccent) : juce::Colour (0xFF2A2A2A));
         // Black on the amber ON fill; white on the inert one.
         b.setColour (juce::TextButton::textColourOnId,
                      on ? juce::Colours::black : juce::Colours::white);
@@ -352,7 +390,7 @@ private:
         auto& b = noteToggles[(size_t) i];
         const bool on = noteSel[(size_t) i];
         b.setColour (juce::TextButton::buttonColourId,
-                     on ? juce::Colour (0xFFCC6600) : juce::Colour (0xFF2A2A2A));
+                     on ? juce::Colour (Betel::Pal::kAccent) : juce::Colour (0xFF2A2A2A));
         // Black on the amber ON fill; white on the inert one.
         b.setColour (juce::TextButton::textColourOnId,
                      on ? juce::Colours::black : juce::Colours::white);
@@ -365,6 +403,9 @@ private:
     // key actually is, rather than "OPEN B/C/D".
     static constexpr const char* kNoteLabels[4] = { "49 CRASH 1", "55 SPLASH",
                                                     "52 CHINESE", "57 CRASH 2" };
+    // The same four keys, as numbers - kCrashNotes in Main.cpp, bit for bit.
+    static constexpr int kCrashKeys[4] = { 49, 55, 52, 57 };
+    juce::String drumsKitSig;                  // kit name + EDM edits the labels were built for
 
     juce::TextButton toggleTransition, toggleAuto;
     juce::TextButton btnNMinus, btnNPlus, btnCrashNow, btnSave;

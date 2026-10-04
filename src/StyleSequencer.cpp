@@ -1,5 +1,4 @@
 #include "StyleSequencer.h"
-#include "GlobalMacros.h"      // GrexPaths::styleLog — the transition diagnostic
 #include <algorithm>
 #include <cmath>
 
@@ -22,6 +21,7 @@ namespace Betel
         currentVariation.store ((int) StyleVariation::A);
         nextAfterCurrent.store (kAfterLoop);
         localTick       .store (0.0);
+        endingTailTicks .store (0.0);
         eventCursor   = 0;
         sectionEntryTick = 0.0;
 
@@ -50,6 +50,16 @@ namespace Betel
 
         if (transport.load() == StyleTransport::Stopped)
         {
+            // LAST PRESS WINS. An INTRO or ENDING armed a moment ago outranks
+            // this variation in the queued-section getter, so without dropping
+            // it the panel would go on showing the older press and this one
+            // would look ignored.
+            //
+            // AFTER the viaFill store above, deliberately - performVariation
+            // calls triggerFill() straight after us for a FILL press, and that
+            // sets its own flag.
+            clearPendingSections();
+
             // Not running yet — set the variation that an upcoming start() will use.
             currentVariation.store ((int) v);
             currentSection  .store ((int) mainSectionFor (v));
@@ -62,20 +72,40 @@ namespace Betel
         }
     }
 
+    /** True while nothing is consuming the pending flags, which is the only
+        situation in which they can pile up. */
+    bool StyleSequencer::isStoppedForArming() const noexcept
+    {
+        return transport.load() != StyleTransport::Playing;
+    }
+
     void StyleSequencer::triggerIntro (int idx)
     {
         if (idx < 0 || idx > 2) return;
+        if (isStoppedForArming()) clearPendingSections();
         pendingIntro.store (idx);
     }
 
     void StyleSequencer::triggerEnding (int idx)
     {
         if (idx < 0 || idx > 2) return;
+        if (isStoppedForArming()) clearPendingSections();
         pendingEnding.store (idx);
     }
 
-    void StyleSequencer::triggerFill()  { pendingFill .store (true); }
-    void StyleSequencer::triggerBreak() { pendingBreak.store (true); }
+    // NOT cleared while PLAYING: there the boundary handler consumes them within
+    // a bar, and clearing would throw away a press the player has already made.
+    void StyleSequencer::triggerFill()
+    {
+        if (isStoppedForArming()) clearPendingSections();
+        pendingFill.store (true);
+    }
+
+    void StyleSequencer::triggerBreak()
+    {
+        if (isStoppedForArming()) clearPendingSections();
+        pendingBreak.store (true);
+    }
 
     // =========================================================================
     //  Query
@@ -171,20 +201,60 @@ namespace Betel
         return (int) jumpDestFor (s);   // transition -> its configured landing
     }
 
-    /** One line per transition into grex_log.txt.  Message/audio thread — a plain
-        append.  localTick is where the outgoing section had reached when the
-        transition fired, and len is the target section's own length: together
-        they say how much of the phrase was left on the table, which is the
-        measurement the phrase-anchored timing will be built from. */
-    void StyleSequencer::logTransition (const char* what, int section,
-                                        double lt, double len) const
+    void StyleSequencer::clearPendingSections() noexcept
     {
-        juce::String d;
-        d << "[trans] " << what
-          << " target="    << section
-          << " localTick=" << juce::String (lt, 1)
-          << " targetLen=" << juce::String (len, 1);
-        GrexPaths::styleLog().appendText (d + juce::newLine);
+        pendingIntro           .store (-1);
+        pendingEnding          .store (-1);
+        pendingBreak           .store (false);
+        pendingFill            .store (false);
+        pendingVariation       .store (-1);
+        pendingVariationViaFill.store (false);
+    }
+
+    StyleSection StyleSequencer::getQueuedOrCurrentSection() const noexcept
+    {
+        // SAME PRIORITY AS applyPendingAtBarBoundary, deliberately duplicated
+        // rather than shared: that function CONSUMES the flags and enters the
+        // section, and this one must not touch them.  If the order there ever
+        // changes it has to change here too, or the LED will point at a section
+        // the audio is not going to.
+        const int endingIdx = pendingEnding.load();
+        if (endingIdx >= 0)
+            return (StyleSection) ((int) StyleSection::EndingA + endingIdx);
+
+        const int introIdx = pendingIntro.load();
+        if (introIdx >= 0)
+            return (StyleSection) ((int) StyleSection::IntroA + introIdx);
+
+        const bool inMain = isMainSection (getCurrentSection());
+
+        // BREAK and plain FILL are only meaningful while a main is looping, and
+        // the boundary handler gates them the same way.  Lighting them from a
+        // non-main would advertise a transition that will never fire.
+        if (inMain && pendingBreak.load())
+            return StyleSection::FillBA;
+
+        const int newVarRaw = pendingVariation.load();
+        if (newVarRaw >= 0)
+        {
+            const auto v = (StyleVariation) newVarRaw;
+
+            // The lamp has to show which BUTTON was pressed, and VAR n and
+            // FILL n are different buttons that both land on variation n.  So
+            // the fill-vs-main choice here mirrors the boundary handler's:
+            // viaFill from a main plays the destination's FILL, everything else
+            // cuts straight to the main.
+            if (inMain && pendingVariationViaFill.load()
+                && newVarRaw != (int) getCurrentVariation())
+                return fillSectionFor (v);
+
+            return mainSectionFor (v);
+        }
+
+        if (inMain && pendingFill.load())
+            return fillSectionFor (getCurrentVariation());
+
+        return getCurrentSection();
     }
 
     void StyleSequencer::enterSection (StyleSection s, int afterCurrent)
@@ -349,6 +419,27 @@ namespace Betel
             // alone.  That is the intended sound — the final crash decaying
             // after the last hit.
             landingEvents.fetch_add (1, std::memory_order_relaxed);
+
+            // ── ARM THE SILENT TAIL RATHER THAN STOPPING HERE ────────────────
+            //
+            // See endingTailTicks in the header for why.  The transport stays
+            // Playing for half a bar with nothing left to emit, so the final
+            // chord completes its own release before the processor's stopped-edge
+            // flush can cut it.
+            //
+            // Falls back to stopping immediately if the style's meter cannot be
+            // read — a tail of unknown length is worse than none.
+            if (const auto* st = stylePtr.load())
+            {
+                const int bt = st->ticksPerQuarter * st->timeSigNum * 4
+                                   / std::max (1, st->timeSigDen);
+                if (bt > 0)
+                {
+                    endingTailTicks.store ((double) bt * kEndingTailBars);
+                    return;                      // transport stays Playing
+                }
+            }
+
             transport.store (StyleTransport::Stopped);
             return;
         }
@@ -497,15 +588,6 @@ namespace Betel
                     // FILL n always lights FILL n, on the first press), instead
                     // of briefly showing the previous variation's fill.
                     const auto fromFill = fillSectionFor ((StyleVariation) newVarRaw);
-                    {
-                        double len = 0.0;
-                        if (const auto* st = stylePtr.load())
-                        {
-                            const auto& sec = st->getSection (fromFill);
-                            len = (double) (sec.endTick - sec.startTick);
-                        }
-                        logTransition ("VAR", (int) fromFill, localTick.load(), len);
-                    }
                     enterSection (fromFill, (int) toMain);
                 }
                 else
@@ -527,21 +609,6 @@ namespace Betel
             const auto toDest   = jumpDestFor (fromFill);   // Jumps-tab landing
             transitionEvents.fetch_add (1, std::memory_order_relaxed);
 
-            // DIAGNOSTIC: localTick says how far into its loop cycle the
-            // variation had got when the fill fired, and len is the fill's own
-            // length.  Read together across a session they show how much phrase
-            // each press threw away — the number the phrase-anchored timing has
-            // to fix, and the reason this log stays for now.
-            {
-                double len = 0.0;
-                if (const auto* st = stylePtr.load())
-                {
-                    const auto& sec = st->getSection (fromFill);
-                    len = (double) (sec.endTick - sec.startTick);
-                }
-                logTransition ("FILL", (int) fromFill, localTick.load(), len);
-            }
-
             enterSection (fromFill, (int) toDest);
             return true;
         }
@@ -554,12 +621,21 @@ namespace Betel
         // stop wins over start in the same block
         if (pendingStop.exchange (false))
         {
+            // AN EXPLICIT STOP CANCELS THE TAIL.  The tail exists to let an
+            // ending decay; a player pressing STOP has asked for it to be over,
+            // and making them wait 2 s for a transport they just stopped would
+            // read as a hang.  The 5 ms flush applies, as it always did on a
+            // manual stop.
+            endingTailTicks.store (0.0);
             transport.store (StyleTransport::Stopped);
             return;
         }
 
         if (pendingStart.exchange (false))
         {
+            // Starting during an ending's tail abandons it — the tail is only
+            // there to protect a decay nobody is waiting on any more.
+            endingTailTicks.store (0.0);
             // Idempotent start: only CUE a section (which resets the section
             // tick to 0) when the style is NOT already playing.  Sync-start and
             // gate (ONPRESS) modes fire start() on every empty→held chord-zone
@@ -571,17 +647,83 @@ namespace Betel
             // exact tick position.
             if (transport.load() != StyleTransport::Playing)
             {
-                const int introIdx = pendingIntro.exchange (-1);
-                if (introIdx >= 0)
+                // ── START ON THE SECTION THAT WAS ACTUALLY PRESSED ───────────
+                //
+                // This block used to consume pendingIntro and NOTHING ELSE, so
+                // a FILL / BREAK / ENDING armed while stopped survived the
+                // start untouched: playback began on the plain main, and then
+                // applyPendingAtBarBoundary found the still-armed flag at the
+                // very next quant point and cut away.  Press ENDING from
+                // stopped and you got a bar of the main first, then the ending
+                // - a jump nobody asked for, and the button appeared to fire
+                // late rather than wrong.
+                //
+                // Every section-selecting flag is now CONSUMED here, in the
+                // same priority order applyPendingAtBarBoundary uses (ending >
+                // intro > break > fill), and whichever one wins decides the
+                // section playback opens on.
+                //
+                // The clears at the end are the other half of the fix, and the
+                // more important half: once a start section has been chosen,
+                // NOTHING may still be armed.  A leftover flag is precisely
+                // what produced the jump, and it does not matter which flag it
+                // is.  From here the section runs to its own natural end -
+                // enterSection has already recorded where it goes next - and
+                // only a new button press moves it early, which is exactly the
+                // behaviour asked for.
+                //
+                // pendingVariation is not consulted: selectVariation has a
+                // stopped-transport branch that writes currentVariation
+                // directly, so while stopped the variation is already IN
+                // getCurrentVariation() rather than queued.  It is still
+                // cleared below, because "nothing armed" has to mean nothing.
+                const int  endingIdx = pendingEnding.exchange (-1);
+                const int  introIdx  = pendingIntro .exchange (-1);
+                const bool wantBreak = pendingBreak .exchange (false);
+                const bool wantFill  = pendingFill  .exchange (false);
+
+                if (endingIdx >= 0)
+                {
+                    const auto end = (StyleSection) ((int) StyleSection::EndingA + endingIdx);
+                    enterSection (end, kAfterStop);
+                }
+                else if (introIdx >= 0)
                 {
                     const auto intro = (StyleSection) ((int) StyleSection::IntroA + introIdx);
                     const auto afterIntro = jumpDestFor (intro);   // Jumps-tab landing
                     enterSection (intro, (int) afterIntro);
                 }
+                else if (wantBreak)
+                {
+                    const auto afterBreak = jumpDestFor (StyleSection::FillBA);
+                    enterSection (StyleSection::FillBA, (int) afterBreak);
+                }
+                else if (wantFill)
+                {
+                    // FILL n from stopped is a "fill INTO variation n": the
+                    // performVariation path calls selectVariation(n, viaFill)
+                    // first, and its stopped branch has already put n in
+                    // currentVariation - so the fill to play and the main to
+                    // land on both come from there.
+                    //
+                    // mainSectionFor rather than jumpDestFor, deliberately, to
+                    // match the fill-INTO case in applyPendingAtBarBoundary:
+                    // pressing FILL 3 means "arrive on VAR 3", and routing the
+                    // landing through the Jumps tab could send it somewhere
+                    // else entirely.
+                    const auto v        = getCurrentVariation();
+                    const auto fromFill = fillSectionFor (v);
+                    enterSection (fromFill, (int) mainSectionFor (v));
+                }
                 else
                 {
                     enterSection (mainSectionFor (getCurrentVariation()), kAfterLoop);
                 }
+
+                // NOTHING LEFT ARMED - see above.
+                pendingVariation       .store (-1);
+                pendingVariationViaFill.store (false);
+
                 transport.store (StyleTransport::Playing);
             }
         }
@@ -628,6 +770,31 @@ namespace Betel
         const int    barTicks = style->ticksPerQuarter * style->timeSigNum * 4
                                     / std::max (1, style->timeSigDen);   // meter-aware bar
         const double samplesPerTick = 1.0 / ticksPerSample;
+
+        // ── RUNNING OUT AN ENDING'S TAIL ─────────────────────────────────────
+        //
+        // Consumes whole blocks and emits nothing.  Block granularity is right:
+        // the tail is seconds long and its only job is to delay the stopped edge,
+        // so resolving it to the sample would buy nothing and cost a split.
+        //
+        // BEFORE the section machinery below, because localTick is parked at the
+        // section end while this runs — every boundary test down there would fire
+        // again on the tick it already handled.
+        if (endingTailTicks.load() > 0.0)
+        {
+            const double left = endingTailTicks.load()
+                              - (double) blockSizeSamples * ticksPerSample;
+
+            if (left <= 0.0)
+            {
+                endingTailTicks.store (0.0);
+                transport.store (StyleTransport::Stopped);
+            }
+            else
+                endingTailTicks.store (left);
+
+            return;
+        }
 
         int samplesProcessed = 0;
         int safetyIters      = 0;
@@ -744,6 +911,11 @@ namespace Betel
             {
                 onSectionEndReached();
                 if (! isPlaying()) return;
+
+                // An ending armed its tail and left the transport Playing.  The
+                // loop must not continue: localTick sits on the section end, so
+                // the next iteration would re-enter this same branch.
+                if (endingTailTicks.load() > 0.0) return;
             }
             else
             {

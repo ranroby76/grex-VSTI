@@ -1,3 +1,4 @@
+
 // =============================================================================
 //  InstrumentPreset.h
 //
@@ -33,6 +34,7 @@
 
 #include <juce_core/juce_core.h>
 #include <map>
+#include <cmath>      // std::abs on the base-unity compare
 #include "InstrEditPanel.h"   // SlotParams / DrumKitParams
 #include "BetelStateXml.h"    // saveSlot / loadSlot (round-trips the whole SlotParams)
 
@@ -167,6 +169,7 @@ namespace InstrumentPresetIO
         root.setProperty ("frb",     frbFileName,                 nullptr);
         root.addChild (BetelStateXml::saveSlot (params), -1, nullptr);
 
+        BetelStateXml::roundNumbersTo2Decimals (root);   // 2 decimals, like every set
         if (auto xml = root.createXml()) return xml->writeTo (file);
         return false;
     }
@@ -217,6 +220,7 @@ namespace InstrumentPresetIO
             }
         }
 
+        BetelStateXml::roundNumbersTo2Decimals (root);   // 2 decimals, like every set
         if (auto xml = root.createXml())
             return xml->writeTo (file) ? file : juce::File();
         return juce::File();
@@ -353,9 +357,72 @@ namespace InstrumentPresetIO
 
         if (found != juce::File() && found != file) found.deleteFile();   // one per flag
 
+        BetelStateXml::roundNumbersTo2Decimals (root);   // 2 decimals, like every set
         if (auto xml = root.createXml())
             return xml->writeTo (file) ? file : juce::File();
         return juce::File();
+    }
+
+    //==========================================================================
+    //  BATCH: EVERY MELODIC PRESET IN ONE FOLDER BACK TO 0 dB BASE.
+    //
+    //  The base unity says how hot a SAMPLE is, so a library re-levelled at the
+    //  source leaves every one of them stating a correction for a problem that
+    //  no longer exists.  Clearing them one instrument at a time through the
+    //  calibration dialog is the same edit several hundred times over.
+    //
+    //  NOTHING ELSE IN THE FILE MOVES.  gainPercent, the envelopes, the filter,
+    //  the FX, the note range - all read back out and written straight back in.
+    //  Only baseUnityDb changes.
+    //
+    //  AND THE SCOPE IS PRESERVED, which is why this does not simply call
+    //  writeToFile: that one always stamps scope="full", and a gainOnly file
+    //  promoted to full stops meaning "the trim and nothing else" and starts
+    //  stamping default attack and sustain 0.0 over the voice underneath it.
+    //  That exact promotion is the shipped-gain-pack failure described on
+    //  InstrumentPreset::gainOnly above.
+    //
+    //  A file already at 0 is left alone rather than rewritten, so the returned
+    //  count is what actually CHANGED and an unchanged library is not churned.
+    //
+    //  Returns the number of files rewritten.
+    //==========================================================================
+    inline int resetBaseUnityInFolder (const juce::File& folder, bool isStyle = false)
+    {
+        if (! folder.isDirectory()) return 0;
+
+        int written = 0;
+
+        for (const auto& file : folder.findChildFiles (juce::File::findFiles, false,
+                                                       "*" + extensionFor (false, isStyle)))
+        {
+            const auto p = read (file);
+            if (! p.ok || p.isDrum) continue;
+            if (std::abs (p.params.baseUnityDb) < 1.0e-4f) continue;   // already 0
+
+            SlotParams params = p.params;
+            params.baseUnityDb = 0.0f;
+
+            juce::ValueTree root (kRootTag);
+            root.setProperty ("version", kVersion,                     nullptr);
+            root.setProperty ("type",    "melodic",                    nullptr);
+            root.setProperty ("set",     isStyle ? "style" : "solo",   nullptr);
+            root.setProperty ("scope",   p.gainOnly ? "gain" : "full", nullptr);
+            root.setProperty ("flag",    p.flag,                       nullptr);
+            root.setProperty ("name",    p.displayName,                nullptr);
+            root.setProperty ("frb",     p.frbFileName,                nullptr);
+            root.addChild (BetelStateXml::saveSlot (params), -1, nullptr);
+
+            // Written back over the SAME file, not through presetFile(): a
+            // library renamed by hand keeps its names, and rebuilding the name
+            // from the flag would leave the old file beside the new one for
+            // the flag lookup to pick between.
+            BetelStateXml::roundNumbersTo2Decimals (root);   // 2 decimals, like every set
+            if (auto xml = root.createXml())
+                if (xml->writeTo (file)) ++written;
+        }
+
+        return written;
     }
 
     inline void scanFolder (const juce::File&                       folder,
@@ -424,6 +491,3 @@ namespace InstrumentPresetIO
 
 } // namespace InstrumentPresetIO
 } // namespace Betel
-
-
-

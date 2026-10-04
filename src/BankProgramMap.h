@@ -1,3 +1,4 @@
+
 #pragma once
 //==============================================================================
 // BankProgramMap.h
@@ -103,6 +104,27 @@ namespace Betel
                 return pc;
             }
 
+
+            // ── Tier 1b: Premium voices (MSB 104) ────────────────────────────
+            //
+            // Genos / SX-era premium voices are numbered in Yamaha's own
+            // internal order, NOT by GM family: "Strings" sits on PC 0,
+            // "Pizzicato" on PC 80 or 90, "MusicBox" on PC 40.  Reading the PC
+            // as a GM flag (tier 2 below) played Strings as a Grand Piano and
+            // a music box as a violin.  The 8-char CASM name is the author's
+            // own label, so it decides first:
+            //   1) premium-specific words the general reader gets wrong or
+            //      does not know (premiumNameToGm),
+            //   2) the same general reader the MegaVoice tier uses,
+            //   3) only a name neither can read falls back to the PC.
+            if (bankMsb == 104)
+            {
+                if (const int p = premiumNameToGm (voiceName); p >= 0)
+                    return p;
+                if (const int kw = voiceNameToGmFamilyBase (voiceName); kw >= 0)
+                    return kw;
+                return pc;
+            }
             // ── Tier 2: GM-aligned banks ──────────────────────────────────────
             //
             // Every non-MSB-8 Yamaha bank (GM, XG variations with LSB 1..127,
@@ -230,6 +252,14 @@ namespace Betel
                 { 0,  4, 29 },   // OverdriveGt      (8/0/PRG5)
                 { 0,  5, 30 },   // DistortionGt     (8/0/PRG6)
                 { 0,  6, 26 },   // JazzGuitar       (8/0/PRG7)
+                // Keyboards on PC 20 (PRG21).  The PC safety net reads PC 20 as a
+                // bass - right on LSB 0, wrong on these: measured across the SX920
+                // library, every one of them is a Clavi or an electric piano.
+                { 33, 20,  7 },  // Clavi            (8/33/PRG21)
+                { 39, 20,  4 },  // E.Piano          (8/39/PRG21)
+                { 40, 20,  4 },  // E.Piano          (8/40/PRG21)
+                { 42, 20,  4 },  // E.Piano          (8/42/PRG21)
+                { 44, 20,  4 },  // E.Piano          (8/44/PRG21)
                 { 1,  2, 25 },   // 12StringGtr      (8/1/PRG3)
                 { 1,  3, 27 },   // SolidGuitar1     (8/1/PRG4)
                 { 2,  3, 27 },   // SolidGuitar2     (8/2/PRG4)
@@ -308,6 +338,50 @@ namespace Betel
         //
         // Returns -1 if no keyword matches.
         //======================================================================
+        //======================================================================
+        //  PREMIUM (MSB 104) NAME WORDS — checked BEFORE the general reader.
+        //
+        //  Each word here fixes a measured miss on 2024 Genos / SX styles:
+        //    "E.Piano"  the general reader's "piano" rule answers ACOUSTIC piano
+        //    "Gtr/Saw"  its guitar rule answers nylon; the part is a saw lead
+        //    "SynBrs"   its plain "brs" rule answers brass section, not synth
+        //    "MusicBox" "WoodArp" "SC Drone" "Crowds" "Str/Pf" "PercPad"
+        //               words it does not know at all
+        //  Premium-only on purpose: the MegaVoice tier keeps its tested path.
+        //======================================================================
+        static int premiumNameToGm (const char* name) noexcept
+        {
+            if (name == nullptr || name[0] == 0) return -1;
+            char buf[16] = {0};
+            int  blen = 0;
+            for (int i = 0; i < 15 && name[i] != 0; ++i)
+            {
+                char c = name[i];
+                if (c >= 'A' && c <= 'Z') c = (char) (c + ('a' - 'A'));
+                buf[blen++] = c;
+            }
+            auto contains = [blen, &buf] (const char* kw) noexcept -> bool
+            {
+                const int klen = (int) std::strlen (kw);
+                if (klen > blen) return false;
+                for (int i = 0; i + klen <= blen; ++i)
+                    if (std::memcmp (buf + i, kw, (size_t) klen) == 0)
+                        return true;
+                return false;
+            };
+
+            if (contains ("e.pia") || contains ("e.p ") || contains ("epia"))    return 4;    // Electric Piano
+            if (contains ("saw"))                                                return 81;   // Lead 2 (sawtooth)
+            if (contains ("synbr") || contains ("syn br"))                       return 62;   // Synth Brass
+            if (contains ("musicb") || contains ("musbox") || contains ("mbox")) return 10;   // Music Box
+            if (contains ("woodarp") || contains ("wdarp"))                      return 12;   // Marimba (wooden arp)
+            if (contains ("drone"))                                              return 89;   // Pad 2 (warm)
+            if (contains ("crowd"))                                              return 126;  // Applause
+            if (contains ("percpad"))                                            return 90;   // Pad 3 (polysynth)
+            if (contains ("str/"))                                               return 48;   // Strings (Str/Pf layer)
+            return -1;
+        }
+
         static int voiceNameToGmFamilyBase (const char* name) noexcept
         {
             if (name == nullptr || name[0] == 0) return -1;
@@ -375,6 +449,8 @@ namespace Betel
                 if (contains ("sec"))                           return 61;
                 return 61;
             }
+            // A string PHRASE before the trumpet test: "StrPhrsM" contains "trp".
+            if (contains ("strph")  || contains ("str ph"))        return 48;
             if (contains ("trump")  || contains ("trp")
                                    || contains ("flugel")
                                    || contains ("cornet"))        return 56;
@@ -385,6 +461,8 @@ namespace Betel
                                     || contains ("horn"))         return 60;
 
             // ── Guitar ───────────────────────────────────────────────────────
+            // Mandolin: XG files it as a Steel Guitar variation.
+            if (contains ("mand"))                                return 25;
             if (contains ("nylgt") || contains ("nylon"))        return 24;
             if (contains ("steelg")|| contains ("stlgt"))        return 25;
             if (contains ("12str") || contains ("12-str"))       return 25;
@@ -416,10 +494,14 @@ namespace Betel
             if (contains ("sax"))                                 return 66;
 
             // ── Reeds & pipes ────────────────────────────────────────────────
-            if (contains ("oboe"))                                return 68;
+            if (contains ("oboe")
+                || (blen == 2 && buf[0] == 'o' && buf[1] == 'b'))  return 68;   // "Ob"
             if (contains ("englh")  || contains ("ehrn"))         return 69;
             if (contains ("bassoon")|| contains ("bsn"))          return 70;
-            if (contains ("clarin") || contains ("clrnt"))        return 71;
+            // Clarinet, including the short forms styles use: "Clar min",
+            // "Clari M", "SA2 Clr", "SA2 CL".
+            if (contains ("clar")   || contains ("clrnt") || contains ("clr")
+                                    || contains ("sa2 cl"))        return 71;
             if (contains ("piccolo")|| contains ("piccol")
                                     || contains ("picc"))         return 72;
             if (contains ("flute")  || contains ("flt"))          return 73;
@@ -437,6 +519,8 @@ namespace Betel
             if (contains ("contrab")|| contains ("ctrbs"))        return 43;
             if (contains ("tremst"))                              return 44;
             if (contains ("pizz"))                                return 45;
+            // Harpsichord BEFORE harp: "Harpsi" contains "harp".
+            if (contains ("harpsi") || contains ("hrpsi") || contains ("hpsch"))  return 6;
             if (contains ("harp"))                                return 46;
             if (contains ("timpani")|| contains ("timp"))         return 47;
             if (contains ("slowstr")|| contains ("slstr"))        return 49;

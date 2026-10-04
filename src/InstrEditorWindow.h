@@ -1,4 +1,6 @@
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 //==============================================================================
 // InstrEditorWindow.h
 //
@@ -26,6 +28,8 @@
 #include "SynthesisPanel.h"
 #include "ModulationPanel.h"
 #include "EffectsPanel.h"
+#include "EffectSendsPanel.h"
+#include "SoundEnginePanel.h"   // SOUND ENGINE: the built-in synth (Synth Bass 1 / 2)
 
 class InstrEditorWindow : public juce::DocumentWindow
 {
@@ -96,6 +100,14 @@ public:
         if (content != nullptr) content->setSfzState (name, active);
     }
 
+    /** ENERGY's curve offset, so the velocity display reads what is in force.
+        See VelCurveDisplay::setEnergyOffset for why this is a readout and not a
+        write into the slot. */
+    void setEnergyOffset (float curveOffset)
+    {
+        if (content != nullptr) content->setEnergyOffset (curveOffset);
+    }
+
     void setSoloMode(bool isSolo)
     {
         if (content != nullptr) content->setSoloMode(isSolo);
@@ -144,6 +156,17 @@ public:
         if (content != nullptr) content->setBandMode(useBand);
     }
 
+    /** SOLO ONLY. The per-sound GAIN trim is hidden on a style slot, where the
+        style's own level is the base and the mixer fader is the one adjustment
+        on top - see SynthesisPanel::setGainVisible. */
+    void setGainVisible (bool shouldShow)
+    {
+        // setBandMode does not cache its flag because the caller re-sends it on
+        // every open; this one does the same, so there is no second copy of the
+        // truth to fall out of step with SoundsTab's soloMode.
+        if (content != nullptr) content->setGainVisible (shouldShow);
+    }
+
     InstrEditorWindow()
         : juce::DocumentWindow("Instrument Editor",
                                juce::Colour(0xFF101010),
@@ -190,6 +213,7 @@ public:
         toFront(true);
     }
 
+    void setEngineProgram (int gmProgram) { if (content != nullptr) content->setEngineProgram (gmProgram); }
     void setSlotParams(const SlotParams& p)
     {
         if (content != nullptr) content->setSlotParams(p);
@@ -294,9 +318,28 @@ private:
 
             It was briefly retired from BOTH editors, which took the .ins save
             away from the solo side along with the style side it was aimed at. */
+        /** ENERGY's offset, forwarded to the velocity-curve display.
+
+            ZEROED FOR A SOLO SLOT, because ENERGY only writes the style bank's
+            channels - showing an offset the engine will not apply would be a
+            readout that lies in the opposite direction. */
+        void setEnergyOffset (float curveOffset)
+        {
+            energyOffset = curveOffset;
+            synthPanel.setEnergyOffset (soloMode ? 0.0f : energyOffset);
+        }
+
         void setSoloMode(bool isSolo)
         {
+            soloMode = isSolo;
+            synthPanel.setEnergyOffset (isSolo ? 0.0f : energyOffset);
+
             effectsPanel.setSoloMode(isSolo);
+
+            // ATTACK GLIDE is a right-hand feature, so the block is not drawn at
+            // all on a style slot rather than drawn and ignored.  Channel::noteOn
+            // refuses it independently - this is the courtesy, not the guarantee.
+            modPanel.setSoloMode(isSolo);
 
             saveDefaultBtn.setVisible (isSolo);
             resized();          // the header row re-flows around it
@@ -344,6 +387,9 @@ private:
 
         /** Band filter (non-bass style slots): forwarded to the SYNTHESIS and
             MODULATION tabs so they swap / hide the classic filter controls. */
+        /** SOLO ONLY - hides the per-sound GAIN trim on a style slot. */
+        void setGainVisible (bool shouldShow) { synthPanel.setGainVisible (shouldShow); }
+
         void setBandMode(bool useBand)
         {
             synthPanel.setBandMode(useBand);
@@ -363,13 +409,13 @@ private:
             // instrument cells and reference-voice pills handle loading now.
 
             slotLabel.setText("Currently editing: \xe2\x80\x94", juce::dontSendNotification);
-            slotLabel.setColour(juce::Label::textColourId, juce::Colour(0xFFCC6600));
+            slotLabel.setColour(juce::Label::textColourId, juce::Colour(Betel::Pal::kAccent));
             slotLabel.setFont(juce::Font(14.0f, juce::Font::bold));
             slotLabel.setJustificationType(juce::Justification::centredLeft);
             addAndMakeVisible(slotLabel);
 
             const juce::String tabLabels[kNumTabs] =
-                { "SYNTHESIS", "MODULATION", "EFFECTS" };
+                { "SOUND ENGINE", "SYNTHESIS", "MODULATION", "EFFECT SENDS", "INSERTS" };
             for (int i = 0; i < kNumTabs; ++i)
             {
                 tabBtns[i].setButtonText(tabLabels[i]);
@@ -465,18 +511,29 @@ private:
             synthPanel.onBaseUnityRequested = [this]
             { if (onBaseUnityRequested) onBaseUnityRequested(); };
 
+            enginePanel  .onAnythingChanged = [this]{ if (onPanelChanged) onPanelChanged(); };
             synthPanel   .onAnythingChanged = [this]{ if (onPanelChanged) onPanelChanged(); };
             modPanel     .onAnythingChanged = [this]{ if (onPanelChanged) onPanelChanged(); };
             effectsPanel .onAnythingChanged = [this]{ if (onPanelChanged) onPanelChanged(); };
+            sendsPanel   .onAnythingChanged = [this]{ if (onPanelChanged) onPanelChanged(); };
 
             effectsPanel.onClickFileChosen = [this](const juce::File& f)
             {
                 if (onClickFileChosen) onClickFileChosen(f);
             };
 
+            addChildComponent(enginePanel);
             addChildComponent(synthPanel);
             addChildComponent(modPanel);
             addChildComponent(effectsPanel);
+            addChildComponent(sendsPanel);
+
+            // WAH, PHASER AND SWEETENER ONLY.  Chorus, reverb and delay are on
+            // the section bus and belong to the GLOBAL EFFECTS window; EQ and
+            // pan are on the SENDS tab beside the sliders they sit with.
+            effectsPanel.setSelectorsVisible ({ EffectsPanel::SelWah,
+                                                EffectsPanel::SelPhaser,
+                                                EffectsPanel::SelSweeten });
 
             pianoStrip.onNoteOn = [this](int n, int v)
             {
@@ -492,23 +549,47 @@ private:
             };
             addAndMakeVisible(pianoStrip);
 
-            selectTab(0);
+            selectTab(1);      // SYNTHESIS; setEngineProgram opens SOUND ENGINE on 38 / 39
         }
 
         void setSlotParams(const SlotParams& p)
         {
+            enginePanel  .loadParams(p);
             synthPanel   .loadParams(p);
             modPanel     .loadParams(p);
             effectsPanel .loadParams(p);
+            sendsPanel   .loadParams(p);
         }
+
+        /** The GM program the edited slot plays.  SOUND ENGINE edits the engine
+            on 38 / 39 and says so on anything else; arriving on an engine program
+            opens that tab, leaving one for a sample program opens SYNTHESIS. */
+        void setEngineProgram (int gmProgram)
+        {
+            const bool wasEngine = oscengine::servesProgram (engineProgram);
+            engineProgram = gmProgram;
+            enginePanel.setProgram (gmProgram);
+            const bool isEngine = oscengine::servesProgram (gmProgram);
+            if (isEngine && ! wasEngine)             selectTab (0);
+            else if (! isEngine && activeTab == 0)   selectTab (1);
+        }
+        int engineProgram = -1;
 
         void setNoteRangeMode(int mode) { synthPanel.setNoteRangeMode(mode); }
 
         void collectInto(SlotParams& p) const
         {
+            enginePanel  .readInto(p);
             synthPanel   .readInto(p);
             modPanel     .readInto(p);
+
+            // ORDER STILL MATTERS, for a smaller overlap than before: both
+            // panels write chorusMix / reverbWet / delayWet — effectsPanel from
+            // pages it no longer shows, sendsPanel from the sliders the player
+            // actually moved — so the visible one has to win.  The three insert
+            // fields are effectsPanel's alone and sendsPanel does not touch them.
             effectsPanel .readInto(p);
+            sendsPanel   .readInto(p);
         }
 
         void setSlotLabel(const juce::String& t)
@@ -660,9 +741,11 @@ private:
             const int contentY = kTabBarBottomY + 8;
             const int contentH = getHeight() - contentY - 12 - kKeyboardH - 8;
             const juce::Rectangle<int> contentBounds(pad, contentY, W - 2 * pad, contentH);
+            enginePanel  .setBounds(contentBounds);
             synthPanel   .setBounds(contentBounds);
             modPanel     .setBounds(contentBounds);
             effectsPanel .setBounds(contentBounds);
+            sendsPanel   .setBounds(contentBounds);
         }
 
     private:
@@ -672,14 +755,25 @@ private:
             for (int i = 0; i < kNumTabs; ++i)
                 InstrEditStyle::styleSquareButton(tabBtns[i], i == activeTab);
 
-            synthPanel   .setVisible(activeTab == 0);
-            modPanel     .setVisible(activeTab == 1);
-            effectsPanel .setVisible(activeTab == 2);
+            enginePanel  .setVisible(activeTab == 0);
+            synthPanel   .setVisible(activeTab == 1);
+            modPanel     .setVisible(activeTab == 2);
+
+            // TAB 2 = the three SENDS plus EQ and pan.
+            // TAB 3 = the three INSERTS: wah, phaser, sweetener.
+            //
+            // Those three are shapers — their output replaces the signal, so a
+            // parallel send gives a wah you cannot hear and a sweetener that
+            // doubles the level — and they need per-instrument settings, which a
+            // shared rack cannot give.  So they stayed here, and effectsPanel,
+            // which already draws all three, is the page for them.
+            sendsPanel   .setVisible(activeTab == 3);
+            effectsPanel .setVisible(activeTab == 4);
 
             if (onTabSelected) onTabSelected(activeTab);
         }
 
-        static constexpr int kNumTabs        = 3;
+        static constexpr int kNumTabs        = 5;
         static constexpr int kHeaderBottomY  = 80;
         static constexpr int kTabBarBottomY  = 140;
         static constexpr int kKeyboardH      = 64;   // design-space px ("short keys")
@@ -703,16 +797,16 @@ private:
         inline static const juce::Colour kSavedGreen { juce::Colour (0xFF57D46A) };
         juce::TextButton sfzLoadBtn, sfzToggleBtn;
 
-        /** ORANGE CAPTION, both states.
+        /** GOLD CAPTION, both states.
 
-            styleSquareButton puts BLACK on the amber fill, which is right for a
-            control whose lit state is the amber itself.  This one reads as a
+            styleSquareButton puts BLACK on the gold fill, which is right for a
+            control whose lit state is the gold itself.  This one reads as a
             status light - "an SFZ is holding this slot" - so the word stays
-            orange either way and the fill carries the state. */
-        /** GREEN while empty, ORANGE once a file is loaded. */
+            gold either way and the fill carries the state. */
+        /** GREEN while empty, GOLD once a file is loaded. */
         void styleSfzLoad (bool loaded)
         {
-            const auto fill = loaded ? juce::Colour (0xFFCC6600) : juce::Colour (0xFF1E7A3C);
+            const auto fill = loaded ? juce::Colour (Betel::Pal::kAccent) : juce::Colour (0xFF1E7A3C);
             sfzLoadBtn.setColour (juce::TextButton::buttonColourId,   fill);
             sfzLoadBtn.setColour (juce::TextButton::buttonOnColourId, fill);
             sfzLoadBtn.setColour (juce::TextButton::textColourOffId,  juce::Colours::white);
@@ -721,8 +815,8 @@ private:
 
         void styleSfzToggle (bool on)
         {
-            const auto amber = juce::Colour (0xFFCC6600);
-            const auto text  = on ? amber : juce::Colours::white;
+            const auto gold = juce::Colour (Betel::Pal::kAccent);
+            const auto text = on ? gold : juce::Colours::white;
             sfzToggleBtn.setColour (juce::TextButton::buttonColourId,   juce::Colour (0xFF2A2A2A));
             sfzToggleBtn.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xFF3A2A14));
             sfzToggleBtn.setColour (juce::TextButton::textColourOffId, text);
@@ -761,9 +855,16 @@ private:
     private:
         int              activeTab = 0;
 
+        SoundEnginePanel enginePanel;
         SynthesisPanel   synthPanel;
+
+        // Held so setEnergyOffset and setSoloMode can each re-derive what the
+        // display should show without needing the other to be called first.
+        bool  soloMode     = false;
+        float energyOffset = 0.0f;
         ModulationPanel  modPanel;
-        EffectsPanel     effectsPanel;
+        EffectsPanel     effectsPanel;   // kept for its GR meters and file chooser
+        EffectSendsPanel sendsPanel;     // tab 2: EQ + pan, and the three sends
         PianoStrip       pianoStrip;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(DesignCanvas)
@@ -831,6 +932,11 @@ private:
         /** Forwarded by InstrEditorWindow::setSoloMode. */
         void setSoloMode(bool isSolo) { canvas.setSoloMode(isSolo); }
 
+        /** Forwarded by InstrEditorWindow::setEnergyOffset.  Content is a plain
+            relay between the window and the canvas; the decision about what a
+            solo slot should show lives on the canvas, with the panel it feeds. */
+        void setEnergyOffset (float curveOffset) { canvas.setEnergyOffset (curveOffset); }
+
         void flashSaved (const juce::String& text) { canvas.flashSaved (text); }
 
         /** Seed IGNORE PRESET CHANGES from the host's per-slot flag. */
@@ -844,10 +950,14 @@ private:
         /** Forwarded by InstrEditorWindow::setBandMode. */
         void setBandMode(bool useBand) { canvas.setBandMode(useBand); }
 
+        /** Forwarded by InstrEditorWindow::setGainVisible. */
+        void setGainVisible (bool shouldShow) { canvas.setGainVisible (shouldShow); }
+
         /** Forwarded by InstrEditorWindow::setSweetenerGr. */
         void setSweetenerGr (float softenDb, float peakDb, float tameDb, float roundDb)
         { canvas.setSweetenerGr (softenDb, peakDb, tameDb, roundDb); }
 
+        void setEngineProgram (int gmProgram) { canvas.setEngineProgram (gmProgram); }   // SOUND ENGINE tab
         void setSlotParams(const SlotParams& p)
         {
             currentParams = p;
@@ -947,5 +1057,3 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(InstrEditorWindow)
 };
-
-

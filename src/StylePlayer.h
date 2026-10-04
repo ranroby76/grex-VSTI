@@ -1,4 +1,8 @@
+
+
+
 #pragma once
+#include "Levels.h"   // Betel::Levels - EVERY level constant lives there
 //==============================================================================
 // StylePlayer.h
 //
@@ -52,7 +56,6 @@
 #include <JuceHeader.h>
 #include "GlobalMacros.h"
 #include "StyleLevels.h"    // section boost / makeup target / role fader trims
-#include "PerfMonitor.h"
 #include <array>
 #include <atomic>
 #include <functional>
@@ -63,6 +66,7 @@
 
 #include "SamplePlayerEngine.h"
 #include "StyleData.h"
+#include "StyleBalanceFile.h"   // balance.grexv - per-instrument style trim
 #include "StyleSequencer.h"
 #include "ChordTransposer.h"
 #include "BankProgramMap.h"
@@ -148,6 +152,7 @@ namespace Betel
 
             const bool wasEmpty = (numHeld == 0);
             held[(size_t) numHeld++] = midiNote;
+            republishLowest();
 
             // ── SINGLE-FINGER: last-note priority (note stealing) ─────────────
             // In single-finger mode the JUST-PRESSED key is ALWAYS the new chord
@@ -209,11 +214,14 @@ namespace Betel
                     return;
                 }
             }
+
+            republishLowest();
         }
 
         void reset() noexcept
         {
             numHeld = 0;
+            republishLowest();      // the third site that changes `held`
             sfToggleRoot  = -1;
             sfToggleMinor = false;
             // Default to CMaj so the band has something coherent to play
@@ -221,9 +229,37 @@ namespace Betel
             currentChord.store (packChord ({ 0, ChordQuality::Maj }));
         }
 
+        /** Recompute and publish the lowest held note.  Called from every place
+            `held` changes, so the two can never disagree. */
+        void republishLowest() noexcept
+        {
+            int lo = -1;
+            for (int i = 0; i < numHeld; ++i)
+                if (lo < 0 || held[(size_t) i] < lo) lo = held[(size_t) i];
+
+            lowestHeld.store (lo, std::memory_order_relaxed);
+        }
+
         Chord getCurrentChord() const noexcept
         {
             return unpackChord (currentChord.load());
+        }
+
+        //======================================================================
+        // THE LOWEST NOTE CURRENTLY HELD IN THE CHORD ZONE, or -1.
+        //
+        // For BASS TO LOWEST: the recognised chord answers "which chord", and
+        // that is all it answers - C/E and a root-position C are the same Chord
+        // and always will be, because inversion is not part of chord identity.
+        // The bass note the player wants is a property of the KEYBOARD, not of
+        // the chord, so it has to be published separately.
+        //
+        // Kept as its own atomic rather than derived from `held` on demand:
+        // `held` is message-thread state and this is read from the audio thread.
+        //======================================================================
+        int getLowestHeldNote() const noexcept
+        {
+            return lowestHeld.load (std::memory_order_relaxed);
         }
 
     private:
@@ -261,6 +297,8 @@ namespace Betel
         int                    sfToggleRoot  = -1;
         bool                   sfToggleMinor = false;
         std::atomic<int>       splitPoint { 60 };   // Middle C — adjustable from UI
+        // Lowest note held in the chord zone, -1 when none. See getLowestHeldNote.
+        std::atomic<int> lowestHeld { -1 };
         std::atomic<uint16_t>  currentChord { 0 };  // CMaj
         std::atomic<bool>      syncStartArmed { false };
         std::atomic<bool>      syncStopArmed  { false };
@@ -361,6 +399,53 @@ namespace Betel
                                    (relative to the current section)
               • ticksPerEighth   - the style's 1/8-note grid in ticks
                                    (typically TPQ / 2) */
+        //======================================================================
+        // BASS INVERSION and MANUAL BASS, handed in per block.
+        //
+        // SETTERS RATHER THAN dispatchBlock PARAMETERS: dispatchBlock is the
+        // busiest function in the style path and already takes five arguments.
+        // Both values are set from processBlock immediately before the call, on
+        // the same thread, so plain ints need no synchronisation - the same
+        // reasoning dispatchFingeredMode already uses.
+        //
+        //   bassRoot   >= 0  re-root the BASS part on this note (inversion)
+        //   manualNote >= 0  play THIS note instead of the pattern's pitch
+        //
+        // Both -1 in the normal case, which costs one compare on the bass
+        // channel and nothing at all anywhere else.
+        //======================================================================
+        static constexpr int kBassEngineChannel = 2;      // the BASS role
+
+        /** `silenceStyleBass` stands the style's own BASS part down for as long
+            as MANUAL BASS is engaged - the player has taken that part over on
+            solo 7, and leaving the pattern running gives two basses at once.
+
+            Deliberately NOT routed through setChannelMute: that mask is the
+            player's own STYLE ELEMENTS ON/OFF row and it is saved into the set,
+            so borrowing it would leave the bass element switched off in the
+            file after the mode was turned back off. This is a separate gate
+            that owns nothing the user can see.
+
+            Called once per block from the audio thread, immediately before
+            dispatchBlock, so a plain member is correct here - same as the two
+            overrides beside it. */
+        void setBassOverrides (int bassRoot, int manualNote,
+                               bool silenceStyleBass = false) noexcept
+        {
+            bassRootOverride = bassRoot;
+            manualBassNote   = manualNote;
+
+            // EDGE-TRIGGERED all-notes-off, not level: a bass note already
+            // sounding when the mode engages would otherwise hang for as long
+            // as the mode stays on, because its note-off is about to be dropped
+            // by the same gate that dropped nothing when the note started.
+            if (silenceStyleBass != manualBassSilencesStyleBass)
+            {
+                manualBassSilencesStyleBass = silenceStyleBass;
+                if (silenceStyleBass) engine.allNotesOff (kBassEngineChannel);
+            }
+        }
+
         void dispatchBlock (const std::vector<EmittedStyleEvent>& events,
                             const Chord& currentChord,
                             int currentTick,
@@ -386,6 +471,9 @@ namespace Betel
                 pendingDrumPc[(size_t) ch] = -1;
                 --drumComposeBudget;
                 engine.programChangeDrum (ch, pc);   // composes + pools + swaps
+                // The Revo! flag was already set when the miss was parked; the
+                // kit identity has not changed, so it is deliberately not
+                // re-stated here.
             }
 
             // Immediate chord response.  The held chord is committed the moment
@@ -414,59 +502,9 @@ namespace Betel
 
                 lastDispatchChord = pendingChord;
                 haveLastChord     = true;
-
-                // ── One-shot CASM-miss diagnostic (temporary) ───────────────
-                // Arm on every committed chord change.  The next dispatchBlock
-                // that actually carries events tallies how many emitted events
-                // came back with a matched CASM rule vs casm==nullptr (the
-                // silent "no transposition" path) and writes ONE summary line
-                // to grex_log.txt, then disarms.  Remove once chord switching
-                // is confirmed wired.
-                diagCasmLogArmed = true;
             }
             lastDispatchTick = currentTick;       // retained for diagnostics only
             juce::ignoreUnused (ticksPerEighth);  // deferral grid no longer used
-
-            // ── One-shot CASM-miss diagnostic (temporary) ───────────────────
-            // If a chord change just committed, report on the first populated
-            // block: per-source-channel, how many emitted note/CC events found
-            // a CASM rule vs came back null.  A null CASM means dispatchOne
-            // plays the RAW recorded pitch with NO chord transposition — so a
-            // high casmNull count here is the direct cause of "chord won't
-            // switch".  Logged once per chord change (infrequent), then off.
-            if (diagCasmLogArmed && ! events.empty())
-            {
-                int matched = 0, missed = 0;
-                uint16_t matchChMask = 0, nullChMask = 0;
-                for (const auto& e : events)
-                {
-                    if (e.event == nullptr) continue;
-                    const int srcCh = (int) (e.event->channel & 0x0F);
-                    if (e.casm != nullptr) { ++matched; matchChMask |= (uint16_t) (1u << srcCh); }
-                    else                   { ++missed;  nullChMask  |= (uint16_t) (1u << srcCh); }
-                }
-                if (matched + missed > 0)
-                {
-                    // AUDIO THREAD — must not touch a file.  This used to call
-                    // grexLog(), which OPENS, WRITES and CLOSES grex_log.txt;
-                    // and because the flag below is re-armed on every chord
-                    // change, it ran once per chord change rather than once
-                    // ever.  The perf log caught the cost: a 14.5 ms block
-                    // whose DSP stages summed to 124 us — i.e. >99% of it was
-                    // the thread BLOCKED in that write, not computing.
-                    //
-                    // The counts still reach the log, via PerfMonitor's
-                    // lock-free marker; the reporter thread formats and writes
-                    // them.  diagChordName / diagChannelMask are deliberately
-                    // NOT called here — they build juce::Strings, which
-                    // allocate.
-                    auto& perf = PerfMonitor::get();
-                    perf.audioMark (PerfMonitor::AudioMarkId::ChordSwitch, matched + missed);
-                    if (missed > 0)
-                        perf.audioMark (PerfMonitor::AudioMarkId::CasmMiss, missed);
-                    diagCasmLogArmed = false;
-                }
-            }
 
             // Dispatch every event in this block against the latched chord
             // (lastDispatchChord) — now always the chord the user is holding
@@ -550,42 +588,67 @@ namespace Betel
 
                 const int   rawVol = (v.volume >= 0) ? v.volume : kDefaultStyleCc7;
                 const int   cc7    = effectiveStyleCc7 (engineCh, rawVol);
-                const bool  ignore = StyleLevels::get().ignoreCc7();
 
-                // IGNORE CC 7: leave the fader exactly where the user (or the
-                // set) left it and neutralise the auto-level.  Writing unity to
-                // the fader would be wrong — that is a level decision too, and
-                // the whole point of the switch is that this slot's level is
-                // not ours to make.
-                const float fdr    = ignore ? engine.getChannelVolume (engineCh)
-                                            : styleCc7ToFader (cc7);
-                const float aut    = styleCc7ToAutoLevel (engineCh, rawVol,
-                                                          drumBalanceFactor,
-                                                          rhythmCeilingFactor,
-                                                          bassIsSynthBass2 (engineCh));
-                if (! ignore) engine.setChannelVolume (engineCh, fdr);
-                engine.setChannelAutoLevel (engineCh, aut);
+                // ── THE STYLE'S NUMBER GOES STRAIGHT IN, UNARGUED ────────────
+                //
+                // There is no blend here any more, and no FOLLOW slider to
+                // drive one. Under the gain model this is now the STYLE FACTOR,
+                // one of two multiplied together - the user's fader is the
+                // other, and it is never touched from this side. A style that
+                // asks for CC 7 = 62 gets 62; if the player wants less, the
+                // mixer takes it off afterwards.
+                //
+                // What used to be here blended the fader between the user's
+                // level and the style's, because both wrote the SAME number and
+                // something had to arbitrate. Multiplying removed the fight, so
+                // the arbitrator went with it.
+                const float styleFdr = styleCc7ToFader (cc7);
+                // The auto-level carries the GM square law and the per-slot
+                // trims, and unity is its "say nothing" value — so it blends
+                // toward 1.0 rather than toward anything of the user's.
+                const float aut = styleCc7ToAutoLevel (engineCh, rawVol,
+                                                       drumBalanceFactor,
+                                                       rhythmCeilingFactor,
+                                                       bassIsSynthBass2 (engineCh));
 
+                // THE SEED, AND ONLY IF NOTHING ELSE OWNS THE MIXER.  With a
+                // set behind this style the fader is the set's to state, and
+                // writing the style's number here would either be overwritten a
+                // moment later or - worse - survive on a slot the set happens
+                // not to mention.
+                if (! styleCc7Suppressed)
+                    engine.setChannelVolumeDerived (engineCh, styleFdr);
+
+                engine.setChannelAutoLevel     (engineCh, aut);
+
+                // slotLoadGain is still recorded even though MAKEUP no longer
+                // consumes it: the style-load LEVELS diagnostic prints it, and
+                // "what did each slot actually load at" is the first question
+                // asked whenever a style comes out too quiet.  Keeping the
+                // measurement costs one multiply per used voice at load time.
                 const float cal = engine.presetGainLinearFor (
                                       engineCh, slotSoundingFlag[(size_t) engineCh]);
-                slotLoadGain[(size_t) engineCh] = fdr * aut * cal;
+                slotLoadGain[(size_t) engineCh] = styleFdr * aut * cal;
             }
 
-            const float makeup = computeStyleMakeupGain (style, slotLoadGain);
-            engine.setStyleMakeupGain (StyleLevels::get().sectionBoost() * makeup);
+            // MAKEUP IS RETIRED — the bus carries the BOOST and nothing else.
+            //
+            // It was a loudness normaliser computed from `slotLoadGain`, which is
+            // built from the user's own faders and per-instrument calibration.  A
+            // per-STYLE constant derived from the user's level settings is a
+            // feedback loop: turn one instrument up and the whole bus moved
+            // underneath it, and only at the next style load or slider nudge, so
+            // the cause and the effect were never in the same gesture.
+            //
+            // computeStyleMakeupGain is kept below and simply has no caller, the
+            // same way computeDrumBalanceFactor and computeRhythmCeilingFactor
+            // were kept when their switches went.  The measurement was sound; it
+            // is the automatic application of it that had to stop.
+            engine.setStyleMakeupGain (StyleLevels::get().sectionBoost());
         }
 
         void applyVoiceSetup (const StyleData& style)
         {
-            // Spike diagnostics: a style load decodes every voice the style
-            // needs and composes its kits, so it is the biggest single
-            // message-thread burst there is.  Timing it here brackets all of
-            // that, and the individual DECODE lines nest inside.
-            Betel::PerfMonitor::Scoped perfScope ("STYLELOAD", style.name);
-
-            grexLog ("=== applyVoiceSetup ===", true);
-            grexLog ("soundLibraryCount=" + juce::String (engine.getSoundLibraryCount()));
-
             //------------------------------------------------------------------
             // CHORDAL SLOTS GO POLY FOR THIS STYLE.
             //
@@ -612,19 +675,7 @@ namespace Betel
                 if (ch < 0 || ch >= kNumUserStyleSlots) continue;
 
                 engine.setChannelStyleForcedPoly (ch, true);
-                grexLog ("chordal dst" + juce::String (rawDst)
-                         + " -> ch" + juce::String (ch) + "  FORCED POLY for this style");
             }
-
-            if (auto* reg = engine.getDrumKitRegistry())
-            {
-                grexLog ("drumKitCount=" + juce::String (reg->getKitCount())
-                         + "  kit000Elements=" + juce::String ((int) reg->getElementsForKit ("000").size()));
-                juce::String g;
-                for (const auto& n : reg->getGlobalComponentNames()) g += n + " ";
-                grexLog ("drumGlobals=" + g);
-            }
-            else grexLog ("drumKitRegistry=NULL");
 
             // Re-sync the bank map with how many presets the blob exposes.
             bankMap.setNumBlobPresets (engine.numBlobPresets());
@@ -639,6 +690,7 @@ namespace Betel
                 runningBankLsb[(size_t) ch] = -1;
                 slotStyleFlag[(size_t) ch]  = -1;
                 slotSoundingFlag[(size_t) ch] = -1;
+                applyBalanceTrim (ch, -1);                 // no instrument -> unity
                 slotLoadGain [(size_t) ch]  = 0.0f;        // …and its makeup weight
                 rhythmLocked[(size_t) ch]   = false;       // drum-part lock (set below)
                 pendingDrumPc[(size_t) ch]  = -1;          // clear parked kit misses
@@ -647,18 +699,32 @@ namespace Betel
                 setupBankLsb [(size_t) ch] = -1;
                 setupPc      [(size_t) ch] = -1;
                 setupExpression[(size_t) ch] = -1;         // …and its CC 11
+                setupBrightness[(size_t) ch] = -1;         // …and its CC 74
+                setupCc7     [(size_t) ch] = -1;          // …and its CC 7 anchor
+                pcJustChanged[(size_t) ch] = false;
                 lastStylePB  [(size_t) ch] = -1;           // …and pitch bend too
                 // AUTO-LEVEL carries the GM CC 7 law plus the per-slot
                 // calibration trims (see styleCc7ToAutoLevel).  Cleared here so
                 // a slot this style doesn't use can't inherit the previous
                 // style's factor — it is as stateful as expression.
                 engine.setChannelAutoLevel (ch, 1.0f);
-                // The style OWNS the style faders now: its CC 7 is a MIDI
-                // command to the visible fader (setup below writes each present
-                // channel's level; per-section rides move it live).  Default
-                // absent channels to unity so a part missing from this style
-                // doesn't inherit the previous style's fader.
-                engine.setChannelVolume (ch, 1.0f);
+                // ── THE STYLE'S FACTOR, NOT THE USER'S FADER ─────────────────
+                //
+                // setChannelVolumeDerived, and the difference is the whole bug
+                // Rob hit: this loop runs over ALL EIGHT style channels
+                // unconditionally at the top of every style load, and
+                // setChannelVolume now means "the user moved the mixer". So it
+                // was wiping all eight mixer faders to unity on every load -
+                // which is exactly "the mixer always loaded reset to 127", and
+                // also why the edits never survived to be saved.
+                //
+                // What this line is FOR is clearing the previous style's stated
+                // level off a channel the incoming style may not use, so a part
+                // missing from it cannot inherit one. That is the STYLE factor.
+                // The user's fader is reset separately and deliberately, once
+                // per style load, in adoptFreshStyle - and the set's MixerState
+                // is applied after that, so a set still gets the last word.
+                engine.setChannelVolumeDerived (ch, 1.0f);
             }
 
             // A style "has a CASM" if any present section declares routing rules.
@@ -786,10 +852,35 @@ namespace Betel
                             // substitution and every per-element edit survive.
                             // Slot 1 is PERC, where a whole sampled kit is
                             // additive rather than a replacement.
+                            // EDM KIT: an electronic kit the synth covers is resolved and pooled
+                            // now, so every later switch to it is a pointer swap.
+                            if (engine.preloadEdmKitForChannel (dests[d], 127, spec.bankLsb, spec.program))
+                                continue;
                             if (onLoadFullKit
                                 && onLoadFullKit (dests[d], 127, spec.bankLsb,
                                                   spec.program, dests[d] == 1))
                                 continue;
+
+                            // ── THE REVO! FLAG MUST BE SET *BEFORE* THE COMPOSE ──
+                            //
+                            // preloadDrumKitForChannel composes and POOLS the kit,
+                            // and resolveDrumKitParams reads this channel's flag as
+                            // it does so - it decides both which low-zone component
+                            // is merged (revo_first vs gm_first) and whether a Revo!
+                            // kit falls back to Standard.
+                            //
+                            // Set afterwards, as it was, the pre-warm composed with
+                            // whatever the PREVIOUS style left behind - false on a
+                            // fresh load - so a Revo! style pooled a gm_first kit at
+                            // its mapped family, and the publish further down then
+                            // took the pointer-swap fast path onto that warm, wrong
+                            // entry.  Setting the flag later could not undo it: the
+                            // kit was already built.
+                            //
+                            // That is also why a MANUAL RELOAD looked like it fixed
+                            // it - by then the flag was true from the load before.
+                            engine.setChannelRevoLowZone (dests[d],
+                                                          isRevoKit (spec.bankMsb, spec.bankLsb, spec.program));
 
                             const int fb = onComposedFallbackPc
                                              ? onComposedFallbackPc (127, spec.bankLsb,
@@ -834,6 +925,14 @@ namespace Betel
                                 // sound being absent - so the fallback answers with
                                 // Arabic when the library has it, and otherwise
                                 // leaves the existing percussion handling to decide.
+                                // Same ordering rule as the bank-127 branch above:
+                                // the flag decides how the kit is COMPOSED, so it
+                                // has to be true before the compose, not after.
+                                // Bank 126 carries Revo!SFX kits on LSB 8 exactly
+                                // as 127 carries Revo!Drums.
+                                engine.setChannelRevoLowZone (dests[d],
+                                                              isRevoBankLsb (spec.bankLsb));
+
                                 const int fb = onComposedFallbackPc
                                                  ? onComposedFallbackPc (126, spec.bankLsb,
                                                                          spec.program)
@@ -995,21 +1094,15 @@ namespace Betel
                     && slotPcIgnored[(size_t) engineCh].load())
                 {
                     slotTouched[(size_t) engineCh] = true;
-                    grexLog ("setup src" + juce::String (srcCh) + "->ch"
-                             + juce::String (engineCh) + "  VOICE SKIPPED (ignore PC)");
                     continue;
                 }
 
                 const bool mayDeclareVoice = (srcCh >= 8)
                                           || ! destDeclaresOwnVoice (engineCh);
+                // The destination declares its own voice; the routed variant
+                // plays through it, so this source contributes no setup.
                 if (! mayDeclareVoice)
-                {
-                    grexLog ("setup src" + juce::String (srcCh) + "->ch"
-                             + juce::String (engineCh)
-                             + "  VOICE SKIPPED (destination declares its own; "
-                               "routed variant plays through it)");
                     continue;
-                }
 
                 // A channel is a DRUM channel whenever its setup bank-select is
                 // MSB 127 -- even if no explicit program change was sent in the
@@ -1087,9 +1180,33 @@ namespace Betel
                     // Asked in the style's own numbering, not forcedKitPc's:
                     // FullKitMap keys on the real bank and program, and by
                     // forcedKitPc every bank-126 kit has already collapsed to 0.
-                    bool kitOk = (onLoadFullKit
-                                  && onLoadFullKit (engineCh, kitBankMsb, kitBankLsb,
-                                                    kitRawPc, engineCh == 1));
+                    // REVO! LOW ZONE, AND IT HAS TO BE SET BEFORE THE PUBLISH.
+                    //
+                    // Taken from kitBankLsb - the style's ACTUAL request - and set
+                    // here because runningBankLsb is flattened to 0 a few lines
+                    // below, so it cannot be recovered later.
+                    //
+                    // IT USED TO SIT FIVE LINES FURTHER DOWN, after the publish,
+                    // and that was the bug: publishDrumKitWithName composes the kit
+                    // on a pool miss, and resolveDrumKitParams reads this flag while
+                    // it does - so the kit was built as a non-Revo one and the flag
+                    // arrived too late to change anything about it.
+                    //
+                    // Ordering it before the publish also covers the pool HIT case,
+                    // which is the common one: the manifest loop pre-warms with the
+                    // same flag (see the two setChannelRevoLowZone calls up there),
+                    // so the warm entry is already the right variant and the swap
+                    // below simply takes it.
+                    engine.setChannelRevoLowZone (engineCh, isRevoKit (kitBankMsb, kitBankLsb, kitRawPc));
+                    engine.setChannelStyleKitAddress (engineCh, kitBankMsb, kitBankLsb, kitRawPc);   // SX920 key map
+
+                    // EDM KIT first: a style kit the synth covers plays live (this also
+                    // names it for SOUNDS, so EDIT on the slot opens the EDM editor).
+                    bool kitOk = engine.publishEdmKitWithName (engineCh, kitBankMsb, kitBankLsb, kitRawPc);
+                    if (! kitOk)
+                        kitOk = (onLoadFullKit
+                                 && onLoadFullKit (engineCh, kitBankMsb, kitBankLsb,
+                                                   kitRawPc, engineCh == 1));
 
                     // No sampled kit for this request: compose as before.  Already
                     // pre-warmed by the manifest loop, so it is a pointer swap
@@ -1099,6 +1216,7 @@ namespace Betel
                     rhythmLocked  [(size_t) engineCh] = true;     // pin to drum path
                     slotStyleFlag [(size_t) engineCh] = -1;
                     slotSoundingFlag[(size_t) engineCh] = -1;   // drum slot: no melodic flag
+                    applyBalanceTrim (engineCh, -1);           // a kit has no GM program -> unity
                     // Pin the running + redundancy caches to the drum bank (127),
                     // NOT the captured setup bank: a section that later resends a
                     // non-127 bank/PC must read as "different" so the playback
@@ -1111,14 +1229,6 @@ namespace Betel
                     setupBankMsb  [(size_t) engineCh] = 127;
                     setupBankLsb  [(size_t) engineCh] = 0;
                     setupPc       [(size_t) engineCh] = forcedKitPc;
-                    grexLog ("setup src" + juce::String (srcCh) + "->ch" + juce::String (engineCh)
-                             + "  DRUM(locked)  req=" + juce::String (kitBankMsb)
-                             + "/" + juce::String (kitBankLsb)
-                             + "/" + juce::String (kitRawPc)
-                             + "  forcedKitPc=" + juce::String (forcedKitPc)
-                             + " setupBank=" + juce::String (v.bankMsb)
-                             + " sampled=" + juce::String ((int) engine.isFullKitOnChannel (engineCh))
-                             + " loaded=" + juce::String ((int) kitOk));
                 }
                 else if (v.program >= 0)
                 {
@@ -1131,12 +1241,7 @@ namespace Betel
                     // source's setup (voice AND volume) for the slot entirely.
                     if (engineCh >= 0 && engineCh < kNumUserStyleSlots
                         && rhythmLocked[(size_t) engineCh])
-                    {
-                        grexLog ("setup src " + juce::String (srcCh)
-                                 + "  melodic voice IGNORED - slot "
-                                 + juce::String (engineCh) + " is drum-locked");
                         continue;
-                    }
                     if (engineCh >= 0 && engineCh < kNumUserStyleSlots)
                         slotTouched[(size_t) engineCh] = true;
                     engine.setDrumChannel (engineCh, false);
@@ -1156,6 +1261,7 @@ namespace Betel
                     engine.selectChannelPreset (engineCh, presetIdx);
                     slotStyleFlag[(size_t) engineCh] = presetIdx;
                     slotSoundingFlag[(size_t) engineCh] = presetIdx;
+                    applyBalanceTrim (engineCh, presetIdx);    // balance.grexv, per instrument
                     runningBankMsb[(size_t) engineCh] = v.bankMsb;
                     runningBankLsb[(size_t) engineCh] = v.bankLsb;
                     // Prime the PC redundancy cache — see drum branch above.
@@ -1165,21 +1271,6 @@ namespace Betel
                     setupBankMsb  [(size_t) engineCh] = v.bankMsb;
                     setupBankLsb  [(size_t) engineCh] = v.bankLsb;
                     setupPc       [(size_t) engineCh] = v.program;
-                    grexLog ("setup src" + juce::String (srcCh) + "->ch" + juce::String (engineCh)
-                             + "  MELODIC msb=" + juce::String (v.bankMsb)
-                             + " lsb=" + juce::String (v.bankLsb)
-                             + " prog=" + juce::String (v.program)
-                             + " -> flag=" + juce::String (presetIdx)
-                             + (presetIdx != rawIdx
-                                  ? (" (bass-role corrected from " + juce::String (rawIdx) + ")")
-                                  : juce::String())
-                             + " inLibrary=" + juce::String ((int) engine.hasInstrumentFlag (presetIdx)));
-                }
-                else
-                {
-                    grexLog ("setup ch" + juce::String (engineCh)
-                             + "  USED-but-no-prog  bankMsb=" + juce::String (v.bankMsb)
-                             + " lsb=" + juce::String (v.bankLsb));
                 }
                 {
                     // CC 7 IS OPTIONAL IN THE SInt.  A style that never sends it
@@ -1227,18 +1318,31 @@ namespace Betel
                     // and nothing else, so the mixer keeps showing exactly what
                     // the style file (and the Style Data window) reports.
                     const int   cc7    = effectiveStyleCc7 (engineCh, rawVol);
-                    const bool  ignore = StyleLevels::get().ignoreCc7();
-                    // IGNORE CC 7 — see refreshLevels above.  The fader keeps
-                    // the user's number; only the auto-level is touched, and
-                    // that goes to unity.
-                    const float fdr = ignore ? engine.getChannelVolume (engineCh)
-                                             : styleCc7ToFader (cc7);
+
+                    // The style's own number, straight into the STYLE FACTOR -
+                    // identical to refreshLevels above, and it has to stay
+                    // identical: this is the same decision made on the
+                    // style-load path, and two spellings of one rule is how
+                    // they drift apart.  INCLUDING the suppression test.
+                    const float styleFdr = styleCc7ToFader (cc7);
+
                     const float aut = styleCc7ToAutoLevel (engineCh, rawVol,
                                                            drumBalanceFactor,
                                                            rhythmCeilingFactor,
                                                            bassIsSynthBass2 (engineCh));
-                    if (! ignore) engine.setChannelVolume (engineCh, fdr);
+                    // THE SEED — suppressed when a set owns the mixer.  Same
+                    // test as refreshLevels; see setStyleCc7Suppressed.
+                    if (! styleCc7Suppressed)
+                        engine.setChannelVolumeDerived (engineCh, styleFdr);
+
                     engine.setChannelAutoLevel (engineCh, aut);
+
+                    // THE ANCHOR for every later CC 7 ride on this channel.  Raw,
+                    // and captured whether or not IGNORE is on: the switch decides
+                    // what reaches the engine, never what the style said.
+                    if (engineCh >= 0 && engineCh < kNumUserStyleSlots)
+                        setupCc7[(size_t) engineCh] = rawVol;
+
                     // Remember the slot's resulting linear gain so the per-style
                     // loudness makeup can weigh each note by the level it will
                     // actually sound at.
@@ -1252,7 +1356,7 @@ namespace Betel
                         const float cal = engine.presetGainLinearFor (
                                               engineCh,
                                               slotSoundingFlag[(size_t) engineCh]);
-                        slotLoadGain[(size_t) engineCh] = fdr * aut * cal;
+                        slotLoadGain[(size_t) engineCh] = styleFdr * aut * cal;
                     }
                 }
                 // EXPRESSION (CC 11) — the style's SECOND gain input, now
@@ -1267,8 +1371,12 @@ namespace Betel
                 // the setup doesn't mention resets to unity so nothing leaks in
                 // from the previously-loaded style.
                 engine.setChannelExpression (engineCh, styleExpressionToGain (v.expression));
+                engine.setChannelBrightness (engineCh, v.brightness >= 0 ? v.brightness : 64);   // CC74: the setup position
                 if (engineCh >= 0 && engineCh < kNumUserStyleSlots)
+                {
                     setupExpression[(size_t) engineCh] = v.expression;   // restore point for allNotesOff
+                    setupBrightness[(size_t) engineCh] = v.brightness;   // …and CC 74's
+                }
                 // OTHER GAIN-SHAPING CCs ARE STILL FILTERED — deliberately:
                 //  • Reverb send (CC 91): NOT applied — was a write-only value
                 //    (no reverb bus in the render path); now fully ignored.
@@ -1336,6 +1444,7 @@ namespace Betel
                 engine.clearChannelInstrument (ch);
                 slotStyleFlag [(size_t) ch] = -1;
                 slotSoundingFlag[(size_t) ch] = -1;
+                applyBalanceTrim (ch, -1);                 // no instrument -> unity
                 rhythmLocked  [(size_t) ch] = false;
                 runningBankMsb[(size_t) ch] = -1;
                 runningBankLsb[(size_t) ch] = -1;
@@ -1346,45 +1455,42 @@ namespace Betel
                 setupBankLsb  [(size_t) ch] = -1;
                 setupPc       [(size_t) ch] = -1;
                 setupExpression[(size_t) ch] = -1;
+                setupBrightness[(size_t) ch] = -1;
+                setupCc7      [(size_t) ch] = -1;
+                pcJustChanged [(size_t) ch] = false;
                 // An unused slot must not inherit the PREVIOUS style's
                 // expression — that multiplier is stateful and would silently
                 // hold this slot down for the whole session.
                 engine.setChannelExpression (ch, 1.0f);
                 engine.setChannelAutoLevel  (ch, 1.0f);   // …and its auto-level
-                grexLog ("setup slot " + juce::String (ch) + "  EMPTY (unused by this style)");
+                engine.setChannelBrightness (ch, 64);     // …and its CC74 sweep
             }
 
             // STYLE VOLUME stays at UNITY on load — it is entirely the user's.
-            // The MAKEUP is a separate multiplier and is now actually computed
-            // (see computeStyleMakeupGain): it evens out the very wide
-            // style-to-style loudness spread so one STYLE VOLUME setting holds
-            // across the library instead of needing a nudge per style.
-            const float makeup = computeStyleMakeupGain (style, slotLoadGain);
-            const float busOut = StyleLevels::get().sectionBoost() * makeup;
+            //
+            // MAKEUP IS RETIRED.  It used to sit here evening out the style-to-
+            // style loudness spread so one STYLE VOLUME setting held across the
+            // library.  The intent was right; the mechanism was not.  It computed
+            // that figure from `slotLoadGain` — the user's own faders times their
+            // per-instrument calibration — so a number meant to describe the
+            // STYLE was in fact a function of the user's level settings, applied
+            // to the whole bus.  Turn one instrument up and everything else
+            // moved, and only at the next style load, so nothing on screen
+            // connected the two.
+            //
+            // What replaces it is STYLE VOLUME's own base unity: one number, set
+            // by hand on the fader's detent, saved with the set, visible where it
+            // is applied.  A player nudging one fader per style is a smaller cost
+            // than a correction nobody can see or predict.
+            const float busOut = StyleLevels::get().sectionBoost();
             engine.setStyleBusGain    (1.0f);
             engine.setStyleMakeupGain (busOut);
 
-            // LEVEL DIAGNOSTIC.  Prints the whole style-bus gain chain and every
-            // slot's load-time gain, so "the style is too quiet" can be answered
-            // from data instead of inference.  If this line is MISSING from
-            // grex_log.txt after loading a style, the build is not running this
-            // file at all — which is itself the answer.
-            {
-                juce::String g;
-                for (int ch = 0; ch < kNumUserStyleSlots; ++ch)
-                    g += juce::String (ch) + "=" + juce::String (slotLoadGain[(size_t) ch], 4) + " ";
-                grexLog ("LEVELS: styleBus=1.000  makeup=" + juce::String (makeup, 3)
-                         + ((makeup >= kStyleMakeupMax - 1.0e-4f
-                             || makeup <= kStyleMakeupMin + 1.0e-4f) ? " [CLAMPED]" : "")
-                         + "  sectionBoost=" + juce::String (kStyleSectionBoost, 3)
-                         + "  -> styleBusTotal=" + juce::String (busOut, 3)
-                         + " (" + juce::String (20.0f * std::log10 (juce::jmax (1.0e-6f, busOut)), 1) + " dB)");
-                grexLog ("LEVELS: slot gains (fader x autoLevel)  " + g);
-                grexLog ("LEVELS: drumBalance=" + juce::String (drumBalanceFactor, 3)
-                         + "  rhythmCeiling=" + juce::String (rhythmCeilingFactor, 3)
-                         + " (" + juce::String (20.0f * std::log10 (juce::jmax (1.0e-6f, rhythmCeilingFactor)), 1)
-                         + " dB)");
-            }
+            // slotLoadGain is still filled above: "what did each slot load at"
+            // is the first question when a style is too quiet, and the figure
+            // is cheap.  The LEVELS log line that used to print it here is gone
+            // with the rest of the file diagnostics.
+            juce::ignoreUnused (busOut, drumBalanceFactor, rhythmCeilingFactor);
         }
 
         //======================================================================
@@ -1456,6 +1562,14 @@ namespace Betel
         // 3 dB louder.  Normalisation has to be continuous or near-identical
         // styles land on opposite sides of a coin flip.
 
+        /** RETIRED — kept, uncalled, exactly as computeDrumBalanceFactor and
+            computeRhythmCeilingFactor were kept when their switches went.
+
+            The MEASUREMENT is sound and took real work to get right; it is the
+            automatic APPLICATION of it that had to stop, because the figure was
+            derived from the user's own faders and calibration and then applied
+            over the top of them.  Deleting the arithmetic would throw away the
+            knowledge along with the mistake. */
         static float computeStyleMakeupGain (const StyleData& style,
                                              const std::array<float, kNumUserStyleSlots>& slotGain)
         {
@@ -1505,23 +1619,21 @@ namespace Betel
 
             if (p95 <= 1.0e-6f) return 1.0f;
 
-            // MAKEUP IS A DEPTH, NOT A TARGET.
+            // SELF-CONTAINED SINCE THE CONTROL WENT.
             //
-            // It used to be the loudness the section was driven to, with a
-            // separate on/off switch beside it.  Now it is 0..100 for "how much
-            // of that normalisation do you want", and 0 IS the off switch — one
-            // control instead of two, and the same 0-100 scale as BOOST.
+            // The depth this used to be scaled by lived in StyleLevels, and so
+            // did the target; both are gone with the slider, so the constant now
+            // sits here beside the only code that ever read it.  A retired
+            // function that still reaches into a class for values nobody else
+            // uses is how a deletion gets undone by accident.
             //
-            // Blending toward 1.0 rather than scaling the target is what makes
-            // it behave like glue: at 30 a quiet section travels 30% of the way
-            // toward the loud ones, instead of everything being flattened onto
-            // one number.
-            const float depth = StyleLevels::get().makeupDepth();
-            if (depth <= 0.0f) return 1.0f;
+            // Returns the FULL normalisation, undamped — there is no depth to
+            // apply any more.  Nothing calls this; it is kept for the
+            // measurement, not the multiplier.
+            constexpr float kRetiredMakeupTarget = 1.20f;
 
-            const float full = juce::jlimit (kStyleMakeupMin, kStyleMakeupMax,
-                                             StyleLevels::kMakeupTarget / p95);
-            return 1.0f + (full - 1.0f) * depth;
+            return juce::jlimit (kStyleMakeupMin, kStyleMakeupMax,
+                                 kRetiredMakeupTarget / p95);
         }
 
         /** Boundary flush: release ONLY the still-held style notes (tracker
@@ -1563,18 +1675,13 @@ namespace Betel
                 {
                     // Same rule as dispatchOne: honour the drum bank (127) and
                     // the percussion/SFX bank (126); ignore anything else.
-                    if      (msb == 127) applyRuntimeDrumPc (ch, pc);
-                    else if (msb == 126) applyRuntimeDrumPc (ch, percBankKitPc (pc));
+                    if      (msb == 127) applyRuntimeDrumPc (ch, pc, lsb);
+                    else if (msb == 126) applyRuntimeDrumPc (ch, percBankKitPc (pc), lsb, 126, pc);
                     continue;
                 }
-                if (msb == 127) { applyRuntimeDrumPc (ch, pc); continue; }
+                if (msb == 127) { applyRuntimeDrumPc (ch, pc, lsb); continue; }
                 const int presetIdx = bankMap.resolve (msb, lsb, pc, nullptr);
                 engine.selectChannelPooledPreset (ch, presetIdx);
-                // AUDIO THREAD (reassertSetupVoices runs from dispatchBlock's
-                // boundary handling) — same reason as the chord-switch marker
-                // above: no file, no string building.  The slot number is the
-                // useful part and it fits in the marker's int.
-                PerfMonitor::get().audioMark (PerfMonitor::AudioMarkId::BoundaryRestore, ch);
             }
         }
 
@@ -1593,6 +1700,8 @@ namespace Betel
                 // exactly where the next start should begin.
                 engine.setChannelExpression (ch,
                     styleExpressionToGain (setupExpression[(size_t) ch]));
+                engine.setChannelBrightness (ch, setupBrightness[(size_t) ch] >= 0
+                                                     ? setupBrightness[(size_t) ch] : 64);   // CC74 back to its setup position
             }
             activeNoteCount = 0;
         }
@@ -1787,35 +1896,6 @@ namespace Betel
         // style channel (0..7).  Yamaha styles use ch 8..15 — subtract 8.
         // Any incoming channel outside 8..15 is clamped into 0..7.
         //----------------------------------------------------------------------
-        // TEMP diagnostics: append a line to D:\\workspace\\BetelgeuseArranger\\grex_log.txt.
-        // reset=true overwrites the file (start of a fresh style load).
-        static void grexLog (const juce::String& line, bool reset = false)
-        {
-            const juce::File f = GrexPaths::styleLog();   // plugin root — see GrexPaths
-            if (reset) f.replaceWithText (line + juce::newLine);
-            else       f.appendText     (line + juce::newLine);
-        }
-
-        // ── One-shot CASM-miss diagnostic helpers (temporary) ───────────────
-        // Pretty-print the held chord and a 16-bit source-channel set for the
-        // grex_log.txt summary written from dispatchBlock.  Remove together
-        // with diagCasmLogArmed once chord switching is confirmed.
-        static juce::String diagChordName (const Chord& c)
-        {
-            static const char* n[12] =
-                { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-            const int r = ((c.root % 12) + 12) % 12;
-            return juce::String (n[r]) + " q" + juce::String ((int) c.quality);
-        }
-        static juce::String diagChannelMask (uint16_t mask)
-        {
-            juce::String s;
-            for (int ch = 0; ch < 16; ++ch)
-                if (mask & (uint16_t) (1u << ch))
-                    s << (s.isEmpty() ? "" : ",") << juce::String (ch);
-            return s.isEmpty() ? juce::String ("-") : s;
-        }
-
         static int mapSourceToEngineChannel (int srcCh) noexcept
         {
             // SFF roles: Ch9 (srcCh 8) = SubRhythm/percussion, Ch10 (srcCh 9) =
@@ -2453,6 +2533,92 @@ namespace Betel
         // Placed entirely in the AUTO-LEVEL, "behind the scenes": the fader is
         // left showing the composer's own CC 7, undoubled, so the mixer never
         // implies a level the style did not ask for.
+        //======================================================================
+        // balance.grexv - the per-instrument STYLE trim. See StyleBalanceFile.h.
+        //
+        // Applied wherever a style slot's SOUNDING flag changes, so it follows a
+        // mid-song program change on and off an instrument rather than only the
+        // initial setup. A drum slot passes -1 and lands on unity, which is why
+        // kits need no special case anywhere.
+        //======================================================================
+        StyleBalanceFile balanceFile;
+
+        // Set by the processor immediately before applyVoiceSetup - see
+        // setStyleCc7Suppressed.  Message thread only: both writers and both
+        // readers are on the style-load path, and the audio thread never looks
+        // at it.
+        bool styleCc7Suppressed = false;
+
+        void applyBalanceTrim (int engineCh, int gmProgram)
+        {
+            if (engineCh < 0 || engineCh >= kNumUserStyleSlots) return;
+            engine.setChannelBalanceGain (engineCh, balanceFile.gainFor (gmProgram));
+        }
+
+    public:
+        //======================================================================
+        //  CC 7 SUPPRESSION — "IS THERE A SET THAT OWNS THE MIXER?"
+        //
+        //  THE WHOLE RULE, IN ONE SENTENCE: if the style has a .bset carrying a
+        //  MixerState, CC 7 never touches a fader; otherwise it seeds them once.
+        //
+        //  WHY CC 7 IS ONLY A SEED.  The numbers in a style file were written
+        //  against Yamaha's oscillators and Yamaha's sample levels.  Our sounds
+        //  are calibrated per instrument already - the .ins gain trim and base
+        //  unity do that job, on screen and saved with the sound - so the
+        //  composer's ABSOLUTE levels are answering a question we have already
+        //  answered.  What still transfers is the SHAPE: which parts were meant
+        //  as foreground and which as bed.  So it goes in once as a starting
+        //  point and never argues with the mixer again.
+        //
+        //  THE PROCESSOR DECIDES, NOT THIS CLASS.  adoptFreshStyle resolves the
+        //  set before applyVoiceSetup runs and calls this - so the answer is
+        //  known BEFORE any fader is written, and there is no window in which
+        //  the style's numbers appear and are then overwritten.  That ordering
+        //  is the point; a flag set afterwards would still flash the wrong
+        //  levels and would still have to be cleared on the next style.
+        void setStyleCc7Suppressed (bool shouldSuppress) noexcept
+        {
+            styleCc7Suppressed = shouldSuppress;
+        }
+
+        /** PUSH THE GLOBAL STYLE BOOST TO THE BUS, NOW.
+
+            sectionBoost() is otherwise read in exactly TWO places, both inside
+            applyVoiceSetup - which runs on STYLE LOAD and nowhere else.  That
+            was correct while the boost was a compiled constant and wrong the
+            moment it became a slider: the value changed, the engine kept the
+            number it was handed at the last style load, and the control looked
+            dead until you loaded another style.
+
+            The panel and the MIDI remote both call this after writing the new
+            value, so the bus follows the slider immediately. */
+        void pushStyleBoost()
+        {
+            engine.setStyleMakeupGain (StyleLevels::get().sectionBoost());
+        }
+
+        bool isStyleCc7Suppressed() const noexcept { return styleCc7Suppressed; }
+
+        /** Re-read balance.grexv and re-apply it to every style slot. Called on
+            every style load, so an edit is heard by switching style - no
+            restart, which is the whole point of a calibration file. */
+        void reloadBalanceFile()
+        {
+            balanceFile.load();
+
+            // THE DEPARTMENT TRIMS GO TO THE ENGINE, not through applyBalanceTrim:
+            // they are per-ELEMENT, baked into each region when a kit is composed,
+            // so handing over the lookup also drops every warm kit. The next
+            // publish rebuilds with the new numbers.
+            engine.setBalanceRoleGainFn ([this] (int roleId)
+                                         { return balanceFile.roleGainFor (roleId); });
+
+            for (int ch = 0; ch < kNumUserStyleSlots; ++ch)
+                applyBalanceTrim (ch, slotSoundingFlag[(size_t) ch]);
+        }
+
+    private:
         static constexpr int kSynthBass2Flag       = 39;
 
         /** True when this slot is sounding GM 39.  Keyed on the SOUNDING flag,
@@ -2703,23 +2869,100 @@ namespace Betel
             return foldToMusicalRange (engineCh, note);
         }
 
-        /** Style CC 11 value -> linear expression multiplier.
-            Applied LINEARLY, deliberately.  GM specifies the same square curve
-            for CC 11 as for CC 7, but here it multiplies a fader that has ALREADY
-            been through that curve, and squaring twice over-attenuates: on
-            80sDisco the PAD (CC 7 52, CC 11 86) lost 3.4 dB it shouldn't have,
-            on top of the fader's own correct drop.  Linear keeps expression
-            doing its real job — the composer's ride shape — without re-applying
-            a law the fader already carries.
+        /** Style CC 11 value -> expression multiplier, GM SQUARE LAW.
+
+            ── WHY THIS WAS LINEAR, AND WHY THAT REASONING WAS WRONG ───────────
+            //
+            It read: "GM specifies the same square curve for CC 11 as for CC 7,
+            but here it multiplies a fader that has ALREADY been through that
+            curve, and squaring twice over-attenuates."
+
+            The fader's square law is CC 7's.  CC 11 is a SEPARATE controller
+            with its own curve, and GM applies the law to each independently -
+            total = (CC7/127)^2 x (CC11/127)^2.  Nothing was being squared
+            twice; CC 11 was simply not being squared at all.  The bug that
+            prompted the change was real - 80sDisco's PAD was 3.4 dB quiet - but
+            3.4 dB is exactly what removing this law gives back at CC 11 86, so
+            it hid whatever was actually attenuating that part rather than
+            fixing it.
+
+            ── WHAT IT COST ────────────────────────────────────────────────────
+
+            Every authored ride played at HALF ITS DEPTH IN dB.  The error is
+            zero at 127 and grows all the way down: CC 11 64 landed at -6 dB
+            instead of -12, and an ending fade to CC 11 3 landed at -33 dB
+            instead of -65 - a phrase written to disappear, still clearly there.
+            Measured across the library, styles sit somewhere other than their
+            setup value 70-94% of the time, so this was not an occasional
+            artefact; it was most of the dynamic writing in every style.
+
+            The dispatch site never agreed with it either: the CC 11 case in the
+            0xB0 handler documents itself as "Same GM square law as the setup
+            value".  It always believed it was calling this.
+
             A "not set" value (-1, the StyleVoiceSetup default) returns unity, so
             a channel whose setup never mentions CC 11 is unaffected.  No
             per-slot trims here: those belong to the mix level (the fader), and
             applying them twice would double-trim. */
+        //======================================================================
+        //  *** STYLE EXPRESSION (CC 11).  ON TRIAL - SEE BELOW. ***
+        //
+        //  true  = the arranger's rides are honoured, with the GM square law.
+        //  false = CC 11 is ignored entirely and every part sits still.
+        //======================================================================
+        /** RE-ENABLED 2026-09-09, FOR TESTING, AND HERE IS THE WHOLE HISTORY -
+            because this constant has now been argued both ways and the next
+            person to reach for it deserves the full account rather than
+            whichever half was written last.
+
+            OFF (2026-09-05).  Built the switch, A/B-ed it, everything sounded
+            better with the ride gone, on every style tried.  The reasoning: CC 7
+            is a BALANCE decision between parts and balance survives a change of
+            samples, whereas CC 11 is a continuous ride shaped around ONE
+            SAMPLE's behaviour - where that Yamaha voice thins out, where it
+            turns shrill - so aimed at different samples it can do the opposite
+            of what was intended.  "The style decides" holds for the composer's
+            structural choices and not for their per-sample corrections.
+
+            ON AGAIN (2026-09-09).  The first half of that argument FAILED A
+            TEST.  The same reasoning was used to retire the CC 7 square law, and
+            two days of mixing would not come right afterwards - see the block on
+            styleCc7ToAutoLevel.  With both laws flattened, NOTHING in a style
+            ever recedes: CC 7 stopped placing parts back and CC 11 stopped
+            pulling them back, so everything sat at the front permanently.  CC 7
+            is restored and demonstrably right.  This is the other half, and it
+            has NOT been proven either way since.
+
+            WHAT IS AT STAKE, measured across eight styles: a median 7.1 dB of
+            authored ride, worst case 16.3 dB, and it hits the Genos 1 library
+            hardest because those styles ride expression most.  The PHR1 part of
+            70s_Chart_Ballad rides CC 11 from 127 down to 3 to take a phrase away
+            at a section end - authored that is -65 dB, gone; ignored it does not
+            move at all.
+
+            WHAT TO LISTEN FOR, because the failure mode is specific: a ride that
+            was written to make a part fade can instead make it THIN, since the
+            original voice's timbre changed as it got quieter and ours does not.
+            If parts vanish where they should recede, that is this, and the
+            honest answer may be that CC 11 belongs off while CC 7 belongs on.
+
+            The values still arrive and are still RECORDED - setupExpression keeps
+            its restore point - so flipping this constant is the whole of it,
+            either way.
+
+            NOTE: this is the STYLE path only.  A player's own expression pedal
+            on a solo channel is handled elsewhere and is untouched. */
+        static constexpr bool kHonourStyleExpression = true;
+
         static float styleExpressionToGain (int styleExpression) noexcept
         {
+            if (! kHonourStyleExpression) return 1.0f;
+
             if (styleExpression < 0) return 1.0f;              // not set -> unity
-            return (float) juce::jlimit (0, 127, styleExpression) / 127.0f;
+            const float v = (float) juce::jlimit (0, 127, styleExpression) / 127.0f;
+            return v * v;
         }
+
 
         /** Style CC 7 -> FADER VALUE (normalised, 1.0 = 127 = unity).
             The composer's number, UNCHANGED — this is what the mixer shows and
@@ -2747,38 +2990,122 @@ namespace Betel
             return (float) juce::jlimit (0, kFaderValueMax, styleVolume) / 127.0f;
         }
 
-        /** Style CC 7 -> the channel's AUTO-LEVEL multiplier: everything that
-            shapes the part's gain WITHOUT moving the visible fader.
+        //======================================================================
+        //  ***  THE ONE NUMBER FOR "TOO LOUD" / "TOO QUIET".  ***
+        //
+        //  Dropping the square law made every style channel LOUDER, because the
+        //  old law squared a number below 1.  How much depends on the channel's
+        //  own CC 7, and this is the whole of it:
+        //
+        //      CC 7 127  ->  no change        CC 7  90  ->  +3.0 dB
+        //      CC 7 110  ->  +1.3 dB          CC 7  64  ->  +6.0 dB
+        //      CC 7 100  ->  +2.1 dB   (100 is the default when a style
+        //                               states no volume for a channel)
+        //
+        //  All sixteen channels move at once, so the bus climbs by roughly the
+        //  average - about 2 to 3 dB on a typical style.  -2.5 dB puts it back.
+        //
+        //  IT IS A CONSTANT, AND THAT MATTERS.  It cannot change the balance
+        //  between two channels, only where the whole bus sits, so tuning it
+        //  can never undo the flatter, calibrated balance the linear law gives.
+        //  Too loud: make it more negative.  Too quiet: less.  Nothing else in
+        //  the gain path needs touching, and nothing else should be.
+        //======================================================================
+        //  THE NUMBER LIVES IN Levels.h - Betel::Levels::kStyleChannelDb - and
+        //  is not duplicated here.  Every level in the tree is in that one file,
+        //  in decibels, for the reason this whole comment block exists.
+        static constexpr float kStyleSeedMakeupDb = Betel::Levels::kStyleChannelDb;
 
-            Engine gain = fader x expression x autoLevel, so returning (v/127)
-            here makes the audible law (v/127)^2 — the GM / Yamaha CC 7 volume
-            curve — while the fader still reads v.  The per-slot trims and the
-            drums' balance/boost ride along here for the same reason: they are
-            calibration, not the composer's stated level, and the user should
-            not see the fader move to a number the style never asked for.
+        //======================================================================
+        //  *** THE CC 7 VOLUME LAW.  BALANCE, NOT LEVEL. ***
+        //
+        //  true  = (v/127)^2, the GM / Yamaha curve the styles were written for.
+        //  false = v/127, linear - every quiet part comes forward by up to 6 dB.
+        //
+        //  IT IS NOT IN Levels.h ON PURPOSE.  That file holds LEVELS - numbers
+        //  that move the whole bus and cannot change how two parts sit against
+        //  each other.  This changes exactly that, and putting it beside them
+        //  would invite reaching for it when something is too loud, which is the
+        //  mistake that produced a mix nothing could fix.
+        //
+        //  If you are ever tempted to set this false again, read the block on
+        //  styleCc7ToAutoLevel below first.  It has been tried.
+        //======================================================================
+        static constexpr bool kUseGmSquareLaw = true;
 
-                PERC (slot 1)  x0.50   (-6.0 dB — runs hot against the kit)
-                BASS (slot 2)  x1.35   (+2.6 dB — runs thin; reference-honed)
+        /** THE HIDDEN GAIN STAGE IS RETIRED.  This returns a FIXED TRIM.
 
-            Audibly identical to the previous all-in-the-fader arithmetic; only
-            the split between "what you see" and "what you hear" changed. */
+            IT RETURNS (v/127) A SECOND TIME, AND THAT IS DELIBERATE.  Engine
+            gain is fader x expression x autoLevel, so feeding the same number
+            into both makes the audible law (v/127)^2 - the GM / Yamaha CC 7
+            volume curve - while the visible fader still reads v.
+
+            ── WHY THIS WAS REMOVED ONCE, AND WHY IT CAME BACK ──────────────────
+
+            The argument for removing it was: "our samples are calibrated per
+            instrument by the .ins gain trim, so Yamaha's curve is a second
+            correction for a problem already solved."  THAT ARGUMENT IS WRONG,
+            and it cost two days of mixing that would not come right.
+
+            Sample calibration and the CC 7 law answer DIFFERENT questions.
+            Calibration makes each SOUND sit at matched loudness for the same
+            MIDI level.  The CC 7 law is how the ARRANGER'S MIX DECISIONS turn
+            into gain - it is the GM volume law, roughly perceptual across the
+            fader's travel, and the styles were authored against it.
+
+            Removing it did not rebalance anything, it FLATTENED everything:
+
+                CC 7 90  went from -6.0 dB to -3.0    (+3.0 dB)
+                CC 7 64  went from -12.0 dB to -6.0   (+6.0 dB)
+                CC 7 127 did not move at all
+
+            so every part the arranger placed in the background came forward, by
+            more the further back it was placed.  The symptom is specific and
+            worth recognising if it ever returns: THE MIX WILL NOT COME RIGHT NO
+            MATTER WHAT YOU DO TO IT, because no fader, bus trim or master can
+            fix a RELATIONSHIP between parts - and it is consistent day after
+            day, which is what separates it from tired ears.
+
+            ── THE LEVEL COMPENSATION LIVES IN Levels.h, NOT HERE ───────────────
+
+            Restoring the curve drops the bus by roughly 2 to 3 dB on a typical
+            style, because the squared number is smaller.  Put that back with
+            kStyleBusDb, not by weakening the curve: the curve decides BALANCE
+            and Levels.h decides LEVEL, and mixing those two up is how this
+            became a two-day problem in the first place.
+
+            THE ARGUMENTS SURVIVE, unused, and deliberately.  drumBalance and
+            rhythmCeiling are still MEASURED per style and still logged; both
+            gates already return 1.0, so nothing changes by ignoring them here,
+            and keeping the signature means the measurement can be reconnected
+            without touching four call sites. */
         static float styleCc7ToAutoLevel (int engineCh, int styleVolume,
                                           float drumBalance   = 1.0f,
                                           float rhythmCeiling = 1.0f,
                                           bool  synthBass2    = false) noexcept
         {
-            // IGNORE CC 7 (per style, from the set).  Everything below this
-            // line is derived from the style's stated channel volume — the GM
-            // square law, the dynamic drum trims, the lot — so when the style's
-            // instrument volumes are being ignored the whole function collapses
-            // to unity and the part's level is the user's mixer fader alone.
-            if (StyleLevels::get().ignoreCc7())
-            {
-                juce::ignoreUnused (engineCh, styleVolume, drumBalance,
-                                    rhythmCeiling, synthBass2);
-                return 1.0f;
-            }
+            juce::ignoreUnused (engineCh, drumBalance, rhythmCeiling, synthBass2);
 
+            // The fixed trim from Levels.h rides along either way - it is a
+            // LEVEL, and it multiplies whatever law is in force.
+            const float makeup = Betel::Levels::toGain (kStyleSeedMakeupDb);
+
+            if (! kUseGmSquareLaw) return makeup;          // linear: fader alone
+
+            return styleCc7ToFader (styleVolume) * makeup; // -> (v/127)^2
+        }
+
+        /** The old body, kept whole and unreachable so the reasoning that built
+            it is not lost with it.  Nothing calls this. */
+        static float legacyStyleCc7ToAutoLevel (int engineCh, int styleVolume,
+                                                float drumBalance   = 1.0f,
+                                                float rhythmCeiling = 1.0f,
+                                                bool  synthBass2    = false) noexcept
+        {
+            // NO DEPTH GATE.  Everything below is derived from the style's own
+            // stated channel volume, and the style's decisions are taken whole
+            // now - the player adjusts afterwards on the mixer rather than
+            // dialling back how much of the style is heard in the first place.
             float level = styleCc7ToFader (styleVolume);      // -> GM square law
 
             //------------------------------------------------------------------
@@ -3041,9 +3368,18 @@ namespace Betel
         // budget allows; otherwise it is parked in pendingDrumPc and retried at
         // the start of a later block, so several un-warmed kits can't all decode
         // in one boundary block.  Audio thread.
-        void applyRuntimeDrumPc (int engineCh, int pc)
+        void applyRuntimeDrumPc (int engineCh, int pc, int bankLsb, int bankMsb = 127, int rawPc = -1)
         {
             if (engineCh < 0 || engineCh >= kNumUserStyleSlots) return;
+
+            // The kit the style asked for, RAW - a bank-126 caller passes the
+            // converted PC as `pc`, so it hands the original over as rawPc.
+            engine.setChannelStyleKitAddress (engineCh, bankMsb, bankLsb, rawPc >= 0 ? rawPc : pc);
+
+            // Every runtime kit change re-states whether this is a Revo! kit.
+            // A style that swaps between a Revo! and a legacy kit mid-song must
+            // flip the low-zone rule with it, not inherit the previous answer.
+            engine.setChannelRevoLowZone (engineCh, isRevoKit (bankMsb, bankLsb, pc));
 
             // A SAMPLED KIT ON THIS SLOT IS NEVER REPLACED FROM HERE.
             //
@@ -3059,6 +3395,14 @@ namespace Betel
             // DIFFERENT kit mid-song keeps the sampled one it started with.  That
             // is still better than what the composed answer would give it, which
             // is Standard either way.
+            // EDM KIT: an electronic kit the synth covers plays live - a pointer
+            // swap into the channel's synth pool, filled at style load.  A miss
+            // falls through to the sampled path below, exactly as before.
+            if (engine.programChangeEdm (engineCh, bankMsb, bankLsb, pc))
+            {
+                pendingDrumPc[(size_t) engineCh] = -1;
+                return;
+            }
             if (engine.isFullKitOnChannel (engineCh)) return;
 
             if (engine.isChannelDrumKitPooled (engineCh, pc))
@@ -3078,6 +3422,26 @@ namespace Betel
             {
                 pendingDrumPc[(size_t) engineCh] = pc;      // defer to a later block
             }
+        }
+
+        /** MANUAL BASS: the pattern's RHYTHM on the player's PITCH.
+
+            Not a mute, and not a sustained note either. The style's bass line
+            is a groove as much as a pitch sequence, and throwing the groove
+            away leaves a hole where the part was. Keeping the rhythm and
+            replacing only the pitch is what these instruments actually do, and
+            it is the reading of Yamaha's patent that stays musical: a bass tone
+            generated FROM the depressed bass note key.
+
+            manualBassNote is already -1 whenever the played note AGREES with
+            the chord root, so an ordinary root-position chord never reaches
+            here and the authored line plays untouched. */
+        int applyManualBass (int dstEngineCh, int outNote) const noexcept
+        {
+            if (dstEngineCh != kBassEngineChannel || manualBassNote < 0)
+                return outNote;
+
+            return foldNote (dstEngineCh, manualBassNote);
         }
 
         void dispatchOne (const StyleEvent& ev,
@@ -3217,7 +3581,22 @@ namespace Betel
                 : (int) ev.channel;
             const int dstEngineCh = mapSourceToEngineChannel (rawDst);
 
-            const bool muted = isChannelMuted (dstEngineCh);
+            // BASS INVERSION: the bass part alone is transposed against a chord
+            // whose ROOT is the note the player put at the bottom. Every other
+            // part keeps the recognised chord, which is the whole point - the
+            // harmony above must not move just because the bass did.
+            const Chord chordForPart =
+                (dstEngineCh == kBassEngineChannel && bassRootOverride >= 0)
+                    ? Chord { (((bassRootOverride % 12) + 12) % 12), chord.quality }
+                    : chord;
+
+            // The player's own element mute, OR the style bass standing down
+            // for MANUAL BASS.  Both mean the same thing to everything below -
+            // note-ons drop, note-offs still pass - so they are one flag here
+            // rather than a second test threaded through every case.
+            const bool muted = isChannelMuted (dstEngineCh)
+                            || (manualBassSilencesStyleBass
+                                && dstEngineCh == kBassEngineChannel);
 
             switch (cmd)
             {
@@ -3263,12 +3642,14 @@ namespace Betel
 
                     if (casm != nullptr)
                     {
-                        const auto r = NoteTransposer::applyAuto ((int) ev.data1, chord, *casm);
+                        const auto r = NoteTransposer::applyAuto ((int) ev.data1,
+                                                                  chordForPart, *casm);
                         if (r.shouldPlay)
                         {
                             int outNote = foldNote (dstEngineCh, r.destNote);
                             if (megaArt)
                                 outNote = megaVoiceFallbackNote (dstEngineCh, outNote, chord);
+                            outNote = applyManualBass (dstEngineCh, outNote);
                             engine.noteOn (dstEngineCh, outNote, outVel);
                             trackNoteOn (dstEngineCh, (int) ev.data1, outNote,
                                          outVel, casm);
@@ -3282,6 +3663,7 @@ namespace Betel
                         int outNote = foldNote (dstEngineCh, (int) ev.data1);
                         if (megaArt)
                             outNote = megaVoiceFallbackNote (dstEngineCh, outNote, chord);
+                        outNote = applyManualBass (dstEngineCh, outNote);
                         engine.noteOn (dstEngineCh, outNote, outVel);
                         trackNoteOn (dstEngineCh, (int) ev.data1, outNote,
                                      outVel, nullptr);
@@ -3335,6 +3717,41 @@ namespace Betel
                             if (! styleCCChanged (dstEngineCh, 7, val))
                                 return;            // identical repeat — swallowed
 
+                            if (dstEngineCh < 0 || dstEngineCh >= kNumUserStyleSlots)
+                                return;
+
+                            //--------------------------------------------------
+                            // FOLLOW: how much of this ride actually lands.
+                            //
+                            // The changed-gate above still compares the RAW value,
+                            // so damping can never make two different rides look
+                            // like a repeat and get swallowed.
+                            //
+                            // Measured from setupCc7 - where the style itself
+                            // parked this channel at load - so the ride keeps its
+                            // direction and its shape and loses only its travel.
+                            // At 100 `applied` IS `val` and this whole block is
+                            // arithmetic that changes nothing, which is what makes
+                            // the default bit-identical to every previous build.
+                            //
+                            // The PROGRAM-CHANGE exemption is gone with the
+                            // blend it qualified - every ride lands in full now,
+                            // so there is nothing left for it to exempt. The
+                            // FLAG is still cleared, because the setter side
+                            // still writes it and a latched true would be a
+                            // stale bit waiting to confuse the next reader.
+                            //--------------------------------------------------
+                            pcJustChanged[(size_t) dstEngineCh] = false;
+
+                            // APPLIED AS SENT.  This used to blend the incoming
+                            // CC 7 toward the setup anchor by the FOLLOW depth,
+                            // so a mid-song ride only moved the channel part of
+                            // the way. The style's rides are its own musical
+                            // decisions and are taken in full; the player's
+                            // fader multiplies whatever comes out.
+                            const int applied = juce::jlimit (0, 127, val);
+
+
                             // PERC is trimmed here too, not just at setup: a style
                             // that re-sends CC 7 every section would otherwise walk
                             // the level straight back up.  The changed-gate above
@@ -3356,10 +3773,12 @@ namespace Betel
                             // Brass Section is trimmed on the ride too, or a
                             // style that re-sends CC 7 each section would walk
                             // the halved fader straight back up.
-                            engine.setChannelVolume    (dstEngineCh,
-                                styleCc7ToFader (effectiveStyleCc7 (dstEngineCh, val)));
+                            // Derived: a style's own CC 7 writing must not
+                            // become the anchor the FOLLOW slider blends from.
+                            engine.setChannelVolumeDerived (dstEngineCh,
+                                styleCc7ToFader (effectiveStyleCc7 (dstEngineCh, applied)));
                             engine.setChannelAutoLevel (dstEngineCh,
-                                styleCc7ToAutoLevel (dstEngineCh, val, drumBalanceFactor,
+                                styleCc7ToAutoLevel (dstEngineCh, applied, drumBalanceFactor,
                                                      rhythmCeilingFactor,
                                                      bassIsSynthBass2 (dstEngineCh)));
                             return;
@@ -3386,6 +3805,17 @@ namespace Betel
                             return;
                         }
 
+                        case 74:    // Brightness — the style's filter sweeps
+                        {
+                            if (dstEngineCh < 0 || dstEngineCh >= kNumUserStyleSlots)
+                                return;
+                            // Lands on the channel's cutoff multiplier (64 =
+                            // untouched, 3 octaves either way), glided per block
+                            // in the render so a dense sweep does not step.  Not
+                            // changed-gated, for the same reason as CC 11.
+                            engine.setChannelBrightness (dstEngineCh, val);
+                            return;
+                        }
                         default:
                             return;     // filtered — other style control CCs ignored
                     }
@@ -3426,6 +3856,17 @@ namespace Betel
                     lastAppliedLsb[(size_t) dstEngineCh] = lsb;
                     lastAppliedPc [(size_t) dstEngineCh] = pc;
 
+                    // ARM THE CC 7 EXEMPTION.  Set here, AFTER the redundancy
+                    // cache has let the event through, so a re-stamped PC that
+                    // changes nothing does not also excuse the next ride from
+                    // being damped.  Consumed by the CC 7 handler, and only by
+                    // it - if the style sends no balancing CC 7 the flag simply
+                    // sits until the next one arrives, which is harmless: the
+                    // first ride after a real voice change is exactly the one
+                    // that should land in full.
+                    if (dstEngineCh >= 0 && dstEngineCh < kNumUserStyleSlots)
+                        pcJustChanged[(size_t) dstEngineCh] = true;
+
                     // GUARD: a rhythm-locked slot (a drum part per its SInt /
                     // manifest) must never be demoted to a melodic voice.  Honour
                     // a real drum-kit change (bank 127); ignore any non-127 bank
@@ -3440,16 +3881,16 @@ namespace Betel
                         // Everything else is still ignored, so a mis-authored
                         // style can't demote the drums to a fretless bass.
                         if (msb == 127)
-                            applyRuntimeDrumPc (dstEngineCh, pc);
+                            applyRuntimeDrumPc (dstEngineCh, pc, lsb);
                         else if (msb == 126)
-                            applyRuntimeDrumPc (dstEngineCh, percBankKitPc (pc));
+                            applyRuntimeDrumPc (dstEngineCh, percBankKitPc (pc), lsb, 126, pc);
                         return;
                     }
 
                     if (msb == 127)
                     {
                         // Drum bank: swap the kit by PC.
-                        applyRuntimeDrumPc (dstEngineCh, pc);
+                        applyRuntimeDrumPc (dstEngineCh, pc, lsb);
                         return;
                     }
                     const char* vName   = (casm != nullptr) ? casm->voiceName : nullptr;
@@ -3463,6 +3904,14 @@ namespace Betel
                                               : rawIdx;
                     engine.selectChannelPooledPreset (dstEngineCh, presetIdx);
                     slotSoundingFlag[(size_t) dstEngineCh] = presetIdx;
+
+                    // THE RUNTIME PC PATH, and the one that matters most for a
+                    // balance file: a style that swaps instruments mid-song must
+                    // pick up the new instrument's trim at the swap, not keep
+                    // the outgoing one's. setChannelBalanceGain is two atomic
+                    // stores and a multiply - no allocation, no locking - so it
+                    // is safe on this thread.
+                    applyBalanceTrim (dstEngineCh, presetIdx);
                     return;
                 }
 
@@ -3499,6 +3948,11 @@ namespace Betel
         // and read only on the audio thread, so a plain bool is sufficient.
         bool                dispatchFingeredMode = false;
 
+        // Bass inversion / manual bass, per block. See setBassOverrides.
+        int                 bassRootOverride = -1;
+        int                 manualBassNote   = -1;
+        // See setBassOverrides. Audio thread only, like the two above.
+        bool                manualBassSilencesStyleBass = false;
 
         // ── "Changed" gate for style CCs that reach the engine ──────────────
         // Last value actually sent, per (style slot, CC#).  A style CC is
@@ -3567,6 +4021,34 @@ namespace Betel
         // style switch.  Without that, one ending would leave the part quiet
         // for the rest of the session.
         std::array<int, kNumUserStyleSlots> setupExpression {{ -1, -1, -1, -1, -1, -1, -1, -1 }};
+        std::array<int, kNumUserStyleSlots> setupBrightness {{ -1, -1, -1, -1, -1, -1, -1, -1 }};   // CC 74 restore point
+
+        // SETUP CC 7 per slot (-1 = the style never stated one).  This is the
+        // ANCHOR the FOLLOW depth measures a mid-song ride against: the level the
+        // style itself parked this channel at when it loaded.  Damping toward it
+        // is what lets a ride keep its DIRECTION and its shape while losing most
+        // of its travel.
+        //
+        // The RAW style volume is stored, not the fader it resolves to, because
+        // the live handler receives a raw CC value and both must go through
+        // effectiveStyleCc7 together - blending a raw number with a resolved one
+        // would apply the per-slot trims twice.
+        std::array<int, kNumUserStyleSlots> setupCc7 {{ -1, -1, -1, -1, -1, -1, -1, -1 }};
+
+        // "This channel just changed voice."  Set by the 0xC0 handler when a
+        // program change is actually APPLIED, consumed by the next CC 7 on the
+        // same channel.
+        //
+        // It exists because CC 7 arrives in two completely different roles and
+        // only one of them is the composer's taste.  Voice-switching styles pair
+        // every per-section program change with a BALANCING CC 7 - the new
+        // instrument is intrinsically louder or quieter than the one it replaced
+        // and the style corrects for it.  Damping that is not restraint, it is a
+        // wrong level: a pad going strings -> brass would be left sounding at the
+        // strings' setting.  So a CC 7 that follows a voice change is applied in
+        // FULL, and only free-standing rides are damped.
+        std::array<bool, kNumUserStyleSlots> pcJustChanged {{ false, false, false, false,
+                                                              false, false, false, false }};
 
         std::array<int, kNumUserStyleSlots> lastAppliedMsb {{ -2, -2, -2, -2, -2, -2, -2, -2 }};
         std::array<int, kNumUserStyleSlots> lastAppliedLsb {{ -2, -2, -2, -2, -2, -2, -2, -2 }};
@@ -3582,6 +4064,64 @@ namespace Betel
         // all decoding in the single block at a section boundary.  With the
         // manifest pre-warm in place this budget is essentially never hit.
         static constexpr int kMaxDrumComposesPerBlock = 1;
+
+        /** Genos marks its Revo! drum and SFX kits with bank LSB 8 (Yamaha's own
+            voice list: 127/8 Revo!Drums, 126/8 Revo!SFX).  Those kits reassign
+            the keys below 29 to hi-hat and snare articulations, so the XG
+            elements gm_first and the_second supply are the wrong instrument
+            there.  revo_first carries the Revo! reading of 13..22; 25..28 is
+            still unsampled and falls back to the XG one. */
+        static constexpr int kRevoBankLsb    = 8;   // Genos    Revo!Drums / Revo!SFX
+        static constexpr int kAmbientBankLsb = 9;   // Genos 2  Ambient Drums / Ambient SFX
+
+    public:
+        /** Does this bank LSB carry a REVO-GENERATION key layout?
+
+            Genos marks Revo! kits with LSB 8 (127/8 Revo!Drums, 126/8 Revo!SFX).
+            GENOS 2 ADDS LSB 9 for its Ambient Drums, and those are the same kit
+            lineup re-recorded with room mics - the PCs line up one for one with
+            the Revo set at LSB 8 (18, 74, 75, 76, 77, 78, 79).  Same kits, same
+            key map, different microphones.
+
+            MEASURED, NOT ASSUMED.  A Genos 2 style's RHY2 on 127/9 plays 86 notes
+            in the 13..22 zone, which only a Revo-generation kit carries at all;
+            read with the legacy map those land on surdos, scratches and
+            metronome clicks.  Until this, exactly half of every Genos 2 style's
+            drums were read correctly - RHY1 on 126/8 was, RHY2 on 127/9 was not.
+
+            A predicate rather than four comparisons against a constant, so the
+            next generation is one entry here instead of a hunt through the file
+            for places that were supposed to agree. */
+        static constexpr bool isRevoBankLsb (int lsb) noexcept
+        { return lsb == kRevoBankLsb || lsb == kAmbientBankLsb; }
+
+        /** THE PSR-SX920 PUTS ITS REVO! KITS ON LSB 0, NOT 8.
+
+            Its Data List (Drum/SFX Kit List) shows six bank-127 kits with the
+            Revo! low layout - a hi-hat Tip/Edge sweep on 13..20, Pedal Closed on
+            21, Pedal Splash on 22, the no-Rim snares on 25..28 - all addressed
+            127-0-PC:  17 RockDrumKit, 73 PopDrumKit, 74 VintageOpenKit,
+            76 JazzBrushExpanded, 77 VintageMutedKit, 78 JazzStickKit.
+            (75 JazzBrushKitComp is NOT one of them: its low keys are XG.)
+
+            Tested on the LSB alone they read as legacy kits, so revo_first never
+            loaded and their hi-hats - 27% of every hit those kits play, in 415 of
+            the 575 SX920 styles - came out as Surdo, Hi Q, whip, scratch and
+            metronome.  Recognised here, they follow the Revo! rule exactly like
+            the LSB 8 kits: revo_first on the low zone, and the Standard body
+            (revoFallbackFamily in SamplePlayerEngine.h), both from this one flag.
+
+            Bank 126 is untouched: the SX920 has no LSB 0 Revo! SFX kits. */
+        static constexpr bool isSx920RevoKit (int msb, int lsb, int pc) noexcept
+        {
+            return msb == 127 && lsb == 0
+                && (pc == 17 || pc == 73 || pc == 74 || pc == 76 || pc == 77 || pc == 78);
+        }
+
+        static constexpr bool isRevoKit (int msb, int lsb, int pc) noexcept
+        { return isRevoBankLsb (lsb) || isSx920RevoKit (msb, lsb, pc); }
+
+    private:
         int drumComposeBudget = 0;   // reset each dispatchBlock
         std::array<int, kNumUserStyleSlots> pendingDrumPc {{ -1, -1, -1, -1, -1, -1, -1, -1 }};
 
@@ -3706,13 +4246,6 @@ namespace Betel
         // initial state so a fresh session doesn't glitch on first dispatch.
         Chord pendingChord    { 0, ChordQuality::Maj };
         int   lastDispatchTick = 0;
-
-        // ── One-shot CASM-miss diagnostic state (temporary) ─────────────────
-        // Set true when a committed chord change occurs; the next dispatchBlock
-        // that carries events logs a CASM match/null summary and clears it.
-        // Remove together with the diagChordName / diagChannelMask helpers and
-        // the logging block in dispatchBlock once chord switching is confirmed.
-        bool  diagCasmLogArmed = false;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StylePlayer)
     };

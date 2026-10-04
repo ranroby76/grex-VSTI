@@ -230,7 +230,9 @@ namespace Betel
             loads, so the caller always knows which it is. */
         bool shouldLoadFull (int msb, int lsb, int pc, bool isPercSlot) const
         {
-            if (find (msb, lsb, pc) == nullptr) return false;      // rule 1
+            // resolve(), not find(): an aliased kit is one we own, so rule 1 has
+            // been satisfied even though this exact triple has no folder.
+            if (resolve (msb, lsb, pc) == nullptr) return false;   // rule 1
 
             // Rule 2 is where DRUMS and PERC part company, and deliberately so.
             // On DRUMS a composed kit Grex actually owns beats a sampled one
@@ -241,12 +243,69 @@ namespace Betel
             return true;                                           // rule 3
         }
 
+        //======================================================================
+        // SAMPLED-KIT ALIASES
+        //
+        // A kit we do not own, answered by one we do - in the SAME family, on
+        // the SAME bank.  This is not the composed fallback below and must not
+        // be confused with it: that one answers "no sampled kit exists, which
+        // COMPOSED kit stands in", and its whole rule is that a miss never lands
+        // in a sampled kit.  This answers a narrower question - "we have the
+        // Cuban kit and the style asked for the Afro-Cuban one" - where the
+        // substitute is a deliberate, named choice rather than an accident of
+        // which folders happen to exist.
+        //
+        // WHY THIS AND NOT DUPLICATE .frb FILES.  Copying Pop Latin to three
+        // more filenames would work today and rot immediately: three copies to
+        // re-export every time the kit is re-sampled, no record anywhere of
+        // which is the real one, and a folder listing that lies about what the
+        // library contains.  One table, one blob, and the substitution is
+        // visible in source instead of implied by identical file sizes.
+        //
+        // ONLY WITHIN BANK 126, AND ONLY PERCUSSION.  Every entry is a
+        // percussion or SFX kit standing in for another of the same character.
+        // A drum kit is never aliased - bank 127 has nearestDrumFamily for that,
+        // which reasons about families properly and would be undermined by a
+        // second opinion here.
+        //======================================================================
+        struct Alias { int msb, lsb, pc;  int toMsb, toLsb, toPc; };
+
+        static const std::vector<Alias>& aliases()
+        {
+            static const std::vector<Alias> a = {
+                // Revo!SFX PopPercKit  -> Pop Latin Kit   (20 styles)
+                { 126, 8, 45,   126, 0, 43 },
+                // Revo!SFX AfroCubanKit -> Cuban Kit       (1 style)
+                { 126, 8, 42,   126, 0, 40 },
+                // NoisesKit            -> SFX Kit 1        (4 styles)
+                { 126, 0,  8,   126, 0,  0 },
+            };
+            return a;
+        }
+
+        /** The installed kit that answers this request: the exact one if it is
+            here, otherwise its alias.  nullptr when neither exists.
+
+            Everything that LOADS a kit goes through this; find() stays exact so
+            the audit and the UI can still tell the difference between "we have
+            it" and "we are standing in for it". */
+        const Entry* resolve (int msb, int lsb, int pc) const
+        {
+            if (const auto* e = find (msb, lsb, pc)) return e;
+
+            for (const auto& a : aliases())
+                if (a.msb == msb && a.lsb == lsb && a.pc == pc)
+                    return find (a.toMsb, a.toLsb, a.toPc);
+
+            return nullptr;
+        }
+
         /** The .frb inside a kit folder.  One file per folder is the expected
             shape; if several exist the first is taken, so a stray backup does
             not silently change which kit loads. */
         juce::File blobFor (int msb, int lsb, int pc) const
         {
-            const auto* e = find (msb, lsb, pc);
+            const auto* e = resolve (msb, lsb, pc);
             if (e == nullptr) return {};
             if (e->isFile)   return e->path;
 

@@ -1,3 +1,56 @@
+# =============================================================================
+# GREX - the full, paid arranger.
+#
+# THIS TREE IS GREX BALLADA'S SOURCE, FORKED FORWARD.  Ballada is the newer
+# engine: section send buses, the .fst library, early reflections, ENERGY, the
+# palette file.  Grex inherits all of it and adds back what a paid, full-library
+# product needs.  The old D:/Workspace/BetelgeuseArranger tree is a DONOR for
+# things like the licence code - it is not the base any more.
+#
+# FOUR SURFACES SEPARATE THE TWO PRODUCTS ON A MACHINE THAT HAS BOTH INSTALLED.
+# Change one and you must change all four:
+#
+#   1. THE PLUGIN ID          BUNDLE_ID / CLAP_ID / PLUGIN_CODE, below.  The
+#                             VST3 UID is derived from PLUGIN_MANUFACTURER_CODE
+#                             + PLUGIN_CODE.  Grex is BtPP, Ballada is GxBa.
+#   2. THE ROOT FOLDER        Documents/Grex VSTI - BetelFolderManager.h.
+#   3. THE SETTINGS FILES     grex_*.xml - Betel::GrexPaths in GlobalMacros.h.
+#   4. THE APPDATA LOCATOR    Fanan Team/Betelgeuse - BetelFolderManager.h.
+#
+# WHAT IS DELIBERATELY SHARED: the FILE FORMATS.  .bset, .ins, .sins, .drm,
+# .grxsong and .fst are byte-identical to Ballada's, and the ValueTree tag names
+# inside the settings XML are unchanged too - so a tuned ballada_master.xml can
+# be seeded into Grex by copying it and renaming it grex_master.xml, and a song
+# recorded in either opens in the other.  Only the file NAMES differ.
+#
+# WHAT GREX ADDS BACK: the WORLD and ORIENTAL sound packs, the machine-locked
+# registration and demo mute, and the full multi-genre style library.
+# =============================================================================
+
+# =============================================================================
+
+# =============================================================================
+# THIS PROJECT IS BUILT AGAINST JUCE 9.  IGNORE EVERY "JUCE 8" COMMENT IN src/.
+#
+# Grex was written against JUCE 8 and moved to JUCE 9.  The move was made in the
+# BUILD, not by rewriting the source comments, so a number of headers and .cpp
+# files under src/ still say "JUCE 8" in their notes - most often where a fix
+# recorded which JUCE version removed an API (Font::getStringWidth /
+# getStringWidthFloat is the usual one).  Those notes describe WHY the code
+# looks the way it does and are still accurate about the workaround; they are
+# NOT a statement about which JUCE this target compiles with.
+#
+# THE AUTHORITY IS THIS FILE:
+#   * cmake_minimum_required(VERSION 3.22) below is JUCE 9's own minimum
+#   * LANGUAGES C CXX is spelled out because JUCE 9 hard-fails without C
+#   * src/Main.cpp gates pinPeerScale() on JUCE_VERSION >= 0x090000
+#
+# So: if a comment in src/ and this file disagree about the JUCE version, THIS
+# FILE IS RIGHT.  Anything written from here on should target JUCE 9 APIs.  The
+# stale comments are deliberately left alone rather than mass-edited - touching
+# ~90 files to change a word is a large diff with no behavioural change and a
+# real chance of collateral damage.
+# =============================================================================
 
 # ==========================================================
 # 3.22 is JUCE 9's own minimum (JUCE/CMakeLists.txt declares
@@ -27,14 +80,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # override it, so a CI runner died at configure time before a single file was
 # compiled.
 #
-# The order is the same for all four: an explicit -D on the command line wins,
-# then the copy inside the repository, then the old D: location.  Because the
-# repo root IS D:/Workspace/BetelgeuseArranger on the development machine, the
-# repo-relative branch resolves to exactly the same folders locally as the
-# hard-coded paths did - the local build does not change behaviour, it just
-# stops being the only build that can work.
+# The order is: an explicit -D on the command line always wins, then an
+# autodetected location.  Because the repo root IS the development machine's
+# project folder, the repo-relative branch resolves to the same folders locally
+# as the hard-coded paths did - the local build does not change behaviour, it
+# just stops being the only build that can work.
+#
+# CLAP IS THE ONE EXCEPTION TO THE REPO-FIRST ORDER, AND IT IS DELIBERATE.
+# See the CLAP block below: the newer, JUCE 9-adjusted checkout lives OUTSIDE
+# the project tree, and a stale copy may still be sitting in libs/, so the
+# absolute path is tried before the repo-relative one on Windows.
 # ==========================================================
 set(BETELGEUSE_ASSETS_PATH "" CACHE PATH "Path to the assets folder")
+# GREX_ASSETS_PATH is accepted as an alias so a command line copied from the
+# Ballada project keeps working; BETELGEUSE_ASSETS_PATH wins if both are given.
+set(GREX_ASSETS_PATH       "" CACHE PATH "Alias for BETELGEUSE_ASSETS_PATH")
+if(GREX_ASSETS_PATH AND NOT BETELGEUSE_ASSETS_PATH)
+    set(BETELGEUSE_ASSETS_PATH "${GREX_ASSETS_PATH}")
+endif()
 set(ASIO_SDK_PATH          "" CACHE PATH "Path to the Steinberg ASIO SDK (Windows only)")
 
 # ---- JUCE ------------------------------------------------------------------
@@ -62,22 +125,39 @@ if(NOT JUCE_DIR OR NOT EXISTS "${JUCE_DIR}/CMakeLists.txt")
 endif()
 
 # ---- CLAP extensions -------------------------------------------------------
-# Not committed to the repository.  Locally it sits in libs/CLAP_Extensions; on
-# CI the workflow git-clones it to the same place, so both resolve identically
-# and the CLAP target never depends on a path that only exists on one machine.
+# Not committed to the repository.  On CI the workflow git-clones it into
+# libs/CLAP_Extensions; on the development machine the working checkout is
+# D:/workspace/clap-juce-extensions-main - a NEWER copy, adjusted for JUCE 9.
+#
+# WHY THE ABSOLUTE PATH IS TRIED BEFORE THE REPO-RELATIVE ONE, WHICH INVERTS
+# THE ORDER USED BY JUCE AND ASSETS ABOVE:
+#
+# An older clap-juce-extensions may still be sitting in libs/CLAP_Extensions
+# from before the JUCE 9 move.  With the repo-relative branch first, that stale
+# copy silently wins and the JUCE 9-adjusted one is never compiled - and the
+# symptom is not a missing folder but a build that configures cleanly and then
+# fails inside the wrapper, or worse, links against the wrong wrapper and
+# misbehaves only in a CLAP host.  Deleting libs/CLAP_Extensions would fix it
+# too, but a build that depends on someone remembering to delete something is
+# not fixed.
+#
+# This costs CI nothing: the absolute path is guarded by EXISTS and there is no
+# D: drive on the macOS runner, so the check fails and the repo-relative clone
+# is used exactly as before.  An explicit -DCLAP_EXTENSIONS_PATH= still
+# outranks both, so the old behaviour is one flag away if it is ever wanted.
 if(NOT DEFINED CLAP_EXTENSIONS_DIR OR "${CLAP_EXTENSIONS_DIR}" STREQUAL "")
     if(DEFINED CLAP_EXTENSIONS_PATH AND EXISTS "${CLAP_EXTENSIONS_PATH}/CMakeLists.txt")
         set(CLAP_EXTENSIONS_DIR "${CLAP_EXTENSIONS_PATH}" CACHE PATH "Path to clap-juce-extensions")
+    elseif(EXISTS "D:/workspace/clap-juce-extensions-main/CMakeLists.txt")
+        set(CLAP_EXTENSIONS_DIR "D:/workspace/clap-juce-extensions-main" CACHE PATH "Path to clap-juce-extensions")
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/CLAP_Extensions/CMakeLists.txt")
         set(CLAP_EXTENSIONS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs/CLAP_Extensions" CACHE PATH "Path to clap-juce-extensions")
-    elseif(EXISTS "D:/Workspace/BetelgeuseArranger/libs/CLAP_Extensions/CMakeLists.txt")
-        set(CLAP_EXTENSIONS_DIR "D:/Workspace/BetelgeuseArranger/libs/CLAP_Extensions" CACHE PATH "Path to clap-juce-extensions")
     endif()
 endif()
 
 if(NOT CLAP_EXTENSIONS_DIR OR NOT EXISTS "${CLAP_EXTENSIONS_DIR}/CMakeLists.txt")
     message(FATAL_ERROR
-        "clap-juce-extensions not found.  Pass -DCLAP_EXTENSIONS_DIR=..., or place a "
+        "clap-juce-extensions not found.  Pass -DCLAP_EXTENSIONS_PATH=..., or place a "
         "checkout at ${CMAKE_CURRENT_SOURCE_DIR}/libs/CLAP_Extensions.")
 endif()
 
@@ -90,8 +170,8 @@ if(BETELGEUSE_ASSETS_PATH AND EXISTS "${BETELGEUSE_ASSETS_PATH}")
     set(BETELGEUSE_ASSETS_DIR "${BETELGEUSE_ASSETS_PATH}")
 elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets")
     set(BETELGEUSE_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
-elseif(EXISTS "D:/Workspace/BetelgeuseArranger/assets")
-    set(BETELGEUSE_ASSETS_DIR "D:/Workspace/BetelgeuseArranger/assets")
+elseif(EXISTS "D:/workspace/grex/assets")
+    set(BETELGEUSE_ASSETS_DIR "D:/workspace/grex/assets")
 else()
     message(FATAL_ERROR
         "Assets folder not found.  Pass -DBETELGEUSE_ASSETS_PATH=..., or place it at "
@@ -170,7 +250,8 @@ endforeach()
 #
 # EXISTS-checked, exactly like the kit images and for the same reason: a missing
 # pack picture must be a slot that shows nothing, not a build that dies naming
-# no file.
+# no file.  THE TWO PNGs COME FROM THE OLD GREX ASSETS FOLDER - this tree was
+# copied from Ballada, which never carried them.
 # ----------------------------------------------------------------------------
 set(BETELGEUSE_PACK_IMAGES "")
 set(BETELGEUSE_PACK_MISSING "")
@@ -210,8 +291,38 @@ else()
     list(APPEND BETELGEUSE_KIT_MISSING "DUNIQUE.png")
 endif()
 
+# ----------------------------------------------------------------------------
+# THE EDM KIT (the drum synth) SHOWS ONE LOGO, whichever of its kits a slot
+# holds: DEDM.png - or, when that name is not there, the first picture in
+# "instrumet images" with EDM anywhere in its file name, so a logo dropped in
+# under its own name is still picked up.  SoundsTab finds it by its ORIGINAL
+# file name (BinaryData::getNamedResourceOriginalFilename), so the mangled
+# BinaryData symbol never has to be known.  Both cases are spelled out because
+# macOS CI can be case-sensitive where Windows never is.
+#
+# Read at CONFIGURE time like every image here: re-run cmake after adding or
+# renaming it.
+# ----------------------------------------------------------------------------
+if(EXISTS "${BETELGEUSE_KIT_IMG}/DEDM.png")
+    list(APPEND BETELGEUSE_KIT_IMAGES "${BETELGEUSE_KIT_IMG}/DEDM.png")
+else()
+    file(GLOB BETELGEUSE_EDM_IMGS
+        "${BETELGEUSE_KIT_IMG}/*[Ee][Dd][Mm]*.png"  "${BETELGEUSE_KIT_IMG}/*[Ee][Dd][Mm]*.PNG"
+        "${BETELGEUSE_KIT_IMG}/*[Ee][Dd][Mm]*.jpg"  "${BETELGEUSE_KIT_IMG}/*[Ee][Dd][Mm]*.JPG"
+        "${BETELGEUSE_KIT_IMG}/*[Ee][Dd][Mm]*.jpeg" "${BETELGEUSE_KIT_IMG}/*[Ee][Dd][Mm]*.JPEG")
+    if(BETELGEUSE_EDM_IMGS)
+        list(REMOVE_DUPLICATES BETELGEUSE_EDM_IMGS)
+        list(SORT BETELGEUSE_EDM_IMGS)
+        list(GET BETELGEUSE_EDM_IMGS 0 BETELGEUSE_EDM_IMG)
+        list(APPEND BETELGEUSE_KIT_IMAGES "${BETELGEUSE_EDM_IMG}")
+        message(STATUS "   EDM kit logo: ${BETELGEUSE_EDM_IMG}")
+    else()
+        list(APPEND BETELGEUSE_KIT_MISSING "DEDM.png (or any picture with EDM in its name)")
+    endif()
+endif()
+
 list(LENGTH BETELGEUSE_KIT_IMAGES BETELGEUSE_KIT_COUNT)
-message(STATUS "Drum-kit images: ${BETELGEUSE_KIT_COUNT} of 10 in ${BETELGEUSE_KIT_IMG}")
+message(STATUS "Drum-kit images: ${BETELGEUSE_KIT_COUNT} of 11 in ${BETELGEUSE_KIT_IMG}")
 if(BETELGEUSE_KIT_MISSING)
     message(STATUS "   not found: ${BETELGEUSE_KIT_MISSING}")
 endif()
@@ -411,6 +522,8 @@ juce_add_binary_data(BetelgeuseAssets SOURCES
 # ==========================================================
 juce_add_plugin(BetelgeuseArranger
     COMPANY_NAME "Fanan"
+    # Grex's own bundle id.  Ballada is com.fanan.grex-ballada; sharing one
+    # would make macOS and every CLAP host treat the two products as one.
     BUNDLE_ID com.fanan.betelgeuse-pnp
     IS_SYNTH TRUE
     NEEDS_MIDI_INPUT TRUE
@@ -419,6 +532,9 @@ juce_add_plugin(BetelgeuseArranger
     COPY_PLUGIN_AFTER_BUILD FALSE
     VST3_AUTO_MANIFEST FALSE
     PLUGIN_MANUFACTURER_CODE Fnan
+    # The VST3 UID is a hash of manufacturer code + plugin code, so this
+    # four-character string is the ONLY thing separating Grex from Ballada in a
+    # VST3 host.  Ballada is GxBa.  Never make these match.
     PLUGIN_CODE BtPP
     VST3_CATEGORIES Instrument Synth
     AU_MAIN_TYPE kAudioUnitType_MusicDevice
@@ -440,18 +556,27 @@ target_sources(BetelgeuseArranger PRIVATE
     src/MainComponent.cpp
     src/MainComponent.h
 
-    # Machine-locked serial + demo mode.  The .cpp MUST be listed here: it holds
-    # the only definitions of checkRegistration / tryRegister / getMachineIDString
-    # / updateDemoMode, and Main.cpp, MainComponent.cpp and SettingsTab.h all call
-    # them.  Leaving it out is what produced LNK2019 on four symbols in both the
-    # VST3 and the CLAP target - the headers compiled fine, there was simply
-    # nothing to link against.
+    # Machine-locked serial + demo mode.  The serial is an HMAC-SHA256 over the
+    # machine ID, and the secret is not a constant in this binary: it is read
+    # out of the LSBs of a carrier WAV at run time.  Hence four files, not two.
+    #
+    # THE .cpp MUST BE LISTED.  It holds the only definitions of
+    # checkRegistration / tryRegister / getMachineIDString / updateDemoMode, and
+    # Main.cpp, MainComponent.cpp and SettingsTab.h all call them.  Leaving it
+    # out is what produced LNK2019 on four symbols in both the VST3 and the CLAP
+    # target - the headers compiled fine, there was simply nothing to link.
+    #
+    # The other two are header-only and would compile without being named here;
+    # they are listed so they show up in the IDE beside the code that uses them.
+    # EVERY level constant in the tree, in one file, in decibels.
+    src/Levels.h
     src/RegistrationManager.h
     src/RegistrationManager.cpp
+    src/HmacSha256.h
+    src/LicenceCarrier.h
 
     src/TabHeader.cpp
     src/TabHeader.h
-    src/BetelSidePanel.h
     src/RectangleKnob.h
     src/SelectorGroup.h
     src/SpaceAnimation.h
@@ -477,9 +602,7 @@ target_sources(BetelgeuseArranger PRIVATE
     src/CcMap.h
     src/SetBaker.h
     src/SfzLoader.h
-    src/StyleCensus.h
     src/FullKitMap.h
-    src/StyleLevelsPanel.h
     src/MacroFxWindows.h
 
     # Instrument editor (popup)
@@ -496,7 +619,6 @@ target_sources(BetelgeuseArranger PRIVATE
     src/SynthCommon.h
     src/SoundsFx.h
     src/SweetenerFx.h
-    src/PerfMonitor.h
     src/GlobalMacros.h
     src/Channel.h
     src/Channel.cpp
@@ -505,7 +627,11 @@ target_sources(BetelgeuseArranger PRIVATE
 
     # Yamaha SFF1/SFF2 style parser
     src/StyleData.h
+    src/StyleBalanceFile.h
     src/StyleLoader.h
+    # The .fst reader. Its header is inline except for this one file, which
+    # holds the parse - the same reason StyleLoader.cpp exists.
+    src/FstLoader.cpp
     src/StyleLoader.cpp
     src/StyleSequencer.h
     src/StyleSequencer.cpp
@@ -587,7 +713,7 @@ add_custom_command(TARGET BetelgeuseArranger_CLAP POST_BUILD
     COMMENT "Copying CLAP to artefacts..."
 )
 
-message(STATUS "Betelgeuse Arranger configured.")
+message(STATUS "Grex configured.")
 message(STATUS "   JUCE:   ${JUCE_DIR}")
 if(GREX_HAVE_ASIO)
     message(STATUS "   ASIO:   ${ASIO_SDK_DIR}")

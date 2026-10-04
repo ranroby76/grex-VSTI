@@ -1,12 +1,28 @@
+
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 //==============================================================================
 // GlobalMacrosPanel.h — Settings ▸ GLOBAL SETTINGS.
 //
 //   ┌─ GLOBAL SETTINGS ──────────────────────────────────────────────────────┐
-//   │                                                                        │
-//   │            [ FUNKEY MODE ]              [ BIG DRUMS ]                  │
-//   │                                                                        │
+//   │ [FUNKEY] [RESET GAIN]  .   .   .        │   <- row 0 of a 5 x 3 grid   │
+//   │  .    .    .    .    .                  │   <- row 1, free              │
+//   │        PITCH BEND        LOW VELOCITY   │   <- row 2                    │
 //   └────────────────────────────────────────────────────────────────────────┘
+//
+//  THE BUTTONS SIT ON A 5 x 3 GRID, FILLED FROM THE TOP LEFT.
+//
+//  They used to be two big centred doors, sized on the argument that a door
+//  which is hard to hit is the whole complaint about the old page.  That was
+//  right when there were two of them and nothing else was ever going to arrive.
+//  Three is already past what centring reads well, and the page is going to
+//  keep collecting them.
+//
+//  So the geometry is now a GRID rather than a row: five columns, three rows,
+//  and a button takes one cell.  Adding a fourth is one more cell rather than a
+//  re-centre of everything, the free cells are visibly free, and nothing has to
+//  be re-measured when the count changes.
 //
 // THREE BUTTONS AND NOTHING ELSE.
 //
@@ -31,6 +47,7 @@
 
 #include "InstrEditPanel.h"     // InstrEditStyle
 #include "GlobalMacros.h"
+#include "StyleLevels.h"     // the GLOBAL style-bus boost lives here
 #include "MacroFxWindows.h"
 #include "MasterSettings.h"    // PITCH BEND RANGE lives in the master file
 
@@ -40,10 +57,10 @@ public:
     /** The host owns the macro state: set the GlobalMacros flag, re-push what
         the macro governs, then call refreshFromState(). */
     std::function<void(bool /*on*/)> onFunkeyToggled;
-    std::function<void(bool /*on*/)> onBigDrumsToggled;
 
     /** A knob moved inside one of the macro editors. */
     std::function<void()> onMacroFxEdited;
+
 
     /** PITCH BEND RANGE moved, in semitones (1..12).  The host pushes it to
         the solo channels; this panel only owns the control. */
@@ -53,6 +70,14 @@ public:
         the solo channels, this panel only owns the control. */
     std::function<void(int /*amount*/)> onLowVelBoostChanged;
 
+    /** STYLE BOOST moved, in dB.  The host stores, saves and pushes it. */
+    std::function<void(float /*db*/)> onStyleBoostChanged;
+
+    /** RESET SOLO BASE GAIN was confirmed.  The panel owns the button and the
+        confirmation; the host owns the files.  Fires only on YES - a cancelled
+        dialog is silent. */
+    std::function<void()> onResetSoloBaseGain;
+
     // STYLE LEVELS used to be a third door here.  It moved out: the levels
     // belong to the loaded style, not to the installation, so they had no
     // business on a page called GLOBAL SETTINGS.  They live in the SET EDITOR
@@ -61,7 +86,14 @@ public:
     GlobalMacrosPanel()
     {
         setupTrigger (funkeyBtn,  "FUNKEY MODE",  [this] { openFunkey(); });
-        setupTrigger (drumsBtn,   "BIG DRUMS",    [this] { openBigDrums(); });
+
+        // AN ACTION, NOT A DOOR AND NOT A TOGGLE.  It never lights, because
+        // there is no state for it to report - it does its work and it is done.
+        // setLit(false) once here is what gives it the same unlit colours as
+        // the other two rather than the LookAndFeel's default button.
+        setupTrigger (resetGainBtn, "RESET SOLO BASE GAIN",
+                      [this] { confirmResetSoloBaseGain(); });
+        setLit (resetGainBtn, false);
 
         // ── PITCH BEND RANGE ─────────────────────────────────────────────
         // A real setting rather than a door, so it sits ON the page instead of
@@ -123,6 +155,42 @@ public:
         lvValue.setColour (juce::Label::textColourId, kSettingYellow);
         addAndMakeVisible (lvValue);
 
+        // ── STYLE BOOST ──────────────────────────────────────────────────────
+        //
+        // ONE NUMBER FOR THE WHOLE INSTALLATION, and that is why it is on this
+        // page rather than in the SET EDITOR: it is a property of the rig, like
+        // the bend range beside it, not of any style.  It writes grex_boost.xml
+        // on every move - see StyleLevels.h - so there is no SAVE to forget.
+        //
+        // IN dB, 0.0 to 24.0, half-dB steps.  The old 0..100 slider is what let
+        // a +19.2 dB boost sit unnoticed for months reading "80", and one unit
+        // everywhere is the whole lesson of that.
+        sbLabel.setText ("STYLE BOOST", juce::dontSendNotification);
+        sbLabel.setJustificationType (juce::Justification::centred);
+        sbLabel.setColour (juce::Label::textColourId, juce::Colour (0xFFC2C2C2));
+        addAndMakeVisible (sbLabel);
+
+        sbSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+        sbSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        styleSettingSlider (sbSlider);
+        sbSlider.setRange (0.0, (double) Betel::StyleLevels::kBoostMaxDb, 0.5);
+        sbSlider.onValueChange = [this]
+        {
+            const float db = (float) sbSlider.getValue();
+            sbValue.setText (boostText (db), juce::dontSendNotification);
+
+            // THE HOST WRITES IT, not this panel - exactly as LOW VELOCITY
+            // RESPONSE does above.  The processor stores the value, saves the
+            // file AND pushes it to the style bus; a panel that only stored it
+            // is why the slider had no effect at all.
+            if (onStyleBoostChanged) onStyleBoostChanged (db);
+        };
+        addAndMakeVisible (sbSlider);
+
+        sbValue.setJustificationType (juce::Justification::centred);
+        sbValue.setColour (juce::Label::textColourId, kSettingYellow);
+        addAndMakeVisible (sbValue);
+
         refreshFromState();
     }
 
@@ -130,20 +198,17 @@ public:
     {
         funkeyWin.reset();
         familyWin.reset();
-        drumsWin .reset();
     }
 
-    /** Relight the two macro triggers from GlobalMacros, and any open window
+    /** Relight the macro trigger from GlobalMacros, and any open window
         with them.  Called after a toggle from either surface and after a set
         restore, so nothing can disagree about whether a macro is engaged. */
     void refreshFromState()
     {
         const auto& gm = Betel::GlobalMacros::get();
         setLit (funkeyBtn, gm.isFunkeyOn());
-        setLit (drumsBtn,  gm.isBigDrumsOn());
 
         if (funkeyWin != nullptr) funkeyWin->refresh();
-        if (drumsWin  != nullptr) drumsWin ->refresh();
 
         // dontSendNotification: this is a REFRESH, and letting it fire onChange
         // would write the value straight back to MasterSettings on every set
@@ -158,6 +223,10 @@ public:
         lvSlider.setValue ((double) lv, juce::dontSendNotification);
         lvValue.setText (lowVelText (lv), juce::dontSendNotification);
 
+        const float sb = Betel::StyleLevels::get().boostDb();
+        sbSlider.setValue ((double) sb, juce::dontSendNotification);
+        sbValue.setText (boostText (sb), juce::dontSendNotification);
+
         repaint();
     }
 
@@ -168,28 +237,54 @@ public:
     {
         auto inner = InstrEditStyle::componentFrameContent (getLocalBounds());
 
-        // One row of three, centred and generously sized: these are doors, and a
-        // door that is hard to hit is the whole complaint about the old page.
-        // TWO doors now, not three — STYLE LEVELS moved to the SET EDITOR tab.
-        // Widened to match, so the page does not look like it lost something.
-        // Doors on top, the setting underneath — a control you READ belongs
-        // below the two you PRESS, not competing with them for the centre.
-        auto lower = inner.removeFromBottom (juce::jmin (86, inner.getHeight() / 3));
+        // ── THE 5 x 3 GRID ───────────────────────────────────────────────────
+        //
+        // Derived from the frame rather than fixed, so the cells stay square-ish
+        // whatever the tab is resized to and a button never spills into its
+        // neighbour.  The inset inside each cell is the gutter: cells touch,
+        // buttons do not.
+        const int cols = 5, rows = 3;
+        const int cellW = inner.getWidth()  / cols;
+        const int cellH = inner.getHeight() / rows;
+
+        auto cell = [&] (int col, int row)
+        {
+            return juce::Rectangle<int> (inner.getX() + col * cellW,
+                                         inner.getY() + row * cellH,
+                                         cellW, cellH).reduced (7, 10);
+        };
+
+        // ROW 0, LEFT TO RIGHT, NO GAP.  The two buttons sit in adjacent cells
+        // (0,0) and (1,0); cells (2,0) to (4,0) and the whole of row 1 are
+        // deliberately empty - that is the space this layout was for.
+        //
+        // THE GAP AT (1,0) IS GONE ON PURPOSE.  It was left there because (1,0)
+        // is where BIG DRUMS used to be, and dropping a destructive library-wide
+        // action into the cell a harmless macro button had just vacated would
+        // have put "reset every instrument to 0 dB" under old muscle memory.
+        // Big Drums has been gone long enough that the memory it was protecting
+        // no longer exists, and the confirmation dialog still stands in front of
+        // the action - so the two buttons read as one row of a table now rather
+        // than as two strays with a hole between them.
+        funkeyBtn   .setBounds (cell (0, 0));
+        resetGainBtn.setBounds (cell (1, 0));
+
+        // ── ROW 2: the two settings ──────────────────────────────────────────
+        //
+        // They keep the bottom of the frame, which is where they already were —
+        // a control you READ belongs below the ones you PRESS.  Held to the
+        // grid's bottom row now instead of a removeFromBottom, so the buttons
+        // and the sliders answer to the same geometry.
+        auto lower = juce::Rectangle<int> (inner.getX(), inner.getY() + 2 * cellH,
+                                           inner.getWidth(), cellH);
 
         const int gap = 24;
-        const int bw  = juce::jmin (280, (inner.getWidth() - gap) / 2);
-        const int bh  = juce::jmin (90,  inner.getHeight() - 20);
-        const int x0  = inner.getCentreX() - (2 * bw + gap) / 2;
-        const int y   = inner.getCentreY() - bh / 2;
 
-        funkeyBtn.setBounds (x0,            y, bw, bh);
-        drumsBtn .setBounds (x0 + bw + gap, y, bw, bh);
-
-        // TWO settings side by side now, not one across the middle.  Stacking
-        // them would push the second off the bottom of the frame; splitting the
-        // row gives each the same three-part shape (label / slider / value) the
+        // TWO settings side by side, not one across the middle.  Stacking them
+        // would push the second off the bottom of the frame; splitting the row
+        // gives each the same three-part shape (label / slider / value) the
         // bend range already had.
-        const int rowW = juce::jmin (2 * bw + gap, lower.getWidth());
+        const int rowW = juce::jmin (4 * cellW, lower.getWidth());
         auto row = lower.withSizeKeepingCentre (rowW, juce::jmin (74, lower.getHeight()));
 
         auto left  = row.removeFromLeft ((row.getWidth() - gap) / 2);
@@ -206,6 +301,17 @@ public:
 
         layOne (left,  pbLabel, pbSlider, pbValue);
         layOne (right, lvLabel, lvSlider, lvValue);
+
+        // ── ROW 1: STYLE BOOST, alone and centred ────────────────────────────
+        //
+        // Its own row rather than a third of the bottom one: three settings
+        // across a row that was already tight for two would leave each too
+        // narrow to set by half a dB, and row 1 was empty anyway.
+        auto mid = juce::Rectangle<int> (inner.getX(), inner.getY() + cellH,
+                                         inner.getWidth(), cellH);
+        auto sbRow = mid.withSizeKeepingCentre (juce::jmin (2 * cellW, mid.getWidth()),
+                                                juce::jmin (74, mid.getHeight()));
+        layOne (sbRow, sbLabel, sbSlider, sbValue);
     }
 
 private:
@@ -222,7 +328,7 @@ private:
     static void setLit (juce::TextButton& b, bool on)
     {
         b.setColour (juce::TextButton::buttonColourId,
-                     on ? juce::Colour (0xFFCC6600) : juce::Colour (0xFF2A2A2A));
+                     on ? juce::Colour (Betel::Pal::kAccent) : juce::Colour (0xFF2A2A2A));
 
         // UNCHANGED, and deliberately so: these two ARE the reference the rest
         // of the left panel was matched to.  A plain TextButton's caption goes
@@ -235,16 +341,45 @@ private:
                      on ? juce::Colours::black : juce::Colours::white);
     }
 
+    //==========================================================================
+    //  RESET SOLO BASE GAIN — CONFIRM FIRST.
+    //
+    //  It rewrites every .ins in the library and there is no undo, so it asks.
+    //  The panel owns the question and the host owns the answer's consequences:
+    //  nothing happens here on YES except the callback.
+    //
+    //  SafePointer rather than a bare `this`: the dialog is async and the user
+    //  can change tab, which takes the panel with it.  showAsync would then call
+    //  into freed memory - and only sometimes, which is the worst kind.
+    //==========================================================================
+    void confirmResetSoloBaseGain()
+    {
+        juce::Component::SafePointer<GlobalMacrosPanel> safe (this);
+
+        juce::AlertWindow::showAsync (
+            juce::MessageBoxOptions::makeOptionsYesNo (
+                juce::MessageBoxIconType::WarningIcon,
+                "Reset solo base gain",
+                "Set the BASE GAIN of every solo instrument to 0 dB and save "
+                "every .ins file?\n\nThis cannot be undone."),
+            [safe] (int result)
+            {
+                if (result != 1)          return;      // 1 = Yes
+                if (safe == nullptr)      return;
+                if (safe->onResetSoloBaseGain) safe->onResetSoloBaseGain();
+            });
+    }
+
     void openFunkey()
     {
         if (funkeyWin == nullptr)
         {
             funkeyWin = std::make_unique<Betel::FunkeyModeWindow>();
-            funkeyWin->onToggled = [this] (bool on)
-            {
-                if (onFunkeyToggled) onFunkeyToggled (on);
-                refreshFromState();
-            };
+
+            // NO onToggled WIRING ANY MORE.  The window's ON/OFF button is gone
+            // and so is the callback: FUNKEY MODE has one switch, the FUNKEY
+            // button in the play-control row.  This window is now purely a way
+            // in to the six family editors.
             funkeyWin->onFamilyPicked = [this] (int slot) { openFamily (slot); };
         }
         funkeyWin->showCentredOver (getTopLevelComponent());
@@ -260,22 +395,18 @@ private:
         familyWin->showForFamily (slot, getTopLevelComponent());
     }
 
-    void openBigDrums()
+    /** "+19.2 dB", and the factory value named so it is recognisable. */
+    static juce::String boostText (float db)
     {
-        if (drumsWin == nullptr)
-        {
-            drumsWin = std::make_unique<Betel::BigDrumsFxWindow>();
-            drumsWin->onChanged = [this] { if (onMacroFxEdited) onMacroFxEdited(); };
-            drumsWin->onToggled = [this] (bool on)
-            {
-                if (onBigDrumsToggled) onBigDrumsToggled (on);
-                refreshFromState();
-            };
-        }
-        drumsWin->showCentredOver (getTopLevelComponent());
+        juce::String s = "+" + juce::String (db, 1) + " dB";
+        if (std::abs (db - Betel::StyleLevels::kForcedBoostDb) < 0.05f) s += "   (factory)";
+        return s;
     }
 
-    juce::TextButton funkeyBtn, drumsBtn;
+    juce::Label  sbLabel, sbValue;
+    juce::Slider sbSlider;
+
+    juce::TextButton funkeyBtn, resetGainBtn;
     juce::Label      pbLabel, pbValue;
     juce::Slider     pbSlider;
     juce::Label      lvLabel, lvValue;
@@ -294,7 +425,7 @@ private:
     // behind it.  textBoxOutline is set because a NoTextBox slider still paints
     // that outline in some LookAndFeels.
     //==========================================================================
-    inline static const juce::Colour kSettingYellow { juce::Colour (0xFFE8C33A) };
+    inline static const juce::Colour kSettingYellow { juce::Colour (Betel::Pal::kNav) };
 
     static void styleSettingSlider (juce::Slider& sl)
     {
@@ -314,10 +445,10 @@ private:
 
     std::unique_ptr<Betel::FunkeyModeWindow>  funkeyWin;
     std::unique_ptr<Betel::FamilyFxWindow>    familyWin;
-    std::unique_ptr<Betel::BigDrumsFxWindow>  drumsWin;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GlobalMacrosPanel)
 };
+
 
 
 

@@ -1,3 +1,4 @@
+
 #include "JumpsTab.h"
 
 // ─── Layout constants ────────────────────────────────────────────────────────
@@ -67,6 +68,9 @@ JumpsTab::JumpsTab()
         {
             buttons[r][c].setButtonText(kDestNames[c]);
             buttons[r][c].setMode(LedButton::Mode::Selector);
+            // No lamp here - the face is the indicator, grey off and gold on.
+            // A lamp sized for the MAIN tab was too big for buttons this narrow.
+            buttons[r][c].setFaceLamp(true);
             buttons[r][c].onClick = [this, r, c]
             {
                 selectDestination(r, c, /*fireCallback*/ true);

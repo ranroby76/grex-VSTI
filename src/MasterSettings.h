@@ -1,3 +1,4 @@
+
 #pragma once
 //==============================================================================
 // MasterSettings.h — the two settings that belong to the PLAYER, not the song.
@@ -143,6 +144,7 @@ namespace Betel
         bool isTempoSynced()   const noexcept { return tempoSynced  .load(); }
         int  getPitchBendRange() const noexcept { return pitchBendRange.load(); }
         int  getLowVelBoost()    const noexcept { return lowVelBoost.load(); }
+
         int  getSplitPoint()     const noexcept { return splitPoint.load(); }
 
         /** The slider position as the CURVE value Betel::VelCurve already
@@ -343,6 +345,3 @@ namespace Betel
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MasterSettings)
     };
 } // namespace Betel
-
-
-

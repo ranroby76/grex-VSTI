@@ -1,6 +1,6 @@
 
-
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 #include <JuceHeader.h>
 
 #include "InstrEditPanel.h"   // InstrEditStyle::kPanelLabel
@@ -67,6 +67,25 @@ public:
 
         // NO background fill — back.png provides it
 
+        // ── TOP TRIM: THE FIRST ITEM'S FORE SAT TOO HIGH ─────────────────────
+        //
+        // The selected fill was inset only 1.5 px plus 2.5% from the top of its
+        // segment, so on item 0 it landed within about 2 px of the painted
+        // panel's own top edge and read as touching it - noticeably tighter
+        // than the TEMPO box, TAP and RESET TEMPO beside it.
+        //
+        // Trimmed from BOUNDS rather than from the selected rect, so the
+        // separators and the label text move with it and the segments stay
+        // equal.  Trimming only the TOP leaves the bottom edge exactly where it
+        // was: withTrimmedTop reduces the height by the same amount it moves the
+        // origin, so the last item still ends on the original boundary and only
+        // the north edge changes.
+        //
+        // 3 px matches the horizontal inset already used on the selected rect
+        // below, so the fill now clears its panel by the same margin on the left,
+        // the right and the top.
+        bounds = bounds.withTrimmedTop (kTopTrim);
+
         const float itemH = bounds.getHeight() / (float)n;
         const float fontSize = juce::jmin(itemH * 0.50f, 14.0f);
 
@@ -79,6 +98,31 @@ public:
             if (i == selectedIndex)
             {
                 auto selRect = itemRect.reduced(3.0f, 1.5f);
+
+                // MINUS 5%, ON BOTH AXES, ABOUT THE CENTRE.  Taken off the rect
+                // AFTER the fixed 3 / 1.5 inset rather than by enlarging that
+                // inset: the fixed part is a margin in pixels and has to stay
+                // the same at every window scale, where this part is a
+                // proportion of the segment and has to grow with it.  Written
+                // as 2.5% per side, which is what reduced() takes.
+                selRect = selRect.reduced (selRect.getWidth()  * 0.025f,
+                                           selRect.getHeight() * 0.025f);
+
+                // PER-INSTANCE EXTRA HEIGHT TRIM, off by default.
+                //
+                // Six controls share this class and they do not all have the
+                // same amount of room: the artwork's black panel is one size,
+                // but a 3-item group gives each segment a third of it and a
+                // 2-item group a half, so the same proportional inset leaves
+                // the taller segment looking generous and the shorter one
+                // looking like it touches the panel edge.
+                //
+                // So the extra is asked for by the OWNER rather than baked in
+                // here - changing the shared number would move all six, and
+                // four of them are already sitting right.
+                if (extraVInset > 0.0f)
+                    selRect = selRect.reduced (0.0f, selRect.getHeight() * extraVInset);
+
                 g.setColour(selectedBg);
                 g.fillRoundedRectangle(selRect, 8.0f);
             }
@@ -106,6 +150,19 @@ public:
         }
     }
 
+    /** Extra height taken off the selection fill, as a PROPORTION PER SIDE of
+        the already-inset rect.  0 = the shared default; 0.025f takes 5% off
+        the height, 0.05f takes 10%.
+
+        The value each group actually uses lives at its CALL SITE, not here -
+        a number quoted in this comment would go stale the first time a group
+        was retuned, which is exactly what happened to the TEMPO SPEED value. */
+    void setExtraVerticalInset (float proportionPerSide)
+    {
+        extraVInset = juce::jlimit (0.0f, 0.25f, proportionPerSide);
+        repaint();
+    }
+
     // ── Mouse ────────────────────────────────────────────────────────────────
     void mouseDown(const juce::MouseEvent& e) override
     {
@@ -126,7 +183,14 @@ private:
     // #C2C2C2, matching every other caption on the left panel — see
     // InstrEditStyle::kPanelLabel for why it is not pure white.
     juce::Colour textColour   = InstrEditStyle::kPanelLabel;
-    juce::Colour selectedBg   = juce::Colour(0xFFCC6600);
+    /** Design-space px shaved off the TOP of the whole group before the items
+        are measured.  See paint(). */
+    static constexpr float kTopTrim = 3.0f;
+
+    /** See setExtraVerticalInset. */
+    float extraVInset = 0.0f;
+
+    juce::Colour selectedBg   = juce::Colour(Betel::Pal::kAccent);
     // BLACK on the amber selection — white on #CC6600 is a poor read, and black
     // is what "engaged" looks like on every other lit control in the plugin.
     juce::Colour selectedText = juce::Colours::black;

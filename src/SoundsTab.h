@@ -1,6 +1,10 @@
-#pragma once
 
+#pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
+
+#include "Harmonizer.h"   // harmonyBlue()
 #include <JuceHeader.h>
+#include <cmath>
 #include <tuple>
 #include <vector>
 #include "GlobalMacros.h"
@@ -9,6 +13,7 @@
 #include "InstrEditPanel.h"
 #include "InstrEditorWindow.h"
 #include "DrumsPopup.h"
+#include "EdmKitWindow.h"          // EDM KIT editor (EDIT on an EDM Kit slot)
 #include "DrumKitRegistry.h"
 #include "BetelStateXml.h"
 #include "InstrumentPreset.h"   // drum .ins lookup for the selector
@@ -248,7 +253,36 @@ public:
         Channel::instrumentGain), so it needs its own explicit route to the
         engine — and firing only on an actual change means re-pushing a slot for
         any other reason can never disturb it. */
-    std::function<void(int slot, bool isSolo, float gainPercent)>        onSlotGainChanged;
+    /** The per-sound gain trim, WITH the base unity it must be paired with.
+
+        The base used to be re-derived by the host from the .ins, which is wrong
+        for a style slot in the exact way that is hardest to notice: a style slot
+        normally has no .ins, so the lookup quietly returned 0 dB and the set's
+        own base never reached the engine. The percent came back on a set load
+        and its partner did not.
+
+        Resolving it HERE instead means the ownership rule lives in one function
+        (see effectiveBaseUnityDb) rather than being re-guessed at every push. */
+    std::function<void(int slot, bool isSolo, float gainPercent, float baseUnityDb)> onSlotGainChanged;
+
+    /** GLOBAL EFFECTS pressed.  `isSolo` picks the section: false = LEFT
+        (style + drums), true = RIGHT.
+
+        DECLARED HERE ON ITS OWN, not beside the section-fx hooks it was
+        originally written next to — those were removed with the overlay, and
+        this went with them because it had been anchored to that block. */
+    std::function<void (bool isSolo)> onOpenGlobalEffects;
+
+    // onReadSectionFx / onWriteSectionFx are GONE.
+    //
+    // They overlaid the section rack onto the per-slot REVERB and DELAY pages
+    // back when those pages were the only way to reach it.  The GLOBAL EFFECTS
+    // window is that way now, and the editor's third tab is EFFECT SENDS — so
+    // those pages no longer exist to overlay.
+    //
+    // Keeping both would have been two routes writing one rack, which is how
+    // they end up disagreeing: open a slot, and its stale page values would
+    // stamp over whatever the window had just been used to dial.
     /** Ask the host for the saved voice governing this slot's loaded sound.
         Returns false when none exists. */
     std::function<bool(int slot, bool isSolo, SlotParams&)>              onGetPresetParams;
@@ -257,6 +291,9 @@ public:
     /** IGNORE PROGRAM CHANGE for a style slot - see btnIgnorePc. */
     std::function<void(int slot, bool isSolo, bool ignore)>              onSetIgnorePc;
     std::function<bool(int slot, bool isSolo)>                           onGetIgnorePc;
+
+    /** Hand a style slot back to the style's own voice - see btnRestorePc. */
+    std::function<void(int slot)>                                        onRestoreStyleInstrument;
 
     std::function<bool(int slot, bool isSolo, float baseUnityDb)>        onSetBaseUnity;
     /** The base unity currently on file for this slot's instrument. */
@@ -309,6 +346,10 @@ public:
                                                             const juce::String& category)>
                                                                          onGetPackInstruments;
 
+    /** The library's own name for an instrument flag - see getSoloInstrumentName.
+        Returns empty for a flag the library does not hold. */
+    std::function<juce::String (int flag)>                               onGetInstrumentName;
+
     std::function<std::vector<juce::String>()>                           onGetBlobPresetNames;
     std::function<void(int slot, int presetIndex)>                       onSoloPresetSelected;
 
@@ -324,10 +365,29 @@ public:
         publishKitFx, which an instrument change never touches. */
     std::function<void(int slot, bool isSolo, const SweetenerParams&)>    onSweetenerChanged;
     std::function<void(int slot, bool isSolo, const SlotParams&)>        onSlotParamsChanged;
+
+    /** FUNKEY MODE's wah+phaser stage for one slot — see
+        Channel::applyFunkeyInPlace.  Fired on EVERY commit.
+
+        **nullptr MEANS BYPASS**, and it is SENT rather than skipped: a channel
+        that was funkeyed has to be told to stop when the macro goes off or its
+        instrument moves to a family the macro does not cover.
+
+        THE FAMILY PRESET, NOT AN ENGINE STRUCT.  This tab has no business naming
+        Betel::Channel::FunkeyFx — it would have to include the whole engine
+        header to do it — so the host converts. */
+    std::function<void(int slot, bool isSolo, const Betel::FamilyFxParams*)> onFunkeyFxChanged;
     /** A preset file landed on a slot and its ALLOWED NOTES window has to
-        reach StylePlayer.  Kept SEPARATE from onSlotParamsChanged: that one
-        is the bulk push, which adoptPresetParams deliberately avoids so the
-        per-sound calibration trim is never re-written behind the user. */
+        reach StylePlayer.
+
+        NO LONGER CALLED.  adoptPresetParams used to avoid the bulk push on the
+        grounds that it would re-write the per-sound calibration trim behind the
+        user - and avoiding it is what left the band filter and the octave bias
+        on the GM defaults until the editor was opened.  The trim is not
+        re-written behind anyone: the values being pushed ARE the .ins's own,
+        and effectiveBaseUnityDb asks the engine for a solo slot's base unity
+        rather than inventing one.  Kept wired so a caller that needs the narrow
+        push has it, but the general path is commitSlotParamsToEngine. */
     std::function<void(int slot, bool isSolo, const SlotParams&)>        onNoteRangeAdopted;
 
     // ── Drum-kit callbacks (Phase 3 additions) ────────────────────────────────
@@ -348,6 +408,19 @@ public:
     std::function<void(int slot, bool isSolo, int note, int velocity)>  onEditorNoteOn;
     std::function<void(int slot, bool isSolo, int note)>                onEditorNoteOff;
     std::function<void(int slot, bool isSolo, uint32_t* mask)>          onQuerySoundingNotes;
+    std::function<void(int slot, bool isSolo, uint32_t* mask)>          onQueryPadActivity;   // EDM KIT pad LEDs
+
+    /** ENERGY's curve offset, asked for when the editor opens so its velocity
+        display reads what the engine will actually apply, not just what this
+        slot stores. */
+    std::function<float()>                                              onGetEnergyCurveOffset;
+
+    /** Push a new ENERGY offset into an editor that is already open.  Silent
+        when nothing is open, which is the common case. */
+    void refreshEnergyOffset (float curveOffset)
+    {
+        if (editorWindow != nullptr) editorWindow->setEnergyOffset (curveOffset);
+    }
     std::function<void(int slot, bool isSolo, int midiKey,
                        const DrumElementParams&)>                        onDrumKeyParamsChanged;
 
@@ -398,11 +471,67 @@ public:
         return juce::String (kInstrNames[t][i]);
     }
 
-    // Current melodic instrument name for a solo slot (0-7), for the Main tab.
+    /** THE LIBRARY'S NAME FIRST, the GM table only as a fallback.
+
+        `instrumentNameForPatch` is a 16x8 GM table indexed purely by program
+        number - it has no concept of a bank. A World or Oriental sound sits at
+        some program number inside its own bank, so that lookup handed back
+        whatever GM keeps at the same number and the main tab labelled a Kanun
+        with a GM name.
+
+        The pack declares its own names (`soundLibraryNames`, keyed by flag), and
+        that is the only source that can be right for all three banks. The GM
+        table stays as the fallback for a flag the library does not know, which
+        is what a bare GM program still is. */
     juce::String getSoloInstrumentName (int slot) const
     {
+        return instrumentNameForSlot (true, slot);
+    }
+
+    /** The STYLE-side twin, and the reason both now go through one body: the
+        library-first / GM-fallback rule above is not a detail of the solo path,
+        it is the rule for naming any slot. A second copy for style would be a
+        second place to forget it, and the main tab would go back to labelling a
+        Kanun with whatever GM keeps at the same program number. */
+
+    juce::String getStyleInstrumentName (int slot) const
+    {
+        return instrumentNameForSlot (false, slot);
+    }
+
+    juce::String instrumentNameForSlot (bool isSolo, int slot) const
+    {
         if (slot < 0 || slot >= 8) return {};
-        return instrumentNameForPatch (soloPatch[(size_t) slot]);
+
+        // ── A DRUM SLOT IS NAMED BY ITS KIT, and this is the whole of the
+        //    "MAIN tab shows PIANO on both drum buttons" bug.
+        //
+        // `stylePatch` is the MELODIC program number.  Nothing on the drum path
+        // ever writes it - the engine reports a KIT, by registry key, and the
+        // mirror in MainComponent feeds that to setSlotDrumKit, not to
+        // setSlotPatch.  So on slots 0 and 1 stylePatch keeps its initial 0,
+        // and the GM table below faithfully turns 0 into "Grand Piano" for
+        // every style ever loaded.  It was never a fallback - it was the only
+        // answer this function could give for a drum slot.
+        //
+        // The kit name was already available and already being shown correctly
+        // by the MIXER, which converts it with the same displayNameForKit call.
+        // The MAIN tab simply asked the wrong question.
+        if (roleIsDrum (isSolo, slot))
+        {
+            const auto kit = displayNameForKit (getSlotDrumKitName (isSolo, slot));
+            if (kit.isNotEmpty()) return kit;
+            return juce::String (kStyleRoleNames[(size_t) slot]);   // no kit yet
+        }
+
+        const int flag = isSolo ? soloPatch [(size_t) slot]
+                                : stylePatch[(size_t) slot];
+
+        if (onGetInstrumentName)
+            if (const auto nm = onGetInstrumentName (flag); nm.isNotEmpty())
+                return nm;
+
+        return instrumentNameForPatch (flag);
     }
 
     //==========================================================================
@@ -416,6 +545,35 @@ public:
         t.setProperty ("soloMode",     soloMode,     nullptr);
         t.setProperty ("selectedSlot", selectedSlot, nullptr);
 
+        // ── WHERE THE BROWSER WAS LEFT ───────────────────────────────────────
+        //
+        // Bank, category and page were the only selectors in this tab that were
+        // never saved, and unlike the rest they cannot be re-derived either.
+        // For GM that goes unnoticed: syncTimbreToSlot recovers the family from
+        // the patch, because in GM the grid IS the program number. In a PACK
+        // there is no such relationship - a category is a folder and the flags
+        // inside it are whatever it happens to contain - so the tab came back on
+        // WORLD category 0 page 0 no matter where the player had been.
+        //
+        // That is the "category selector jumps to the first option" report: it
+        // is not the selector forgetting, it is nobody ever having asked it.
+        // MARKS THIS SET AS WRITTEN BY A HARMONY-AWARE BUILD.
+        //
+        // Not a setting - a witness. Every set saved before harmony existed
+        // carries a slot-8 patch of 0, because slot 8 was plain SOLO 8 and
+        // nobody had chosen anything for it. Restoring that 0 is how the
+        // harmony channel ends up on Piano, and there is no way to tell it
+        // apart from a deliberate choice of Piano by looking at the patch.
+        //
+        // The presence of this property IS the difference: if it is here, the
+        // slot-8 patch was written by a build that knew what slot 8 was for, so
+        // it is honoured. If it is absent, it is not a choice and the harmony
+        // default wins.
+        t.setProperty ("harmonyAware",   1,              nullptr);
+        t.setProperty ("selectedPack",   selectedPack,   nullptr);
+        t.setProperty ("selectedTimbre", selectedTimbre, nullptr);
+        t.setProperty ("packPage",       packPage,       nullptr);
+
         juce::ValueTree solo ("SoloSlots");
         juce::ValueTree styl ("StyleSlots");
         for (int i = 0; i < 8; ++i)
@@ -426,11 +584,17 @@ public:
             s.setProperty ("isDrum",  soloIsDrumSlot[(size_t) i],        nullptr);
             s.setProperty ("ref",     soloRef[(size_t) i],               nullptr);
             s.setProperty ("octaveBias", slotOctaveBias[1][(size_t) i],   nullptr);
+            // IGNORE PRESET CHANGES, the other per-slot toggle nobody saved.
+            // It decides whether a style's program change may overwrite the
+            // slot, so losing it does not merely reset a switch - it hands the
+            // slot back to the style the player had just protected it from.
+            s.setProperty ("frozen",  paramsFrozen[1][(size_t) i],       nullptr);
             solo.appendChild (s, nullptr);
 
             auto y = BetelStateXml::saveSlot (styleParams[(size_t) i]);
             y.setProperty ("index",   i,                                 nullptr);
             y.setProperty ("patch",   stylePatch[(size_t) i],            nullptr);
+            y.setProperty ("frozen",  paramsFrozen[0][(size_t) i],       nullptr);
             y.setProperty ("isDrum",  styleIsDrumSlot[(size_t) i],       nullptr);
             y.setProperty ("ref",     styleRef[(size_t) i],              nullptr);
             // The octave BIAS is engine state, not a SlotParams field — it is
@@ -472,6 +636,19 @@ public:
             soloIsDrumSlot[(size_t) idx] = (bool) s.getProperty ("isDrum", soloIsDrumSlot[(size_t) idx]);
             soloRef[(size_t) idx]        = (int)  s.getProperty ("ref",    -1);
         }
+        // ── THE HARMONY SLOT'S DEFAULT, AFTER THE LOOP THAT COULD CLOBBER IT ─
+        //
+        // A set from before harmony existed says nothing about slot 8; it just
+        // happens to carry the 0 that SOLO 8 had. Taking that literally is what
+        // left harmony stuck on Piano. Only a set that carries `harmonyAware`
+        // gets to decide what the harmony slot holds.
+        //
+        // Deliberately NOT touching soloParams here - the ADSR, filter and FX
+        // the old set stored for that slot are still fine. Only WHICH SOUND is
+        // being overridden.
+        if (! t.hasProperty ("harmonyAware"))
+            soloPatch[(size_t) kHarmonySoloSlot] = kHarmonyDefaultPatch;
+
         for (int i = 0; i < styl.getNumChildren(); ++i)
         {
             auto y = styl.getChild (i);
@@ -502,6 +679,28 @@ public:
             stylePatch[(size_t) idx]      = (int)  y.getProperty ("patch",  stylePatch[(size_t) idx]);
             styleIsDrumSlot[(size_t) idx] = (bool) y.getProperty ("isDrum", styleIsDrumSlot[(size_t) idx]);
             styleRef[(size_t) idx]        = (int)  y.getProperty ("ref",    -1);
+        }
+
+        // ── THE FREEZE FLAGS, AFTER THE SLOT LOOPS ON PURPOSE ────────────────
+        //
+        // Those loops consult isSlotFrozen to decide what the incoming state is
+        // allowed to touch, and that decision has to be made with the freeze
+        // state the player LEFT, not the one the file is bringing. Restoring
+        // earlier would let a set unfreeze a slot and overwrite it in the same
+        // pass, which is the exact thing the toggle exists to prevent.
+        for (int i = 0; i < solo.getNumChildren(); ++i)
+        {
+            auto c = solo.getChild (i);
+            const int idx = (int) c.getProperty ("index", -1);
+            if (idx >= 0 && idx < 8 && c.hasProperty ("frozen"))
+                paramsFrozen[1][(size_t) idx] = (bool) c.getProperty ("frozen");
+        }
+        for (int i = 0; i < styl.getNumChildren(); ++i)
+        {
+            auto c = styl.getChild (i);
+            const int idx = (int) c.getProperty ("index", -1);
+            if (idx >= 0 && idx < 8 && c.hasProperty ("frozen"))
+                paramsFrozen[0][(size_t) idx] = (bool) c.getProperty ("frozen");
         }
 
         soloMode     = (bool) t.getProperty ("soloMode",     soloMode);
@@ -547,20 +746,73 @@ public:
                     // safe and the whole fix.  It also removes the heaviest part
                     // of a reopen (two full kit sample reloads on the message
                     // thread), which is what made the reopen audibly glitch.
-                    if (params.drumKit.hasMappedKeys())
+                    //
+                    // EDM KIT is the one kit with no mapped keys that IS real:
+                    // Channel builds it by name + saved cells, never from the
+                    // registry, so publishing it cannot produce the empty kit.
+                    if (params.drumKit.hasMappedKeys() || isEdmKitName (params.drumKit.lastLoadedKit))
                         publishDrumKit (slot, isSolo, params.drumKit);
 
-                    // THE KIT FX WERE NEVER PUSHED HERE.  publishDrumKit sends
-                    // the key mapping; the rack — EQ, saturation, compressor,
-                    // reverb, delay and their five enables — travels separately
-                    // through publishKitFx, and this loop never called it.  So a
-                    // set's drum effects loaded into the data, showed correctly
-                    // on the toggles, and never reached the engine.
+                    // THE KIT FX RACK IS NOT SENT HERE ANY MORE.  It used to be,
+                    // because this loop pushed everything by hand; it now travels
+                    // with commitSlotParamsToEngine at the end of the iteration,
+                    // which sends it for every drum slot and applies the BIG
+                    // DRUMS override on the way out.  Sending it twice would be
+                    // harmless but would re-open the question of which copy wins.
+
+                    // ── AND THE PER-KEY EDITS, WHICH THE KIT GATE ABOVE ATE ──
                     //
-                    // Unconditional, unlike the kit above: the FX block is
-                    // always meaningful even for a slot whose key mapping is
-                    // style-owned and therefore not stored here.
-                    publishKitFx (slot, isSolo, params.drumKit.fx);
+                    // Rob changed a kick volume three times and none of it came
+                    // back.  It SAVED correctly - his .bset carries gain 0.24 on
+                    // keys 33 and 36 - so the loss was entirely on restore, and
+                    // `hasMappedKeys()` is why.
+                    //
+                    // That test asks "does any key carry a sourceKit", i.e. has
+                    // the user REMAPPED a key to a different element.  It is the
+                    // right question for whether to reload samples, and it is the
+                    // wrong question for whether there are per-key EDITS worth
+                    // restoring.  A kit loaded by NAME - lastLoadedKit="024" with
+                    // every key inheriting from the registry - has no sourceKit
+                    // anywhere, so a set full of carefully trimmed key gains
+                    // reported "nothing mapped" and was skipped whole.
+                    //
+                    // Pushed through the LIVE-EDIT path, deliberately, not
+                    // through publishDrumKit: setDrumKeyParams is an RT-safe
+                    // atomic write that never touches loadDrumKit, so it cannot
+                    // resurrect the empty-kit bug the gate above exists to
+                    // prevent.  It is the same call the slider drag makes.
+                    //
+                    // AFTER publishDrumKit and publishKitFx, because a kit load
+                    // rebuilds the key table and would overwrite anything set
+                    // before it.
+                    if (onDrumKeyParamsChanged)
+                    {
+                        // ── EVERY KEY GOES, EDITED OR NOT ───────────────────
+                        //
+                        // This loop used to push only the keys that differed
+                        // from a default key, plus the two kick keys, on the
+                        // theory that "for a continuous value a stale default
+                        // is harmless".  It is not, because what the engine
+                        // holds for an unedited key is not a default - it is
+                        // whatever the LAST set or edit left there.  The style
+                        // channels belong to the set, so a style's kit swap
+                        // never resets a key (publishDrumKit restores only on
+                        // an explicit kit load), and a set that leaves a key
+                        // at its default never said so.  The previous set's
+                        // pitch, gain, filter, length or curve stayed on that
+                        // key while the editor showed the default - heard as
+                        // the pitch slider at 50 not giving the sample's own
+                        // pitch.  The kick MIX was the same hole, found first
+                        // because a stale switch is a second kick; this closes
+                        // it for every field on every key.
+                        //
+                        // Cheap: setDrumKeyParams is a handful of atomic
+                        // stores, so a whole kit is nothing next to a set load.
+                        // It never touches the key MAPPING (sourceKit / role),
+                        // so pushing a default key cannot re-sample anything.
+                        for (int k = 0; k < 128; ++k)
+                            onDrumKeyParamsChanged (slot, isSolo, k, params.drumKit.keys[(size_t) k]);
+                    }
                 }
                 else
                 {
@@ -574,30 +826,37 @@ public:
                     if (onReferenceSelected) onReferenceSelected (isSolo, slot, ref);
                 }
 
-                // Push the full slot params (ADSR / filter / EQ / etc.) and the
-                // click sub-set onto the engine.  Note the two callbacks have
-                // different signatures: onClickParamsChanged takes the three
-                // click scalars explicitly, while onSlotParamsChanged takes
-                // the whole SlotParams.
-                if (onClickParamsChanged)
-                    onClickParamsChanged (slot, isSolo,
-                                          params.clickEnabled,
-                                          params.clickVolume,
-                                          params.clickDecayMs);
-                if (onSlotParamsChanged)
-                    onSlotParamsChanged (slot, isSolo, params);
-
-                // AND THE HIDDEN OCTAVE BIAS.  onSlotParamsChanged carries
-                // octaveOffset (the slider) but NOT the bias, which is engine
-                // state and rides on its own callback — only ever fired from
-                // commitSlotParamsToEngine, which this loop does not use.  So a
-                // set restored the number into the tab and the bass came back an
-                // octave adrift from where it was saved.
-                if (onOctaveBiasChanged)
-                    onOctaveBiasChanged (slot, isSolo,
-                                         slotOctaveBias[isSolo ? 1 : 0][(size_t) slot]);
+                // ══ AND EVERYTHING ELSE THROUGH THE ONE SHARED COMMIT ════════
+                //
+                // THIS REPLACES SIX HAND-COPIED PUSHES.  What used to sit here
+                // was a second, parallel "commit everything" that had to be
+                // taught each parameter the real commit path already knew - and
+                // it was taught them ONE BUG AT A TIME.  The sweetener, the
+                // hidden octave bias, the kit FX rack, the per-key drum edits
+                // and the gain + base-unity pair were each added only after a
+                // set came back wrong, and each failed the same silent way: the
+                // right number in the tab, the old value in the engine.
+                //
+                // commitSlotParamsToEngine now sends the click params, the bulk
+                // SlotParams, the sweetener, the drum kit FX rack, the gain +
+                // base pair and the octave bias.  A parameter added to it is
+                // restored by a set for free, which is the whole point of the
+                // change - the next one of these bugs cannot be written.
+                //
+                // IT ALSO FIXES SOMETHING NOBODY REPORTED.  The hand-rolled push
+                // called onSlotParamsChanged RAW, so a set restored while FUNKEY
+                // MODE was on sent un-overridden FX: the macro was engaged, the
+                // button was lit, and the slots came back with their private
+                // effects. commitSlotParamsToEngine routes through
+                // GlobalMacros::overrideFx, so the macro now survives a set load.
+                //
+                // ORDER MATTERS AND IS DELIBERATE.  publishDrumKit above rebuilds
+                // the key table, so it must precede the per-key edits; the FX
+                // rack sent from in here touches no keys, so it is safe after.
+                commitSlotParamsToEngine (slot, isSolo, params);
             }
         }
+
 
         // ── REDRAW THROUGH THE REAL ENTRY POINTS ─────────────────────────────
         //
@@ -615,7 +874,45 @@ public:
         setMode (restoredMode);
         selectedSlot = restoredSlot;
 
+        // ── PUT THE BROWSER BACK ─────────────────────────────────────────────
+        //
+        // NOT via selectPack(): that is the user-click path and it deliberately
+        // resets category and page to 0, which is right for choosing a bank and
+        // exactly wrong for restoring one. Set the three directly, refetch the
+        // category names the bank owns, then clamp - a saved category or page
+        // can be out of range if the pack folder has since been edited, and an
+        // out-of-range index would index an empty StringArray.
+        //
+        // Order matters: the names have to exist before the category index
+        // means anything, and refreshPackInstruments needs the category before
+        // it can count pages.
+        // THE SAVED PACK IS HONOURED AGAIN.  Ballada clamped this to GM because
+        // its PACK column was hidden and a restored pack 1 would have left the
+        // tab in a bank with no way back.  Grex shows all three, so the saved
+        // index is restored - clamped only against the range, in case a future
+        // build adds a pack this one does not have.
+        selectedPack = juce::jlimit (0, kNumPacks - 1,
+                                     (int) t.getProperty ("selectedPack", selectedPack));
+
+        if (isPackBank())
+        {
+            packCategoryNames.clear();
+            if (onGetPackCategories)
+                packCategoryNames = onGetPackCategories (selectedPack);
+
+            selectedTimbre = juce::jlimit (0, juce::jmax (0, packCategoryNames.size() - 1),
+                                           (int) t.getProperty ("selectedTimbre", 0));
+            packPage       = juce::jmax (0, (int) t.getProperty ("packPage", 0));
+            refreshPackInstruments();     // clamps packPage against the real count
+        }
+
+        // AND THEN DERIVATION OVERRULES ALL OF IT, deliberately. The saved
+        // position is now only a fallback: it is what the tab falls back to for
+        // a state written before positions were saved, or for a flag no
+        // category claims. Where the sound actually lives always wins, because
+        // that is the answer the player is looking for when the tab opens.
         syncTimbreToSlot();
+        refreshBankButtons();
         refreshSlotButtons();
         refreshTimbreButtons();
         layoutInstrCells();
@@ -650,6 +947,14 @@ public:
     void clearStyleSlotOwnership()
     {
         for (auto& b : styleSlotFromSet) b = false;
+
+        // A style loading WITHOUT a set: no set owns the slots now, so EDM edits
+        // carried over from the previous set are not this style's.  The load
+        // publishes the style's own kit; clearing here keeps the editor, the next
+        // save and what plays in agreement - even when the new style names the
+        // SAME EDM kit, which the kit-name check alone cannot see.
+        for (auto& p : styleParams)
+            p.drumKit.edmKit.clear();
     }
 
     /** Push one slot's stored params (ADSR / filter / EQ / FX / octave / pitch
@@ -676,58 +981,112 @@ public:
         Deliberately NOT a full commit: no onInstrumentSelected, no
         onReferenceSelected, no publishDrumKit.  Re-selecting an instrument here
         would trip the very reset this exists to undo. */
+    /** Re-state every slot's stored voicing on the engine.  Called during a set
+        restore, after everything that publishes an instrument has finished.
+
+        IT IS NOW A LOOP OVER commitSlotParamsToEngine AND NOTHING ELSE.
+
+        It used to be a second, hand-rolled copy of that function, and the two
+        had already drifted: this one carried the GAIN and the other did not,
+        while the other carried the drum rack and the Funkey/Big Drums override
+        and this one did not.  So "is my trim restored?" and "is my macro
+        applied?" had different answers depending on which path the caller took,
+        and neither list was the whole truth.  One push path, one answer. */
     void repushAllSlotParams()
     {
         for (int sm = 0; sm < 2; ++sm)
         {
             const bool isSolo = (sm == 0);
             for (int slot = 0; slot < 8; ++slot)
-            {
-                const auto& p = isSolo ? soloParams [(size_t) slot]
-                                       : styleParams[(size_t) slot];
-
-                if (onSlotParamsChanged) onSlotParamsChanged (slot, isSolo, p);
-
-                if (onSweetenerChanged && ! roleIsDrum (isSolo, slot))
-                    onSweetenerChanged (slot, isSolo, p.sweet);
-
-                // GAIN, AND IT IS THE SAME BUG WITH A DIFFERENT SYMPTOM.
-                //
-                // gainPercent is deliberately absent from ChannelParams (a bulk
-                // push must not be able to move a calibration), so the line
-                // above does not carry it — and selectChannelPreset resets the
-                // channel to unity on its own account:
-                //
-                //     setChannelInstrumentGainPercent (channelIndex, 100.0f);
-                //
-                // followed by the .ins trim only IF the sound has one.  A style
-                // instrument with no preset therefore came back at 100 % however
-                // the set had it trimmed, and like the band filter it looked
-                // fine on the slider.
-                //
-                // The host pairs this with the channel's CURRENT base unity, so
-                // whatever the load path established stays put and only the
-                // slot's own trim is restored.
-                if (onSlotGainChanged)
-                    onSlotGainChanged (slot, isSolo, p.gainPercent);
-
-                // Click travels on its own route too.  Nothing currently resets
-                // it, but it is per-slot state the set owns, and this function
-                // is meant to be the whole of what the set owns per slot rather
-                // than the subset that happens to be broken today.
-                if (onClickParamsChanged)
-                    onClickParamsChanged (slot, isSolo, p.clickEnabled,
-                                          p.clickVolume, p.clickDecayMs);
-
-                if (onOctaveBiasChanged)
-                    onOctaveBiasChanged (slot, isSolo,
-                                         slotOctaveBias[isSolo ? 1 : 0][(size_t) slot]);
-            }
+                commitSlotParamsToEngine (slot, isSolo,
+                                          isSolo ? soloParams [(size_t) slot]
+                                                 : styleParams[(size_t) slot]);
         }
     }
 
+    //==========================================================================
+    // A STYLE'S PROGRAM CHANGE WIPES THE SLOT, AND THE SET HAS TO PUT IT BACK.
+    //
+    // SamplePlayerEngine::selectChannelPreset does two things to a melodic slot
+    // whose incoming sound has no saved .ins - which, since style slots stopped
+    // owning .ins files, is the ORDINARY case for the eight style slots:
+    //
+    //     applyChannelParams (ch, Channel::ChannelParams{});   // defaults
+    //     setChannelInstrumentGainPercent (ch, 100.0f);        // unity
+    //
+    // Both are correct in isolation.  A new sound must not inherit the previous
+    // sound's envelopes or its calibration trim.  But for a STYLE slot the set
+    // is the authority on how that slot is voiced, and nothing was re-stating
+    // it - so every program change the style sent at a section boundary quietly
+    // returned that slot to factory defaults while the editor went on showing
+    // the set's values, and the whole voicing came back the moment any control
+    // was nudged.  That is the "it only commits after I move a slider" report,
+    // and the GAIN slider is simply where it is easiest to hear.
+    //
+    // Called from the 30 Hz engine mirror on every style-slot voice change,
+    // NOT gated on the new sound having a preset - a slot with no preset is
+    // exactly the case that was broken.
+    //==========================================================================
+    void reassertStyleSlotVoicing (int slot)
+    {
+        if (slot < 0 || slot >= 8) return;
+
+        // FROZEN slots are already protected inside the engine
+        // (getIgnorePresetParams gates both the reset and the .ins), so
+        // re-stating here would be redundant at best.
+        if (isSlotFrozen (slot, false)) return;
+
+        // Drum slots do not go through this path: their kit and rack travel as
+        // DrumKitParams / DrumKitFxParams and are published separately.
+        if (roleIsDrum (false, slot)) return;
+
+        commitSlotParamsToEngine (slot, false, styleParams[(size_t) slot]);
+    }
+
+    //==========================================================================
+    // THE SOLO MIXER FADER AND THE SOLO SOUND-EDIT GAIN ARE ONE VALUE.
+    //
+    // [Rob] "the mixer slider and the sound edit window sliders should be
+    // connected! when one changes, it effects the other."  Solo is the one
+    // place that is safe: nothing else writes a solo slot's level, so two views
+    // of one number cannot start a fight the way style and user did.
+    //
+    // ONE DIRECTION PER FUNCTION, AND A RE-ENTRY GUARD.  A two-way link is
+    // exactly the shape that produced the FOLLOW ratchet - A writes B, B writes
+    // A, and a drag compounds instead of settling.  `linking` makes the second
+    // hop a no-op, so a move from either side lands exactly once.
+    //==========================================================================
+
+    /** The SOLO mixer fader moved.  linearGain 1.0 == 100% on the editor's GAIN. */
+    void setSoloGainFromMixer (int slot, float linearGain)
+    {
+        if (linking || slot < 0 || slot >= 8) return;
+
+        // A PLAIN FLAG, set and cleared - the same `seeding` pattern
+        // StyleLevelsPanel, FinisherWindow and MacroFxWindows already use. Not
+        // ScopedValueSetter: nothing else in this project uses it, and an
+        // unproven spelling is what turned into a build break earlier today.
+        linking = true;
+
+        auto& p = paramsFor (slot, true);
+        p.gainPercent = juce::jlimit (0.0f, 200.0f, linearGain * 100.0f);
+
+        if (onSlotGainChanged)
+            onSlotGainChanged (slot, true, p.gainPercent,
+                               effectiveBaseUnityDb (slot, true, p));
+
+        if (soloMode && slot == selectedSlot) pushSlotIntoEditor();
+
+        linking = false;
+    }
+
+    /** The editor's GAIN moved on a SOLO slot - the host moves the matching
+        mixer fader.  Never fired for style or drums. */
+    std::function<void (int slot, float linearGain)> onSoloGainToMixer;
+
     void commitSlotParamsToEngine (int slot, bool isSolo, const SlotParams& p)
     {
+
         if (onClickParamsChanged)
             onClickParamsChanged (slot, isSolo, p.clickEnabled, p.clickVolume, p.clickDecayMs);
 
@@ -752,32 +1111,94 @@ public:
             const int gmProg = isSolo ? soloPatch [(size_t) juce::jlimit (0, 7, slot)]
                                       : stylePatch[(size_t) juce::jlimit (0, 7, slot)];
 
-            // Gate on the MACRO, not on family coverage: the shared chorus +
-            // reverb reaches every melodic channel, so an instrument outside
-            // the seven families still has to pass through overrideFx (which
-            // leaves its private EQ / wah / phaser / delay alone).
-            if (! drumSlot && Betel::GlobalMacros::get().isFunkeyOn())
-            {
-                SlotParams macroP = p;                       // copy — never the original
-                Betel::GlobalMacros::get().overrideFx (macroP, gmProg, drumSlot);
-                onSlotParamsChanged (slot, isSolo, macroP);
-            }
-            else
-            {
-                onSlotParamsChanged (slot, isSolo, p);
-            }
+            // Gate on the MACRO, not on family coverage.
+            //
+            // The old reason for this was a shared chorus + reverb that reached
+            // every melodic channel; that is gone, and overrideFx now returns
+            // untouched for any program outside the six families.  The gate
+            // stays wide anyway, and deliberately: coverage is decided in ONE
+            // place (FunkeyFamilies::slotForProgram) rather than in two that can
+            // disagree, and the cost of an uncovered instrument is a copy of a
+            // struct and a lookup that returns null.
+            //
+            // THE SLOT'S OWN PARAMS NOW GO OUT UNTOUCHED, ALWAYS.
+            //
+            //     STYLE INSTRUMENT  ->  FUNKEY  ->  CHANNEL EFFECTS
+            //
+            // Funkey no longer overrides anything here.  Its wah and phaser are
+            // a SEPARATE STAGE ahead of the channel's own chain (see
+            // Channel::applyFunkeyInPlace), pushed on their own route just
+            // below — so a slot KEEPS its private wah and phaser while the macro
+            // is on, and the two run in series instead of one replacing the
+            // other.
+            juce::ignoreUnused (gmProg);
+            onSlotParamsChanged (slot, isSolo, p);
         }
 
-        // BIG DRUMS interception — the drum twin of the Funkey block above.
+        // ── THE FUNKEY STAGE, ON ITS OWN ROUTE ───────────────────────────────
         //
-        // A kit's FX rack does NOT travel to the engine inside SlotParams
-        // (applyChannelParams ignores it); it goes out through onKitFxChanged.
-        // So the macro has to intervene on its own push, and that push has to
-        // happen on EVERY commit rather than only when the rack is edited —
-        // that is what makes the toggle work in both directions: switching Big
-        // Drums on sends the macro rack, switching it off re-sends the kit's
-        // own, and the kit's stored rack is never written either way.
+        // Pushed on EVERY commit, exactly like the kit FX below and for the same
+        // reason: a style change swaps an instrument without going anywhere near
+        // an editor, and which family applies is decided by the GM program that
+        // is actually sounding.
+        //
+        // NULLPTR IS SENT, NOT SKIPPED.  Without it a channel keeps its last
+        // wah forever after the macro is switched off, its instrument moves to
+        // an uncovered family, or — since this change — it turns out to be a
+        // solo slot that was funkeyed by an earlier build.
+        //
+        // ── STYLE SLOTS ONLY.  THE RIGHT HAND IS NEVER FUNKEYED. ─────────────
+        //
+        // Funkey Mode is a treatment for the BAND, not for what the player is
+        // playing over it.  A wah that opened and closed under the right hand
+        // would be fighting the performance rather than backing it, and the solo
+        // bus is the one place the player expects to hear exactly the sound they
+        // chose.
+        //
+        // The GATE IS HERE rather than in GlobalMacros because this is the only
+        // place that knows which bank a slot belongs to — presetForProgram is
+        // asked about a GM PROGRAM, and a guitar is program 25 in either hand.
+        if (onFunkeyFxChanged)
+        {
+            const Betel::FamilyFxParams* fk = nullptr;      // nullptr = bypass
+
+            if (! drumSlot && ! isSolo)
+            {
+                const int gmProg2 = stylePatch[(size_t) juce::jlimit (0, 7, slot)];
+                // presetForProgram already answers nullptr when the macro is OFF
+                // or the family is not covered — one place decides both.
+                fk = Betel::GlobalMacros::get().presetForProgram (gmProg2);
+            }
+
+            onFunkeyFxChanged (slot, isSolo, fk);
+        }
+
+        // The kit's FX rack does NOT travel inside SlotParams — applyChannelParams
+        // ignores it — so it goes out on its own push here.  Big Drums used to
+        // intercept that push; with the macro gone this is a plain publish, but
+        // it still has to happen on EVERY commit rather than only when the rack
+        // is edited, because a style change replaces the kit without going
+        // anywhere near the drum editor.
         if (drumSlot) publishKitFx (slot, isSolo, p.drumKit.fx);
+
+        // THE PER-SOUND GAIN TRIM, AND IT HAS TO BE HERE.
+        //
+        // gainPercent is deliberately absent from ChannelParams, so the bulk
+        // push above cannot carry it - and SamplePlayerEngine::selectChannelPreset
+        // RESETS the channel to 100% on every sound swap so a trim calibrated
+        // for the outgoing voice cannot bury the incoming one.  That reset is
+        // right.  What was missing is the other half: something to re-state the
+        // slot's OWN trim afterwards, for a slot whose truth is the set rather
+        // than a .ins.
+        //
+        // Putting it here rather than in a second, parallel push function is the
+        // point.  There used to be two "commit everything" functions - this one
+        // and repushAllSlotParams - and the gain was in the other one, so
+        // whichever path a caller happened to take decided whether the trim
+        // survived.  repushAllSlotParams now calls THIS, so there is one answer.
+        if (onSlotGainChanged)
+            onSlotGainChanged (slot, isSolo, p.gainPercent,
+                               effectiveBaseUnityDb (slot, isSolo, p));
 
         // Hidden octave bias rides along with every commit.  It's cached rather
         // than fired at the point it's computed, because applySoundCalibration()
@@ -804,33 +1225,18 @@ public:
     // stored rack is never written and switching the macro off restores it
     // exactly — the same lossless contract the melodic side has.
     //==========================================================================
-    /** BIG DRUMS governs the DRUMS slot only.
-    
-        PERC is a second, independent kit — in Korg conversions often a full one
-        — and a macro named for the drums has no business rewriting its rack.
-        Sharing one macro across both also made the two impossible to balance
-        against each other, which is most of what a perc part is for. */
-    static bool isBigDrumsTarget (int slot, bool isSolo) noexcept
-    {
-        return ! isSolo && slot == 0;                     // style slot 0 = DRUMS
-    }
-
     void publishDrumKit (int slot, bool isSolo, const DrumKitParams& kit)
     {
         if (! onApplyDrumKit) return;
-        DrumKitParams k = kit;                            // copy — never the original
-        if (isBigDrumsTarget (slot, isSolo))
-            Betel::GlobalMacros::get().overrideDrumFx (k.fx);
-        onApplyDrumKit (slot, isSolo, k);
+        onApplyDrumKit (slot, isSolo, kit);
     }
 
     void publishKitFx (int slot, bool isSolo, const DrumKitFxParams& fx)
     {
         if (! onKitFxChanged) return;
-        DrumKitFxParams f = fx;                           // copy — never the original
-        if (isBigDrumsTarget (slot, isSolo))
-            Betel::GlobalMacros::get().overrideDrumFx (f);
-        onKitFxChanged (slot, isSolo, f);
+        // A macro used to intercept here, taking a copy and swapping the whole
+        // rack.  With it gone the kit's own rack is what travels, always.
+        onKitFxChanged (slot, isSolo, fx);
     }
 
     /** Re-push every slot after a macro is switched on or off — or after a knob
@@ -841,23 +1247,26 @@ public:
         both directions. */
     void refreshMacroFx() { commitAllSlotParamsToEngine(); }
 
-    /** Re-push ONLY the drum rack — what BIG DRUMS actually governs.
-    
-        A macro toggle used to go through refreshMacroFx, which commits all 16
-        slots: envelopes, filter, octave, octave bias, note range, FX, the lot.
-        For a macro that touches one kit's effects that is enormous overreach —
-        it re-asserts the editor's whole picture over everything the style set,
-        and any cached value that has drifted lands on the engine at that
-        instant.  Big Drums needs one publish, so it does one. */
-    void refreshBigDrums()
-    {
-        if (roleIsDrum (false, 0))
-            publishKitFx (0, false, styleParams[0].drumKit.fx);
-    }
-
     /** Commit every slot's params (both solo and style banks) to the engine.
         Call once after the host has wired the callbacks so a fresh instance has
         the engine matching the editor's seeded defaults without a drag. */
+    /** Push the harmony slot's instrument to the engine.
+
+        commitAllSlotParamsToEngine sends slot PARAMS; the PATCH travels on
+        onInstrumentSelected, which only fires from a set restore or a cell
+        click. On a fresh instance that loads no set, the tab therefore showed
+        String Ensemble 2 while channel 23 still held whatever it constructed
+        with - the tab and the engine disagreeing about the same slot.
+
+        Idempotent: a set restore that runs afterwards simply sends its own
+        patch through the same callback. */
+    void seedHarmonyInstrument()
+    {
+        if (onInstrumentSelected)
+            onInstrumentSelected (true, kHarmonySoloSlot,
+                                  soloPatch[(size_t) kHarmonySoloSlot]);
+    }
+
     void commitAllSlotParamsToEngine()
     {
         for (int slot = 0; slot < 8; ++slot)
@@ -978,10 +1387,11 @@ public:
     // — the UI-driven path — while a STYLE program change went through
     // setSlotPatch, which never touched it.  The stale value then sat in the
     // cache doing nothing until something committed every slot at once, and the
-    // only thing that does that is a macro toggle: switching BIG DRUMS on
-    // re-sent a +1 or +2 left over from whenever that slot last held a bass, and
-    // an unrelated instrument jumped an octave.  Hence "turning on Big Drums
-    // shifts some instruments up".
+    // only thing that does that is a macro toggle: engaging one re-sent a +1 or
+    // +2 left over from whenever that slot last held a bass, and an unrelated
+    // instrument jumped an octave.  It was reported as "turning on the macro
+    // shifts some instruments up", which is why the fix belongs here and not in
+    // whichever macro happened to expose it.
     //==========================================================================
     static int octaveBiasFor (int slot, bool isSolo, int gmProg) noexcept
     {
@@ -1070,7 +1480,23 @@ public:
     // touches no member state and no engine — so the baker can call it 633
     // times over without a style ever being loaded.
     //==========================================================================
+    /** gmDefaultsBase, then the SOUND ENGINE programs' window chain: the engine
+        brings its own ladder and envelope, so what follows it starts NEUTRAL -
+        the window filter wide open, no filter envelope, full sustain, a short
+        release.  A wrapper, because the base has returns all through it. */
     static void gmDefaultsInto (SlotParams& p, int& outOctaveBias,
+                                bool isSolo, int slot, int gmProg)
+    {
+        gmDefaultsBase (p, outOctaveBias, isSolo, slot, gmProg);
+        if (oscengine::servesProgram (gmProg))
+        {
+            p.filterCutoff = 1.0f;  p.filterReson  = 0.0f;  p.fEnvAmount = 0.0f;
+            p.filterHpNorm = 0.0f;  p.filterLpNorm = 1.0f;
+            p.attack = 0.0f;  p.sustain = 1.0f;  p.release = 0.12f;
+        }
+    }
+
+    static void gmDefaultsBase (SlotParams& p, int& outOctaveBias,
                                 bool isSolo, int slot, int gmProg)
     {
         outOctaveBias = 0;
@@ -1104,9 +1530,44 @@ public:
         // sag to ~43% by 4 s and vanish on long endings ("bass stops playing").
         // Everything else keeps S 0.
         p.decay   = 7.0f;
-        p.sustain = isBass ? 1.0f : 0.0f;
-        p.release  = (float) gmReleaseSlider (gmProg) * 0.03f;
-        p.ampCurve = gmAmpCurve (gmProg);
+
+        // ── WHO GETS THE DECAY CARPET, AND WHO ALREADY HAS ONE ───────────────
+        //
+        // S 0 with a 7 s decay is a slow fade laid over the sample.  That is
+        // right for a SUSTAINED sample — organ, strings, pad, brass — where the
+        // sample itself holds forever and something has to end the note.
+        //
+        // It is wrong for a sample that ALREADY DECAYS.  A piano, a guitar, a
+        // vibraphone, a harp: the recording fades on its own, and the carpet
+        // then multiplies one decay by another.  The note dies far faster than
+        // the instrument does, which is heard as the part being swallowed while
+        // it is still being held.
+        //
+        // This is the bass fix generalised.  Bass got S 1 because the carpet
+        // sagged it to ~43% by 4 s; the reason was never that it was the bass,
+        // it was that a bass sample decays by itself.  So do these.
+        const bool selfDecaying =
+               (gmProg >=   0 && gmProg <=  15)   // pianos, chromatic percussion
+            || (gmProg >=  24 && gmProg <=  31)   // guitars
+            || (gmProg ==  45)                    // pizzicato strings
+            || (gmProg ==  46)                    // orchestral harp
+            || (gmProg ==  47)                    // timpani
+            || (gmProg ==  55)                    // orchestra hit
+            || (gmProg >= 104 && gmProg <= 111)   // ethnic — sitar, banjo, koto...
+            || (gmProg >= 112 && gmProg <= 119);  // tuned percussion
+
+        p.sustain = (isBass || selfDecaying) ? 1.0f : 0.0f;
+        // SECONDS DIRECTLY, not "slider x 0.03".  That factor encoded the old
+        // LINEAR knob scale, so the table silently meant something different the
+        // moment the knob became exponential.  gmReleaseSlider still returns its
+        // historical numbers and they still mean the same times; the conversion
+        // is just written where it can be seen.
+        p.release  = (float) gmReleaseSlider (gmProg) * 0.03f;   // 15 -> 0.45 s
+
+        p.ampCurve  = gmAmpCurve (gmProg);
+        p.ampCurveK = (p.ampCurve == 1) ?  0.0f
+                    : (p.ampCurve == 2) ? -4.0f
+                                        :  6.0f;
 
         // Filter family default.  Bright, potentially harsh GM families park
         // HALF-OPEN (filter slider = 50, norm 0.5, ~630 Hz) so they don't scream
@@ -1401,13 +1862,6 @@ public:
         // WORLD is everything the library carries at flag >= 200 - the space the
         // engine already reserved for sounds a style cannot ask for by program
         // change, which is exactly what a bouzouki or a kanun is.
-        btnBankGm   .setButtonText("GM");
-        // EXPANSION, not WORLD: this bank stopped being "ethnic instruments" and
-        // became where every added sound pack lands, which is what flag >= 200
-        // has always actually meant.  Caption only - the internal name stays
-        // btnBankWorld / worldBank so nothing else has to move.
-        btnBankWorld   .setButtonText("WORLD");
-        btnBankOriental.setButtonText("ORIENTAL");
         for (int i = 0; i < kMaxFullKitCells; ++i)
         {
             auto& b = fullKitButtons[(size_t) i];
@@ -1421,16 +1875,47 @@ public:
                 refreshInstrDisplay();
                 reloadInstrImage();
                 pushDrumEditorMode();   // an open editor becomes the sampled one
+                closeEdmKitWindow();    // and the EDM KIT window has nothing to edit
             };
             addChildComponent (b);
         }
 
-        btnBankGm      .onClick = [this]{ setPack(0); };
-        btnBankWorld   .onClick = [this]{ setPack(1); };
-        btnBankOriental.onClick = [this]{ setPack(2); };
-        addAndMakeVisible(btnBankGm);
-        addAndMakeVisible(btnBankWorld);
-        addAndMakeVisible(btnBankOriental);
+        // ── THE THREE VERTICAL COLUMNS ───────────────────────────────────────
+        //
+        // PACK is a fixed three, so it is filled once here and never again.
+        // CATEGORY and INSTRUMENT are refilled by refreshTimbreButtons and
+        // refreshInstrDisplay, which remain the only writers - the columns are
+        // a presentation of the same state the horizontal rows showed, not a
+        // second copy of it.
+        //
+        // THE RULE GOES AFTER PACK AND CATEGORY ONLY.  A rule separates a
+        // column from the NEXT one; after INSTRUMENT there is no next, only the
+        // animation panel, and a rule there would box it in.
+        // ── THE PACK COLUMN IS LIVE IN GREX ─────────────────────────────────
+        //
+        // Three fixed rows, filled once here and never again - the packs are a
+        // constant, unlike CATEGORY and INSTRUMENT which are refilled from the
+        // library.  A pack the user has not installed still shows: pressing it
+        // opens an empty category list, which says "not installed" far more
+        // plainly than a row that is not there at all.
+        colPack.setTitle ("PACK");
+        colPack.setItems ({ "GM", "WORLD", "ORIENTAL" });
+        colPack.setMaxRowH (30);
+        colPack.setDrawRule (true);
+        colPack.onRowClicked = [this] (int r) { setPack (r); };
+        addAndMakeVisible (colPack);
+
+        colCategory.setTitle ("CATEGORY");
+        colCategory.setMaxRowH (24);
+        colCategory.setDrawRule (true);
+        colCategory.onRowClicked = [this] (int r) { selectTimbre (r); };
+        addAndMakeVisible (colCategory);
+
+        colInstr.setTitle ("INSTRUMENT");
+        colInstr.setMaxRowH (30);
+        colInstr.setDrawRule (false);
+        colInstr.onRowClicked = [this] (int r) { selectInstrument (r); };
+        addAndMakeVisible (colInstr);
 
         // ── PAGE WITHIN A CATEGORY ───────────────────────────────────────────
         // A category holds as many sounds as the folder holds; the row shows 8.
@@ -1470,16 +1955,44 @@ public:
             slotButtons[i].onClick = [this, i]{ selectSlot(i); };
             addAndMakeVisible(slotButtons[i]);
         }
-        for (int i = 0; i < kNumTimbres; ++i)
+
+        // ── GLOBAL EFFECTS ───────────────────────────────────────────────────
+        //
+        // Under the eight instrument selectors, and it belongs there rather than
+        // in the editor: the rack is a property of the HAND, not of whichever
+        // slot happens to be selected, and a button that lives beside the slots
+        // says that without a word of explanation.
+        //
+        // One button, both hands — soloMode decides which rack it opens, the
+        // same way every other control on this tab already reads it.
         {
-            timbreButtons[i].setButtonText(kTimbreNames[i]);
-            timbreButtons[i].onClick = [this, i]{ selectTimbre(i); };
-            addAndMakeVisible(timbreButtons[i]);
+            btnGlobalFx.setButtonText ("GLOBAL EFFECTS");
+
+            // YELLOW ON BLACK, and loudly so.  The default TextButton reads as
+            // a panel rather than a control next to a row of slot buttons, and
+            // this is the only way into the three effects every instrument shares
+            // — a player who does not notice it cannot reach them at all.
+            // kPageYellow is the tab's existing "this is a navigation control"
+            // colour, so it is announcing itself in a language the tab already
+            // speaks rather than inventing one.
+            btnGlobalFx.setColour (juce::TextButton::buttonColourId,   kPageYellow);
+            btnGlobalFx.setColour (juce::TextButton::buttonOnColourId, kPageYellow);
+            btnGlobalFx.setColour (juce::TextButton::textColourOffId,  juce::Colours::black);
+            btnGlobalFx.setColour (juce::TextButton::textColourOnId,   juce::Colours::black);
+            btnGlobalFx.onClick = [this]
+            {
+                if (onOpenGlobalEffects) onOpenGlobalEffects (soloMode);
+            };
+            addAndMakeVisible (btnGlobalFx);
         }
         for (int i = 0; i < kMaxInstrCells; ++i)
         {
             instrButtons[i].onClick = [this, i]{ selectInstrument(i); };
-            addAndMakeVisible(instrButtons[i]);
+            // addChildComponent, NOT addAndMakeVisible: these are the DRUM kit
+            // cells now and a melodic slot must never flash them before the
+            // first resized() hides them.  Same trap the SFZ LOAD button in
+            // InstrEditorWindow already documents.
+            addChildComponent(instrButtons[i]);
         }
 
         for (int i = 0; i < 8; ++i)
@@ -1516,7 +2029,7 @@ public:
         btnIgnorePc.setColour(juce::TextButton::buttonColourId,   juce::Colour(0xFF222222));
         btnIgnorePc.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xFF222222));
         btnIgnorePc.setColour(juce::TextButton::textColourOffId,  juce::Colours::white);
-        btnIgnorePc.setColour(juce::TextButton::textColourOnId,   juce::Colour(0xFFCC6600));
+        btnIgnorePc.setColour(juce::TextButton::textColourOnId,   juce::Colour(Betel::Pal::kAccent));
         btnIgnorePc.onClick = [this]
         {
             if (soloMode) return;
@@ -1526,8 +2039,41 @@ public:
         };
         addAndMakeVisible(btnIgnorePc);
 
+        //----------------------------------------------------------------------
+        // RESTORE THE STYLE'S OWN INSTRUMENT.
+        //
+        // Picking a sound for a style slot LOCKS it: setSlotSubstitution both
+        // loads the choice and stops the style's later program changes from
+        // overwriting it. That is right - otherwise the pick would survive about
+        // two bars - but it left no way back. Reloading the style does not help
+        // either, because the lock is precisely what survives a reload.
+        //
+        // A PUSH button, not a toggle: there is no "restored" state to sit in.
+        // The moment it fires the slot is back under the style's control and the
+        // next authored program change is genuinely re-applied.
+        //----------------------------------------------------------------------
+        btnRestorePc.setButtonText("RESTORE STYLE INSTRUMENT");
+        btnRestorePc.setTooltip("Give this slot back to the style. Undoes your "
+                                "instrument pick for it.");
+        btnRestorePc.setColour(juce::TextButton::buttonColourId,  juce::Colour(0xFF222222));
+        btnRestorePc.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
+        btnRestorePc.onClick = [this]
+        {
+            if (soloMode) return;                 // style slots only, like IGNORE
+            if (onRestoreStyleInstrument) onRestoreStyleInstrument (selectedSlot);
+        };
+        addAndMakeVisible(btnRestorePc);
+
         soloPatch .fill(0);
         stylePatch.fill(0);
+
+        // HARMONY DEFAULTS TO GM 49, String Ensemble 2. A GM program rather
+        // than a pack flag on purpose: it cannot fail to resolve, so harmony
+        // has a voice even on an install whose WORLD folder is missing.
+        // Overwritten by any set, project or favourite that carries its own
+        // slot-8 patch - a default only applies where there is nothing to
+        // restore.
+        soloPatch[(size_t) kHarmonySoloSlot] = kHarmonyDefaultPatch;
         soloIsDrumSlot .fill(false);
         styleIsDrumSlot.fill(false);
         soloRef .fill(-1);
@@ -1553,7 +2099,26 @@ public:
 
         if (isSolo)  { if (slot >= 0 && slot < 8) soloPatch[slot]  = patch; }
         else         { if (slot >= 0 && slot < 8) stylePatch[slot] = patch; }
-        if (soloMode == isSolo) { syncTimbreToSlot(); refreshInstrDisplay(); reloadInstrImage(); refreshEditorSlotLabel(); }
+        // setSlotPatch is the STYLE-driven path - a program change lands a sound
+        // on a slot with no browsing involved at all - and it is the one that
+        // most needs the browser moved: a style can drop a pack sound onto a
+        // slot while the tab is sitting on GM. syncTimbreToSlot now moves the
+        // BANK as well as the category, so the bank row and the cell grid have
+        // to follow it here too.
+        if (soloMode == isSolo)
+        {
+            const int wasPack = selectedPack;
+            syncTimbreToSlot();
+            refreshBankButtons();
+            refreshTimbreButtons();
+            layoutInstrCells();
+            refreshInstrDisplay();
+            reloadInstrImage();
+            refreshEditorSlotLabel();
+            if (wasPack != selectedPack) resized();
+        }
+        if (editorWindow != nullptr && isSolo == soloMode && slot == selectedSlot)
+            editorWindow->setEngineProgram (editedEngineProgram());   // SOUND ENGINE follows a program change
     }
 
     int getSlotPatch(bool isSolo, int slot) const
@@ -1625,6 +2190,49 @@ public:
         if (onSlotFreezeChanged) onSlotFreezeChanged (slot, isSolo, frozen);
     }
 
+    //==========================================================================
+    //  THE SOLO OCTAVE MACRO - the MAIN tab's five pads read and write here.
+    //
+    //  The pads and the sound editor's OCT slider are two views of ONE field,
+    //  SlotParams::octaveOffset, so the macro writes exactly what the slider
+    //  writes and pushes it by exactly the route the slider's edits take:
+    //
+    //    paramsFor()  - the AWAKE set, SFZ or instrument, i.e. the set the
+    //                   editor is showing and editing.  Writing soloParams
+    //                   directly would move a set that is asleep while the one
+    //                   you can hear stayed where it was.
+    //    commitSlotParamsToEngine - the one complete push.
+    //    setSlotParams - refreshes the open editor when it is showing this
+    //                   slot.  Silent: GoldSlider::setValue does not notify by
+    //                   default, so the editor cannot echo the change back.
+    //
+    //  The reverse direction needs nothing here: a slider move lands in the
+    //  same field, and MainComponent's 30 Hz mirror reads it back into the
+    //  pads through getSoloOctave.  Same persistence as the slider too - it is
+    //  saved with the set and with SAVE SETTINGS, because it is the same field.
+    //==========================================================================
+    int getSoloOctave (int slot) const noexcept
+    {
+        if (slot < 0 || slot >= 8) return 0;
+        return paramsFor (slot, true).octaveOffset;
+    }
+
+    void setSoloOctave (int slot, int octaves)
+    {
+        if (slot < 0 || slot >= 8) return;
+
+        auto& p = paramsFor (slot, true);
+        const int o = juce::jlimit (-3, 3, octaves);   // the slider's own range
+        if (p.octaveOffset == o) return;
+
+        p.octaveOffset = o;
+        commitSlotParamsToEngine (slot, true, p);
+
+        if (editorWindow != nullptr && editorWindow->isVisible()
+            && soloMode && selectedSlot == slot)
+            editorWindow->setSlotParams (p);
+    }
+
     void adoptPresetParams (bool isSolo, int slot, const SlotParams& p)
     {
         if (slot < 0 || slot >= 8) return;
@@ -1641,17 +2249,46 @@ public:
 
         soloParams[(size_t) slot] = p;
 
-        const auto& stored = soloParams[(size_t) slot];
-
-        if (onNoteRangeAdopted)   onNoteRangeAdopted (slot, isSolo, stored);
-        if (onSweetenerChanged && ! roleIsDrum (isSolo, slot))
-            onSweetenerChanged (slot, isSolo, stored.sweet);
-        if (onClickParamsChanged) onClickParamsChanged (slot, isSolo,
-                                                        stored.clickEnabled,
-                                                        stored.clickVolume,
-                                                        stored.clickDecayMs);
-        if (roleIsDrum (isSolo, slot))
-            publishKitFx (slot, isSolo, stored.drumKit.fx);
+        // ── AND COMMIT IT.  THIS LINE IS THE WHOLE FIX. ──────────────────────
+        //
+        // This function used to push FOUR hand-picked callbacks — note range,
+        // sweetener, click, kit FX — and stop there.  That is a SECOND, PARTIAL
+        // copy of commitSlotParamsToEngine, and the difference between the two
+        // is exactly what never reached the audio when a solo instrument was
+        // picked:
+        //
+        //   onSlotParamsChanged   the ChannelParams bulk push, AND with it
+        //                         setChannelBandFilterNorm - the two-handle
+        //                         BAND filter, which deliberately does NOT ride
+        //                         inside ChannelParams and so has only this one
+        //                         route to the engine
+        //   onSlotGainChanged     the per-sound trim and its base unity
+        //   onOctaveBiasChanged   the hidden register shift
+        //
+        // The engine's own selectChannelPreset covers ChannelParams and the
+        // gain, so the sound was NEARLY right - which is what made this hard to
+        // see.  What it cannot cover is the band filter and the octave bias,
+        // because those live on the channel and not in ChannelParams.  So the
+        // slot kept whatever applyGmEnvDefaults had just written from the GM
+        // family table, and the .ins values sat in soloParams unheard until
+        // pushSlotIntoEditor ran commitSlotParamsToEngine at the end of opening
+        // the editor.  That is the "only applies when I open the sound window"
+        // report, and the same defect Grex had.
+        //
+        // TWO "COMMIT EVERYTHING" FUNCTIONS IS THE BUG, NOT THE MISSING FIELDS.
+        // This file has been here before - see the note in
+        // commitSlotParamsToEngine about repushAllSlotParams holding the gain
+        // while this one did not, so whichever path a caller took decided
+        // whether the trim survived.  The answer then was to make the other one
+        // call THIS one; the answer here is the same.  Everything the four
+        // hand-picked pushes did is a strict subset: the note range now travels
+        // inside onSlotParamsChanged with identical arguments, and the kit-FX
+        // branch was dead on this path anyway (roleIsDrum is false for every
+        // solo slot).
+        //
+        // The frozen and style-slot guards above still stand in front of it, so
+        // this changes WHAT a legitimate adoption pushes, never WHEN one happens.
+        commitSlotParamsToEngine (slot, isSolo, soloParams[(size_t) slot]);
 
         if (editorWindow && editorWindow->isVisible()
             && soloMode && selectedSlot == slot)
@@ -1705,12 +2342,29 @@ public:
         (the big "<kit> kit" label and the DrumsPopup state).  Programmatic —
         fires no callbacks; repaints only when the value changed AND the slot
         is the one currently shown (so the 30 Hz mirror never causes blinking). */
+    /** The slot's EDM kit edits (empty = the kit as its base).  With the kit
+        name they are exactly what the engine plays - the Crash tab names the
+        kit's crash pads from the pair. */
+    juce::String getSlotEdmEdits (bool isSolo, int slot) const
+    {
+        if (slot < 0 || slot >= 8) return {};
+        return (isSolo ? soloParams : styleParams)[(size_t) slot].drumKit.edmKit;
+    }
+
     void setSlotDrumKitName (bool isSolo, int slot, const juce::String& kitName)
     {
         if (slot < 0 || slot >= 8) return;
         auto& p = isSolo ? soloParams[(size_t) slot] : styleParams[(size_t) slot];
         if (p.drumKit.lastLoadedKit == kitName) return;
         p.drumKit.lastLoadedKit = kitName;
+
+        // EDM KIT EDITS BELONG TO THE KIT THEY WERE MADE ON.  The engine now
+        // holds a DIFFERENT kit (a style loaded without a set, a kit switch), so
+        // those edits are no longer what plays - left here they would be saved
+        // beside THIS kit's name and applied to it on the next load.  Nothing
+        // audible is lost: the engine is already playing the new kit without
+        // them.  setSlotDrumKit keeps its one false alarm (key 0) away from here.
+        p.drumKit.edmKit.clear();
 
         // The kit CHANGED, and its effects are DELIBERATELY left alone.  This
         // used to seed a compressor here for Electronic / TR-808 — the comment
@@ -1771,9 +2425,18 @@ public:
         if (slot < 0 || slot >= 8) return;
         (isSolo ? soloKitKey : styleKitKey)[(size_t) slot] = kitKey;
 
+        // EDM KIT: an EDM kit is published under unity key 0 - the composed
+        // Standard kit's key - so the key cannot name it and the engine answers
+        // "Standard".  Renaming on that would clear the slot's EDM edits (see
+        // setSlotDrumKitName) and then rename it straight back, on every set
+        // load.  The caller sets the real name from the channel right after, and
+        // a genuine switch to Standard arrives through that name too.
+        const bool edmOnKeyZero = kitKey == 0
+            && isEdmKitName ((isSolo ? soloParams : styleParams)[(size_t) slot].drumKit.lastLoadedKit);
+
         // setSlotDrumKitName already does the storing AND the refresh, so route
         // through it whenever there is a name rather than duplicating either.
-        if (name.isNotEmpty())
+        if (name.isNotEmpty() && ! edmOnKeyZero)
         {
             setSlotDrumKitName (isSolo, slot, name);
             return;
@@ -1788,8 +2451,98 @@ public:
         }
     }
 
+    //==========================================================================
+    // HOW THE ANIMATION PANEL SPLITS: PICTURE CENTRED, NAME ALONG THE BOTTOM.
+    //
+    // ONE FUNCTION FOR BOTH READERS.  resized() sizes instrDisplay from it and
+    // paint() draws the name from it.  They MUST NOT compute the split
+    // separately - that is precisely what went wrong when the panel became a
+    // tall column: resized() moved the picture but paint() kept the old
+    // WIDE-STRIP maths (name down the LEFT, vertically centred), so the text
+    // landed straight across the middle of the instrument.
+    //
+    // THE PICTURE IS CAPPED, THEN CENTRED IN WHAT IS LEFT.  Handing it the
+    // whole area above the name would scale it up to fill - drawImageWithin
+    // with RectanglePlacement::centred enlarges as well as shrinks - and it
+    // would then run under the EDIT / IGNORE buttons in the top-left corner.
+    // Capping keeps it the size it already was and only moves it.
+    //==========================================================================
+    struct AnimSplit
+    {
+        juce::Rectangle<int> picture, name;
+        float fontH = 12.0f;
+    };
+
+    AnimSplit animPanelSplit() const
+    {
+        AnimSplit s;
+        if (animBounds.getHeight() <= 0) return s;
+
+        const int margin = 8;
+        auto r = animBounds.reduced (margin);
+        if (r.getHeight() <= 0 || r.getWidth() <= 0) return s;
+
+        // SIZED FROM THE WIDTH, because width is what decides whether "String
+        // Ensemble 1" fits on a line; the height term only stops the name
+        // eating the picture on a short window.
+        s.fontH = juce::jlimit (13.0f, 40.0f,
+                                juce::jmin ((float) r.getWidth()  * 0.075f,
+                                            (float) r.getHeight() * 0.13f));
+
+        const int nameH = juce::jlimit (20, juce::jmax (20, r.getHeight() / 3),
+                                        (int) (s.fontH * 2.2f));
+
+        s.name = r.removeFromBottom (nameH);
+        r.removeFromBottom (margin / 2);      // breathing room, not a separator
+
+        // RESERVE THE BUTTON CORNER.  EDIT sits top-left on every slot, and a
+        // style slot stacks IGNORE PROGRAM CHANGE and RESTORE STYLE INSTRUMENT
+        // under it.  Those are drawn as CHILD COMPONENTS over this panel, so
+        // nothing would stop the picture sliding under them - centring the
+        // picture in the raw panel is what would put it there.
+        r.removeFromTop (juce::jmin (r.getHeight() / 4, soloMode ? 24 : 68));
+
+        const int picH = juce::jmin (r.getHeight(), (int) (animBounds.getHeight() * 0.55f));
+        const int picW = juce::jmin (r.getWidth(),  (int) (animBounds.getWidth()  * 0.62f));
+        s.picture = r.withSizeKeepingCentre (picW, picH);
+
+        return s;
+    }
+
     void paint(juce::Graphics& g) override
     {
+        // ── THE HIERARCHY ARROWS ─────────────────────────────────────────────
+        //
+        // One between PACK and CATEGORY, one between CATEGORY and INSTRUMENT.
+        // They say "this column feeds the next" without a label.
+        //
+        // EACH IS DIM UNTIL THE COLUMN TO ITS LEFT HAS A SELECTION, so the row
+        // reads as a path being walked rather than as three lists that happen
+        // to sit side by side.  Painted rather than made into components: they
+        // are never clicked, and a Component that ignores the mouse still eats
+        // it from whatever is underneath.
+        for (int a = 0; a < 2; ++a)
+        {
+            const auto r = arrowRect[a];
+            if (r.isEmpty()) continue;
+
+            const bool lit = (a == 0) ? colPack.hasSelection()
+                                      : colCategory.hasSelection();
+
+            const float cx = (float) r.getCentreX();
+            const float cy = (float) r.getY() + juce::jmin (26.0f, r.getHeight() * 0.10f);
+            const float w  = juce::jlimit (4.0f, 7.0f, r.getWidth() * 0.30f);
+
+            juce::Path tri;
+            tri.startNewSubPath (cx - w * 0.6f, cy - w);
+            tri.lineTo          (cx + w * 0.7f, cy);
+            tri.lineTo          (cx - w * 0.6f, cy + w);
+            tri.closeSubPath();
+
+            g.setColour (juce::Colours::white.withAlpha (lit ? 0.45f : 0.13f));
+            g.fillPath (tri);
+        }
+
         if (animBounds.getHeight() > 0)
         {
             g.setColour(juce::Colours::black.withAlpha(0.55f));
@@ -1805,7 +2558,7 @@ public:
                 const int imgAreaX = animBounds.getRight() - imgAreaW - margin;
                 const int labelW   = imgAreaX - animBounds.getX() - margin * 2;
                 const float fh     = juce::jmin((float)animBounds.getHeight() * 0.44f, 44.0f);
-                g.setColour(juce::Colour(0xFFCC6600));
+                g.setColour(juce::Colour(Betel::Pal::kAccent));
                 g.setFont(juce::Font(fh, juce::Font::bold));
 
                 const auto& dk = currentSlotParams().drumKit;
@@ -1816,7 +2569,8 @@ public:
                 const juce::String disp = displayNameForKit (dk.lastLoadedKit);
                 const juce::String label = disp.isEmpty()
                     ? juce::String ("DRUMS")
-                    : disp + " kit";
+                    : isEdmKitName (dk.lastLoadedKit) ? disp          // EDM: the kit's own name, as listed
+                                                      : disp + " kit";
 
                 g.drawFittedText(label,
                                  animBounds.getX() + margin,
@@ -1830,18 +2584,14 @@ public:
                                                   : stylePatch[selectedSlot];
                 if (currentPatch >= 0 && currentPatch < 128)
                 {
-                    const int margin   = 6;
-                    const int imgAreaW = (int)(animBounds.getWidth() * 0.32f) - margin * 2;
-                    const int imgAreaX = animBounds.getRight() - imgAreaW - margin;
-                    const int labelW   = imgAreaX - animBounds.getX() - margin * 2;
-                    const float fh     = juce::jmin((float)animBounds.getHeight() * 0.44f, 44.0f);
-                    g.setColour(juce::Colour(0xFFCC6600));
-                    g.setFont(juce::Font(fh, juce::Font::bold));
-                    g.drawFittedText(kFullInstrNames[currentPatch],
-                                     animBounds.getX() + margin,
-                                     animBounds.getY() + (animBounds.getHeight() - (int)(fh * 2.2f)) / 2,
-                                     labelW, (int)(fh * 2.4f),
-                                     juce::Justification::centred, 2);
+                    // ALONG THE BOTTOM, full width, from the SAME split
+                    // resized() used to place the picture - so the two can
+                    // never overlap however the panel is resized.
+                    const auto split = animPanelSplit();
+                    g.setColour (juce::Colour (Betel::Pal::kAccent));
+                    g.setFont (juce::Font (split.fontH, juce::Font::bold));
+                    g.drawFittedText (kFullInstrNames[currentPatch], split.name,
+                                      juce::Justification::centred, 2);
                 }
             }
         }
@@ -1874,172 +2624,161 @@ public:
 
         slotRowY = y; slotRowH = slotH;
         layoutSlots();
-        y += slotH + secGap;
+        y += slotH + 3;
+
+        // Full width under the selectors, shallower than a slot button so it
+        // reads as belonging to the row above rather than being a ninth slot.
+        {
+            const int gfxH = juce::jmax (18, (int) (slotH * 0.62f));
+            btnGlobalFx.setBounds (padX, y, usW, gfxH);
+            y += gfxH + secGap;
+        }
         sectionDividers.add(y - secGap / 2);
 
-        // Timbre row: 16 melodic categories only (the DRUMS button is gone —
-        // drum slots are role-fixed).  Hidden entirely for drum slots, which
-        // show just the kit selector below.
-        // ── BANK SELECTOR: GM / WORLD ────────────────────────────────────────
+        // ══ THE SELECTOR: THREE VERTICAL BANDS ═══════════════════════════════
         //
-        // Between the channel editor above and the instrument selector below,
-        // which is the order the choice is actually made in: which slot, which
-        // library, which sound.  Hidden on a DRUM slot - a kit is neither GM nor
-        // World, and offering the choice there would be offering nothing.
-        {
-            const bool showBank = ! isCurrentSlotDrum();
-            const int  bankH    = juce::jmax (18, timbreH - 2);
-            // Three across now, not two.  Same band, same height - the third
-            // button comes out of the width the other two had.
-            const int  bankW    = juce::jmin (140, (usW - 8) / 3);
-
-            btnBankGm      .setVisible (showBank);
-            btnBankWorld   .setVisible (showBank);
-            btnBankOriental.setVisible (showBank);
-
-            if (showBank)
-            {
-                btnBankGm      .setBounds (padX,                     y, bankW, bankH);
-                btnBankWorld   .setBounds (padX + (bankW + 4),       y, bankW, bankH);
-                btnBankOriental.setBounds (padX + (bankW + 4) * 2,   y, bankW, bankH);
-                y += bankH + secGap;   // same gap as every other section
-            }
-        }
-
-        {
-            const bool showTimbres = ! isCurrentSlotDrum();
-            const int nT = 16;
-            const int cellGap = 2;
-
-            // In a PACK only the categories that exist are shown.
-            const int visibleCount = isPackBank() ? juce::jmin (nT, packCategoryNames.size()) : nT;
-
-            // ── DIVIDE BY WHAT IS SHOWN, NOT BY WHAT COULD BE ────────────────
-            //
-            // This used to divide the width by 16 always and then hide the
-            // buttons past visibleCount, so a pack's categories occupied
-            // visibleCount/16 of the row and stopped dead: ORIENTAL's six sat in
-            // the left 37%, WORLD's ten in the left 62%, with the rest of the
-            // canvas empty.  Sixteen is the count of GM FAMILIES, which a pack
-            // does not have - so it was never the right divisor there.
-            //
-            // Widening also makes the labels legible: a category is a word
-            // ("accordion", "woodwind"), not a four-letter GM family name, and
-            // a 1/16th cell truncated most of them.
-            const int laidOut = juce::jmax (1, visibleCount);
-            const int cellW   = (usW - (laidOut - 1) * cellGap) / laidOut;
-
-            for (int i = 0; i < kNumTimbres; ++i)
-            {
-                if (i < nT)
-                {
-                    // Last visible cell absorbs the integer-division remainder so
-                    // the row ends flush with the right edge.
-                    const int bw = (i == laidOut - 1) ? (usW - i * (cellW + cellGap))
-                                                      : cellW;
-                    timbreButtons[i].setBounds(padX + i*(cellW+cellGap), y, bw, timbreH);
-                    timbreButtons[i].setVisible(showTimbres && i < visibleCount);
-                }
-                else
-                {
-                    timbreButtons[i].setVisible(false);     // DRUMS button removed
-                    timbreButtons[i].setBounds(0, 0, 0, 0);
-                }
-            }
-            // THE HIDDEN ROW MUST NOT KEEP ITS HEIGHT.
-            //
-            // On a drum slot the timbre row is invisible, but y advanced past it
-            // anyway - so the kit grid started a full row lower than the slot
-            // buttons above it, with nothing in between.  That empty band was
-            // the whole "chaos" impression: the grid looked detached from the
-            // selector it belongs to.
-            if (showTimbres)
-            {
-                y += timbreH + secGap;
-                sectionDividers.add(y - secGap / 2);
-            }
-            else
-            {
-                y += secGap;
-            }
-        }
-
-        // Instrument row: 8 wide cells for melodic timbres, 16 half-width
-        // cells when DRUMS is active.  The cell COUNT changes with the
-        // selected timbre, hence the explicit handling here AND in selectTimbre.
-        // KIT CELLS MATCH THE SLOT BUTTONS.
+        // PACK > CATEGORY > INSTRUMENT reads left to right in the shape of the
+        // choice itself.  The old layout put the same three questions in three
+        // stacked horizontal rows, so you read across, then down, then down
+        // again - and each row had to be divided by its own item count, which is
+        // why a six-category pack sat in the left third of the canvas.
         //
-        // 26 kits in three rows is a lot of screen; at the melodic cell height
-        // (58 px) it dominates the tab.  At slotH they read as what they are -
-        // another selector row in the same family as DRUMS / PERC / BASS above -
-        // and all three rows fit where one melodic row used to.
-        instrRowY = y;
-        instrRowH = isCurrentSlotDrum() ? slotH : instrH;
-        layoutInstrCells();
+        // A DRUM SLOT DOES NOT USE THIS.  A kit is neither a pack nor a GM
+        // family, and its 9 composed + 18 sampled kits are a MATRIX, not a
+        // list - so drum slots keep the three-row kit grid they already had.
+        // The columns are hidden rather than emptied so nothing paints a
+        // heading over a band with nothing in it.
+        const bool drumSlot = isCurrentSlotDrum();
 
-        // A DRUM SLOT TAKES THREE ROWS, not one: the GM kits on top and the
-        // sampled kits on the two below.  The extra height comes out of the
-        // canvas beneath, which is the animation strip - it has room to give and
-        // nothing below it depends on a fixed top.
-        const int cellRows = isCurrentSlotDrum() ? 3 : 1;
-        y += instrRowH * cellRows + 2 * (cellRows - 1) + secGap;
-
-        // Reference-voice pills: one per band slot, aligned to the slot columns.
-        // The drum/perc view has no GM reference voices (you pick a kit), so the
-        // whole row is dropped there and its space handed back to the canvas.
-        if (! isCurrentSlotDrum())
+        if (! drumSlot)
         {
-            pillRowY = y; pillRowH = pillH;
-            // THE REF PILLS ARE RETIRED.
+            const int bandY = y;
+            const int bandH = juce::jmax (60, H - bandY - 4);
+
+            // PACK > CATEGORY > INSTRUMENT reads left to right in the shape of
+            // the choice itself.
             //
-            // They existed as the only route to a >= 200 reference sound, back
-            // when nothing else could reach that range.  The WORLD bank browses
-            // exactly the same flags with names, pages and the slot's own
-            // selector, so a second parallel picker is one mechanism too many -
-            // and the one that had no labels.
-            for (int i = 0; i < 8; ++i)
-            {
-                refPills[i].setVisible (false);
-                refPills[i].setBounds (0, 0, 0, 0);
-            }
+            // WIDTHS ARE PROPORTIONAL WITH FLOORS AND CEILINGS.  PACK holds
+            // three short words; CATEGORY holds sixteen GM families or pack
+            // FOLDER NAMES, which are the longest text on the surface;
+            // INSTRUMENT holds sound names.  Everything left over goes to the
+            // animation panel, which is the one thing that wants to be big.
+            const int arrowW = juce::jlimit (14, 26, usW / 55);
+            const int packW  = juce::jlimit (72, 150, (int) (usW * 0.105f));
+            const int catW   = juce::jlimit (98, 230, (int) (usW * 0.170f));
+            const int instW  = juce::jlimit (112, 260, (int) (usW * 0.200f));
 
-            // ── THE PAGE CONTROLS TAKE THE PILLS' PLACE ──────────────────────
-            // Same band, and it was already empty.  Left-aligned under the first
-            // cells rather than centred, so the eye goes cells -> pager without
-            // crossing the whole width.
-            {
-                const int pw = juce::jmin (34, usW / 12);
-                const int ph = juce::jmax (16, pillH - 4);
-                const int py = y + (pillH - ph) / 2;
-                const int capW = juce::jmax (40, pw + 14);
+            int cx = padX;
+            colPack    .setBounds (cx, bandY, packW, bandH); cx += packW;
+            arrowRect[0] = { cx, bandY, arrowW, bandH };     cx += arrowW;
+            colCategory.setBounds (cx, bandY, catW,  bandH); cx += catW;
+            arrowRect[1] = { cx, bandY, arrowW, bandH };     cx += arrowW;
+            colInstr   .setBounds (cx, bandY, instW, bandH); cx += instW;
 
-                // Reading order left to right: PAGE  -  +  3 / 7.  The caption
-                // sits before the buttons because it names what they move.
-                int px = padX;
-                pageCaption.setBounds (px, py, capW, ph);          px += capW + 6;
-                btnPagePrev.setBounds (px, py, pw,   ph);          px += pw + 4;
-                btnPageNext.setBounds (px, py, pw,   ph);          px += pw + 8;
-                pageLabel  .setBounds (px, py, pw * 3, ph);
+            colPack.setVisible (true);
+            colCategory.setVisible (true); colInstr.setVisible (true);
+
+            // ── PACK IS LIVE IN BOTH MODES ───────────────────────────────────
+            // A style slot has a bank exactly as a solo slot does - the old
+            // horizontal bank row was shown on every non-drum slot with no
+            // solo/style test at all, and syncTimbreToSlot resolves a pack flag
+            // for either mode.  A style slot holding a WORLD sound is exactly
+            // what IGNORE PROGRAM CHANGE exists to make stick.
+            colPack.setDimmed (false);
+
+            // The kit grid and every horizontal cell belong to the drum path
+            // now; hide them so a stale row cannot paint over a column.
+            instrRowY = bandY; instrRowH = 0;
+            layoutInstrCells();
+
+            // ── PAGE CONTROLS, UNDER THE INSTRUMENT COLUMN ────────────────────
+            // Where the thing they page is, rather than in a strip across the
+            // bottom that no longer exists.  Bottom-aligned inside the band.
+            {
+                const int ph  = juce::jmax (16, pillH - 4);
+                const int pw  = juce::jmin (30, instW / 5);
+                const int py  = bandY + bandH - ph - 2;
+                const int capW = juce::jmax (34, pw + 8);
+
+                int px = colInstr.getX() + 4;
+                pageCaption.setBounds (px, py, capW, ph);   px += capW + 4;
+                btnPagePrev.setBounds (px, py, pw,   ph);   px += pw + 3;
+                btnPageNext.setBounds (px, py, pw,   ph);   px += pw + 6;
+                pageLabel  .setBounds (px, py,
+                                       juce::jmax (24, colInstr.getRight() - px - 4), ph);
                 refreshPageControls();
             }
 
-            y += pillH + secGap;
-            sectionDividers.add(y - secGap / 2);
-        }
-        else
-        {
+            for (int i = 0; i < 8; ++i) { refPills[i].setVisible (false); refPills[i].setBounds (0,0,0,0); }
             pillRowH = 0;
-            for (int i = 0; i < 8; ++i)
+
+            // THE ANIMATION PANEL TAKES THE REST, as a tall block rather than
+            // the wide strip it used to be.
+            const int animX = cx + 6;
+            const int animW = padX + usW - animX;
+            if (animW > 60)
             {
-                refPills[i].setVisible(false);
-                refPills[i].setBounds(0, 0, 0, 0);
+                animBounds = { animX, bandY, animW, bandH };
+
+                // BOTH FROM ONE SPLIT - see animPanelSplit().  The picture is
+                // centred in the panel above the name band; the name is drawn
+                // into split.name by paint().
+                const auto split = animPanelSplit();
+
+                spaceAnim   .setBounds (animX, bandY, animW, bandH);
+                instrDisplay.setBounds (split.picture);
+                spaceAnim   .setVisible (true);
+                instrDisplay.setVisible (true);
+                spaceAnim.setAnimating (true);
+
+                btnEdit.setBounds (animX + 2, bandY + 2, 44, 20);
+                btnEdit.setVisible (true);
+                btnEdit.toFront (false);
+
+                const int ignW = juce::jlimit (56, 168, animW - 8);
+                btnIgnorePc .setBounds (animX + 2, bandY + 25, ignW, 18);
+                btnIgnorePc .setVisible (! soloMode);
+                btnIgnorePc .toFront (false);
+                refreshIgnorePcButton();
+
+                btnRestorePc.setBounds (animX + 2, bandY + 46, ignW, 18);
+                btnRestorePc.setVisible (! soloMode);
+                btnRestorePc.toFront (false);
             }
-            // A kit is not paged, and this whole band is gone on a drum slot.
-            btnPagePrev.setVisible (false);
-            btnPageNext.setVisible (false);
-            pageCaption.setVisible (false);
-            pageLabel  .setVisible (false);
+            else
+            {
+                animBounds = {};
+                spaceAnim.setVisible (false); instrDisplay.setVisible (false);
+                btnEdit.setVisible (false);
+                btnIgnorePc.setVisible (false);
+                btnRestorePc.setVisible (false);
+            }
+
+            refreshModeButtons(); refreshSlotButtons(); refreshBankButtons();
+            refreshTimbreButtons(); refreshInstrDisplay();
+            return;
         }
+
+        // ══ DRUM SLOT: the kit matrix, unchanged ═════════════════════════════
+        colPack.setVisible (false); colCategory.setVisible (false); colInstr.setVisible (false);
+        arrowRect[0] = arrowRect[1] = {};
+        btnPagePrev.setVisible (false);
+        btnPageNext.setVisible (false);
+        pageCaption.setVisible (false);
+        pageLabel  .setVisible (false);
+
+        // KIT CELLS MATCH THE SLOT BUTTONS: 26 kits in three rows at the
+        // melodic cell height would dominate the tab; at slotH they read as
+        // another selector row in the same family as DRUMS / PERC / BASS above.
+        instrRowY = y;
+        instrRowH = slotH;
+        layoutInstrCells();
+
+        // Three rows: the GM kits on top, the sampled kits on the two below.
+        y += instrRowH * 3 + 2 * 2 + secGap;
+
+        pillRowH = 0;
+        for (int i = 0; i < 8; ++i) { refPills[i].setVisible (false); refPills[i].setBounds (0,0,0,0); }
 
         const int animH = H - y - 4;
         if (animH > 20)
@@ -2070,6 +2809,13 @@ public:
             btnIgnorePc.setVisible(! soloMode);
             btnIgnorePc.toFront(false);
             refreshIgnorePcButton();
+
+            // Directly under IGNORE and the SAME SIZE, as asked - they read as
+            // the pair they are: one stops the style changing the slot, the
+            // other hands the slot back to it.
+            btnRestorePc.setBounds(padX + 2, y + 2 + 20 + 3 + 18 + 3, ignW, 18);
+            btnRestorePc.setVisible(! soloMode);
+            btnRestorePc.toFront(false);
         }
         else
         {
@@ -2077,17 +2823,21 @@ public:
             spaceAnim.setVisible(false); instrDisplay.setVisible(false);
             btnEdit.setVisible(false);
             btnIgnorePc.setVisible(false);
+            btnRestorePc.setVisible(false);
         }
 
-        refreshModeButtons(); refreshSlotButtons(); refreshTimbreButtons(); refreshInstrDisplay();
+        refreshModeButtons(); refreshSlotButtons(); refreshBankButtons();
+        refreshTimbreButtons(); refreshInstrDisplay();
     }
 
     void visibilityChanged() override { spaceAnim.setAnimating(isVisible()); }
 
 private:
     // ── GM data ───────────────────────────────────────────────────────────────
+    // 17 = the 16 GM melodic families + one historic DRUMS entry.  kTimbreNames
+    // is still sized by it, but only [0..15] are ever shown: the CATEGORY column
+    // lists melodic families, and a drum slot does not use the columns at all.
     static constexpr int kNumTimbres  = 17;
-    static constexpr int kDrumsTimbre = 16;  // index of the DRUMS button
 
     // When DRUMS is the active timbre the row below shows 9 half-width
     // cells instead of the 8 wide cells used for melodic timbres.  The cell
@@ -2101,12 +2851,18 @@ private:
     // for them, so clicking them silently did nothing.  Keeping the visible
     // list aligned to the engine guarantees PC and the selector are the
     // same code path.
-    static constexpr int kMaxInstrCells = 9;
+    static constexpr int kMaxInstrCells = 10;   // nine GM kits + EDM KIT
     static constexpr const char* kDrumKitNames [kMaxInstrCells] = {
         "Standard", "Room",  "Power",  "Electronic",
         "TR-808",   "Jazz",  "Brush",  "Orchestra",
-        "SFX"
+        "SFX",      "EDM Kit"
     };
+
+    // EDM KIT - the tenth cell.  Not a composed or sampled kit: Channel plays
+    // it with live synth voices (SynthKits.h), so it has no registry entry
+    // and no program number.  The cell loads kEdmDefaultKit.
+    static constexpr const char* kEdmDefaultKit = "EDM Dance";
+    static bool isEdmKitName (const juce::String& kit) { return kit.startsWith ("EDM "); }
 
     static constexpr const char* kTimbreNames[kNumTimbres] = {
         "PIANO","CHROM.","ORGAN","GUITAR",
@@ -2115,6 +2871,14 @@ private:
         "SYN.FX","ETHNIC","PERCUS.","SFX",
         "DRUMS"
     };
+
+    /** Solo slot carrying the harmony voice - must match
+    BetelgeuseProcessor::kHarmonySlot. */
+    static constexpr int kHarmonySoloSlot = 7;
+
+    /** GM 49 = String Ensemble 2 (0-based; index 48 is String Ensemble 1).
+        Verified against this file's own name table. */
+    static constexpr int kHarmonyDefaultPatch = 49;
 
     static constexpr const char* kStyleRoleNames[8] = {
         "DRUMS", "PERC", "BASS", "CHORD 1", "CHORD 2", "PAD", "LEAD 1", "LEAD 2"
@@ -2180,9 +2944,9 @@ private:
         void setActive(bool a) { active = a; repaint(); }
         void paintButton(juce::Graphics& g, bool isOver, bool isDown) override {
             auto b = getLocalBounds().toFloat();
-            g.setColour(active ? juce::Colour(0xFFCC6600) : isDown ? juce::Colour(0xFF444444) : isOver ? juce::Colour(0xFF333333) : juce::Colour(0xFF222222));
+            g.setColour(active ? juce::Colour(Betel::Pal::kAccent) : isDown ? juce::Colour(0xFF444444) : isOver ? juce::Colour(0xFF333333) : juce::Colour(0xFF222222));
             g.fillRoundedRectangle(b.reduced(0.5f), 5.0f);
-            g.setColour(active ? juce::Colour(0xFFCC6600).brighter(0.3f) : juce::Colour(0xFF555555));
+            g.setColour(active ? juce::Colour(Betel::Pal::kAccent).brighter(0.3f) : juce::Colour(0xFF555555));
             g.drawRoundedRectangle(b.reduced(0.5f), 5.0f, 1.0f);
             g.setColour(active ? juce::Colours::black : juce::Colours::white);
             g.setFont(juce::Font(juce::jmin(b.getHeight() * 0.40f, 13.0f), juce::Font::bold));
@@ -2194,32 +2958,220 @@ private:
     class SlotButton : public juce::TextButton {
     public:
         void setActive(bool a) { active = a; repaint(); }
+
+        /** PER INSTANCE, deliberately. The Betel::Pal::kAccent below is shared with
+            InstrButton and with SelectorColumn's selected-row text, so changing
+            that constant would turn the kit cells and every column selection
+            blue along with this one. */
+        void setHarmonyTint(bool h) { if (harmony == h) return; harmony = h; repaint(); }
+
         void paintButton(juce::Graphics& g, bool isOver, bool isDown) override {
             auto b = getLocalBounds().toFloat();
-            g.setColour(active ? juce::Colour(0xFFCC6600) : isDown ? juce::Colour(0xFF444444) : isOver ? juce::Colour(0xFF2E2E2E) : juce::Colour(0xFF232323));
+            const juce::Colour activeCol = harmony ? Betel::Harmonizer::harmonyBlue()
+                                                   : juce::Colour(Betel::Pal::kAccent);
+            g.setColour(active ? activeCol : isDown ? juce::Colour(0xFF444444) : isOver ? juce::Colour(0xFF2E2E2E) : juce::Colour(0xFF232323));
             g.fillRoundedRectangle(b.reduced(0.5f), 4.0f);
-            g.setColour(juce::Colour(0xFF555555)); g.drawRoundedRectangle(b.reduced(0.5f), 4.0f, 1.0f);
-            g.setColour(active ? juce::Colours::black : juce::Colours::white);
+            g.setColour(harmony ? activeCol : juce::Colour(0xFF555555));
+            g.drawRoundedRectangle(b.reduced(0.5f), 4.0f, 1.0f);
+            // BLACK ON GOLD READS; BLACK ON BLUE DOES NOT. The active text
+            // goes black because the amber is bright - the harmony blue is not,
+            // so its caption stays white whether the slot is selected or not.
+            g.setColour(harmony ? juce::Colours::white
+                                : active ? juce::Colours::black
+                                         : juce::Colours::white);
             g.setFont(juce::Font(juce::jmin(b.getHeight() * 0.38f, 11.0f), juce::Font::bold));
             g.drawText(getButtonText(), getLocalBounds(), juce::Justification::centred);
         }
-    private: bool active = false;
+    private: bool active = false; bool harmony = false;
     };
 
-    class TimbreButton : public juce::TextButton {
+    //==========================================================================
+    // SelectorColumn  -  ONE VERTICAL BAND OF THE PACK > CATEGORY > INSTRUMENT
+    // HIERARCHY.  Replaces the horizontal TimbreButton / InstrButton rows.
+    //==========================================================================
+    //
+    // WHY IT IS NOT A COLUMN OF BUTTONS.  Rob's rule for this surface is that
+    // there are NO horizontal separators between entries - they stay invisible.
+    // A button draws its own outline by definition, so forty of them stacked is
+    // forty boxes however faint the fill is.  Painting the rows here means the
+    // only ink on the whole selector is the text plus one vertical rule per
+    // column, which is the "table missing three of its borders" the feature
+    // panel already uses.
+    //
+    // SELECTION IS AMBER TEXT, NOT A FILL.  A border is what normally says
+    // "this one", and there are no borders here.  Gold is what selected
+    // already means everywhere else in this tab, so it carries with no new
+    // vocabulary.  Hover gets a faint wash - that is feedback, not state, and
+    // it disappears the moment the mouse leaves.
+    //
+    // TOP-ALIGNED WITH A CAPPED ROW HEIGHT.  Dividing the height by the item
+    // count would give the three-entry PACK column rows a third of the panel
+    // tall, and a six-category ORIENTAL pack rows twice the height of GM's
+    // sixteen.  Rows are a fixed size per column and stack from the top, so a
+    // short list is a short list rather than a stretched one.
+    //==========================================================================
+    class SelectorColumn : public juce::Component
+    {
     public:
-        void setActive(bool a) { active = a; repaint(); }
-        void paintButton(juce::Graphics& g, bool isOver, bool isDown) override {
-            auto b = getLocalBounds().toFloat();
-            g.setColour(active ? juce::Colour(0xFFCC6600) : isDown ? juce::Colour(0xFF444444) : isOver ? juce::Colour(0xFF2E2E2E) : juce::Colour(0xFF1E1E1E));
-            g.fillRoundedRectangle(b.reduced(0.5f), 4.0f);
-            g.setColour(active ? juce::Colour(0xFF885500) : juce::Colour(0xFF444444));
-            g.drawRoundedRectangle(b.reduced(0.5f), 4.0f, 1.0f);
-            g.setColour(active ? juce::Colours::black : juce::Colours::white);
-            g.setFont(juce::Font(juce::jmin(b.getHeight() * 0.40f, 10.0f), juce::Font::bold));
-            g.drawText(getButtonText(), getLocalBounds(), juce::Justification::centred);
+        std::function<void (int)> onRowClicked;
+
+        void setTitle (const juce::String& t) { title = t; repaint(); }
+        void setMaxRowH (int h)               { maxRowH = juce::jmax (12, h); }
+
+        /** THE RULE IS BETWEEN COLUMNS, so the last one does not get it: a rule
+            after INSTRUMENT would box that column against the animation panel
+            rather than separate it from a next column that does not exist. */
+        void setDrawRule (bool r) { drawRule = r; repaint(); }
+
+        /** Dimmed = present but not offering anything, which is the style-mode
+            PACK column.  Kept on screen rather than removed so the tab does not
+            change shape when the mode buttons are used. */
+        void setDimmed (bool d) { dimmed = d; repaint(); }
+
+        void setItems (const juce::StringArray& names)
+        {
+            items = names;
+            // A PLAIN LOOP, not insertMultiple: every other container fill in
+            // this project uses resize() or add(), and a one-line convenience
+            // that nothing else here uses is exactly what turned into a build
+            // break two edits ago.
+            numbers.clear();
+            for (int k = 0; k < items.size(); ++k) numbers.add (-1);
+
+            // A SHORTER LIST MUST NOT KEEP A LONGER LIST'S INDEX.  Every caller
+            // does set the selection immediately afterwards, but setSelected
+            // early-returns when the value is unchanged - so a stale index that
+            // happens to equal the new one would survive as a highlight on a
+            // different sound.  Clamped here, where the list changes.
+            if (selected >= items.size()) selected = -1;
+            hovered = -1;
+            repaint();
         }
-    private: bool active = false;
+
+        /** Right-aligned trailing number per row - the GM program change, or a
+            pack flag.  -1 hides it. */
+        void setNumber (int row, int n)
+        {
+            if (row >= 0 && row < numbers.size() && numbers[row] != n)
+            { numbers.set (row, n); repaint(); }
+        }
+
+        void setSelected (int idx)
+        {
+            if (selected == idx) return;
+            selected = idx; repaint();
+        }
+
+        int  getSelected()   const noexcept { return selected; }
+        bool hasSelection()  const noexcept { return selected >= 0 && selected < items.size(); }
+        int  getNumItems()   const noexcept { return items.size(); }
+
+        /** Height one row wants, so the caller can size the column to its
+            content instead of guessing. */
+        int rowHeightFor (int availableH) const noexcept
+        {
+            const int n = juce::jmax (1, items.size());
+            return juce::jlimit (13, maxRowH, availableH / n);
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            const int w = getWidth(), h = getHeight();
+            int y = 0;
+
+            if (title.isNotEmpty())
+            {
+                g.setColour (juce::Colours::white.withAlpha (dimmed ? 0.18f : 0.38f));
+                g.setFont (juce::Font (9.5f, juce::Font::bold));
+                g.drawFittedText (title, juce::Rectangle<int> (2, 0, w - 8, kTitleH),
+                                  juce::Justification::centredLeft, 1);
+                y = kTitleH;
+            }
+
+            const int rowH = rowHeightFor (juce::jmax (1, h - y));
+            const float fh = juce::jlimit (8.5f, 12.0f, rowH * 0.58f);
+
+            for (int i = 0; i < items.size(); ++i)
+            {
+                const int ry = y + i * rowH;
+                if (ry + rowH > h) break;                 // never draw past the band
+
+                const juce::Rectangle<int> row (0, ry, w - 4, rowH);
+
+                // HOVER IS THE ONLY FILL, and only when the column is live.
+                if (i == hovered && ! dimmed)
+                {
+                    g.setColour (juce::Colours::white.withAlpha (0.07f));
+                    g.fillRect (row);
+                }
+
+                const bool sel = (i == selected);
+                g.setColour (dimmed  ? juce::Colours::white.withAlpha (0.16f)
+                           : sel     ? juce::Colour (Betel::Pal::kAccent).brighter (0.35f)
+                                     : juce::Colours::white.withAlpha (0.72f));
+                // THE PROVEN IDIOM IN THIS FILE, deliberately.  My first attempt
+                // was `withStyle ("Bold")`, which does not compile: Font::withStyle
+                // takes the int FontStyleFlags and the string overload is called
+                // withTypefaceStyle.  Rather than reach for a third spelling,
+                // this is the exact two-argument form every other font in
+                // SoundsTab.h already uses and that therefore certainly builds.
+                g.setFont (juce::Font (fh, sel ? juce::Font::bold : juce::Font::plain));
+
+                // The trailing number needs its own lane or a long name runs
+                // straight through it.
+                const int numW = numbers[i] >= 0 ? juce::jmin (30, w / 4) : 0;
+                g.drawFittedText (items[i], row.withTrimmedLeft (6).withTrimmedRight (numW + 2),
+                                  juce::Justification::centredLeft, 1);
+
+                if (numbers[i] >= 0)
+                {
+                    g.setColour (dimmed ? juce::Colours::white.withAlpha (0.12f)
+                                        : sel ? juce::Colour (Betel::Pal::kAccent).withAlpha (0.85f)
+                                              : juce::Colours::white.withAlpha (0.30f));
+                    g.setFont (juce::Font (juce::jmax (7.5f, fh - 2.0f), juce::Font::plain));
+                    g.drawFittedText (juce::String (numbers[i]),
+                                      row.withTrimmedRight (4), juce::Justification::centredRight, 1);
+                }
+            }
+
+            // NO HORIZONTAL SEPARATORS ANYWHERE - see the header comment.  The
+            // vertical rule is the only long line this control ever draws.
+            if (drawRule)
+            {
+                g.setColour (juce::Colours::white.withAlpha (dimmed ? 0.10f : 0.22f));
+                g.drawVerticalLine (w - 1, 0.0f, (float) h);
+            }
+        }
+
+        void mouseMove (const juce::MouseEvent& e) override  { setHover (rowAt (e.y)); }
+        void mouseExit (const juce::MouseEvent&)   override  { setHover (-1); }
+
+        void mouseUp (const juce::MouseEvent& e) override
+        {
+            if (dimmed) return;
+            const int r = rowAt (e.y);
+            if (r >= 0 && r < items.size() && onRowClicked) onRowClicked (r);
+        }
+
+    private:
+        static constexpr int kTitleH = 13;
+
+        int rowAt (int py) const noexcept
+        {
+            const int top = title.isNotEmpty() ? kTitleH : 0;
+            if (py < top) return -1;
+            const int rowH = rowHeightFor (juce::jmax (1, getHeight() - top));
+            const int r = (py - top) / juce::jmax (1, rowH);
+            return r < items.size() ? r : -1;
+        }
+
+        void setHover (int r) { if (hovered != r) { hovered = r; repaint(); } }
+
+        juce::StringArray items;
+        juce::Array<int>  numbers;
+        juce::String      title;
+        int  selected = -1, hovered = -1, maxRowH = 26;
+        bool drawRule = true, dimmed = false;
     };
 
     class InstrButton : public juce::TextButton {
@@ -2228,7 +3180,7 @@ private:
         void setProgramNumber(int n) { programNumber = n; repaint(); }   // -1 = hide
         void paintButton(juce::Graphics& g, bool isOver, bool isDown) override {
             auto b = getLocalBounds().toFloat();
-            g.setColour(active ? juce::Colour(0xFFCC6600) : isDown ? juce::Colour(0xFF444444) : isOver ? juce::Colour(0xFF2E2E2E) : juce::Colour(0xFF202020));
+            g.setColour(active ? juce::Colour(Betel::Pal::kAccent) : isDown ? juce::Colour(0xFF444444) : isOver ? juce::Colour(0xFF2E2E2E) : juce::Colour(0xFF202020));
             g.fillRoundedRectangle(b.reduced(0.5f), 4.0f);
             g.setColour(juce::Colour(0xFF555555)); g.drawRoundedRectangle(b.reduced(0.5f), 4.0f, 1.0f);
             g.setColour(active ? juce::Colours::black : juce::Colours::white);
@@ -2244,7 +3196,7 @@ private:
             g.setFont(juce::Font(juce::jmin(b.getHeight() * 0.36f, 10.0f), juce::Font::bold));
             g.drawText(getButtonText(), getLocalBounds(), juce::Justification::centred);
             if (programNumber >= 0) {
-                g.setColour(active ? juce::Colours::white.withAlpha(0.85f) : juce::Colour(0xFFCC8844));
+                g.setColour(active ? juce::Colours::white.withAlpha(0.85f) : juce::Colour(Betel::Pal::kAccentWarm));
                 g.setFont(juce::Font(juce::jmin(b.getHeight() * 0.16f, 9.0f), juce::Font::bold));
                 g.drawText(juce::String(programNumber), getLocalBounds().reduced(4, 2),
                            juce::Justification::topRight);
@@ -2255,7 +3207,14 @@ private:
 
     // ── Components ────────────────────────────────────────────────────────────
     ModeButton              btnModeSolo, btnModeStyle;
-    ModeButton              btnBankGm, btnBankWorld, btnBankOriental;
+    // THE THREE VERTICAL BANDS.  PACK > CATEGORY > INSTRUMENT, which is the
+    // order the choice is actually made in - and now the shape of it too.
+    SelectorColumn          colPack, colCategory, colInstr;
+
+    // Where the two hierarchy arrows are painted, filled by resized().  Empty
+    // on a drum slot, where the columns are not used at all.
+    juce::Rectangle<int>    arrowRect[2];
+    bool                    linking = false;   // see setSoloGainFromMixer
     /** Page down / page up within the selected category.  Small, and parked in
         the row the retired reference pills used to occupy - that space was
         already reserved and sat empty. */
@@ -2266,7 +3225,7 @@ private:
         inline static, not plain static const: this class lives entirely in a
         header, and a plain static const member would need an out-of-line
         definition in some .cpp to link at all. */
-    inline static const juce::Colour kPageYellow { juce::Colour (0xFFE8C33A) };
+    inline static const juce::Colour kPageYellow { juce::Colour (Betel::Pal::kNav) };
 
     /** "PAGE" caption on the left, then the counter.  Two labels rather than one
         string so the caption can stay put while the count changes under it. */
@@ -2279,7 +3238,7 @@ private:
         column grid across all three rows is what makes it read as a matrix
         rather than three unrelated strips, and it costs nothing: the last row
         simply leaves its final cell empty. */
-    static constexpr int kFullKitsPerRow  = 9;
+    static constexpr int kFullKitsPerRow  = kMaxInstrCells;   // every row of the matrix, one column count
     static constexpr int kMaxFullKitCells = kFullKitsPerRow * 2;
     InstrButton             fullKitButtons[kMaxFullKitCells];
     std::vector<std::tuple<int,int,int,juce::String>> fullKits;
@@ -2291,6 +3250,10 @@ private:
         with two optional packs that is no longer the question.  `worldBank` is
         kept as a derived helper below so the many `if (worldBank)` sites that
         mean "not the GM grid" still read correctly. */
+    /** GM, WORLD, ORIENTAL - matching SamplePlayerEngine::kNumSoundPacks.  A
+        local constant rather than the engine's enum because this tab talks to
+        the host through callbacks and includes no engine header. */
+    static constexpr int    kNumPacks = 3;
     int                     selectedPack = 0;
     bool isPackBank() const { return selectedPack != 0; }
 
@@ -2300,7 +3263,7 @@ private:
     /** Cached WORLD list, refreshed on entry so a library rescan is picked up. */
     std::vector<std::pair<int, juce::String>> worldInstruments;
     SlotButton              slotButtons[8];
-    TimbreButton            timbreButtons[kNumTimbres];
+    juce::TextButton        btnGlobalFx;
     InstrButton             instrButtons[kMaxInstrCells];
 
     // Live mirror of the engine's kit identity per slot - see getSlotKitKey.
@@ -2310,9 +3273,11 @@ private:
     InstrImageDisplay       instrDisplay;
     juce::TextButton        btnEdit;
     juce::TextButton        btnIgnorePc;
+    juce::TextButton        btnRestorePc;
 
     std::unique_ptr<InstrEditorWindow> editorWindow;
     std::unique_ptr<DrumsPopup>        drumsPopup;
+    std::unique_ptr<EdmKitWindow>      edmWindow;     // EDM KIT editor, see toggleEdmKitWindow
 
     bool soloMode     = true;
     int  selectedSlot = 0;
@@ -2355,6 +3320,27 @@ private:
     // ── Drum-slot helpers ─────────────────────────────────────────────────────
     // Drum-ness is fixed by ROLE: in STYLE mode the first two slots are DRUMS
     // and PERC (drum channels by definition); every SOLO slot is melodic.
+    //==========================================================================
+    // WHOSE BASE UNITY IS IT?  One function, because the answer differs by slot
+    // and every place that pushes a gain needs the same answer.
+    //
+    //   STYLE, melodic  -> THE SET.  A style slot must never consult a .ins for
+    //                      anything; the set and the style own it completely.
+    //   SOLO            -> THE .ins.  That file defines the solo sound editor,
+    //                      and nothing else does.
+    //   DRUM            -> THE KIT.  A kit's base travels per-KIT in the set's
+    //                      KitUnity block, not per-slot, so SlotParams.baseUnityDb
+    //                      is deliberately not written for drum slots and would
+    //                      be stale if read.  Ask the host, which resolves it.
+    //==========================================================================
+    float effectiveBaseUnityDb (int slot, bool isSolo, const SlotParams& p) const
+    {
+        if (! isSolo && ! roleIsDrum (isSolo, slot))
+            return p.baseUnityDb;
+
+        return onGetBaseUnity ? onGetBaseUnity (slot, isSolo) : 0.0f;
+    }
+
     static bool roleIsDrum (bool solo, int slot)
     {
         return (! solo) && (slot == 0 || slot == 1);
@@ -2493,6 +3479,30 @@ private:
         return juce::ImageFileFormat::loadFrom(data, (size_t)sz);
     }
 
+    /** The EDM KIT's logo, shown whenever a slot holds one of the synth kits.
+        DEDM.png, or the picture in "instrumet images" with EDM in its file
+        name (see CMakeLists).  Found by its ORIGINAL file name, so whatever the
+        file is called, the mangled BinaryData symbol never has to be guessed.
+        Not embedded -> an invalid image, and the panel stays empty. */
+    static juce::Image loadEdmKitImage()
+    {
+        int sz = 0;
+        if (const char* data = BinaryData::getNamedResource ("DEDM_png", sz); data != nullptr && sz > 0)
+            return juce::ImageFileFormat::loadFrom (data, (size_t) sz);
+
+        for (int i = 0; i < BinaryData::namedResourceListSize; ++i)
+        {
+            const char* res = BinaryData::namedResourceList[i];
+            const juce::String file (BinaryData::getNamedResourceOriginalFilename (res));
+            const bool picture = file.endsWithIgnoreCase (".png") || file.endsWithIgnoreCase (".jpg")
+                              || file.endsWithIgnoreCase (".jpeg");
+            if (picture && file.containsIgnoreCase ("edm"))
+                if (const char* data = BinaryData::getNamedResource (res, sz); data != nullptr && sz > 0)
+                    return juce::ImageFileFormat::loadFrom (data, (size_t) sz);
+        }
+        return {};
+    }
+
     void reloadInstrImage()
     {
         // DRUM SLOTS get their kit's picture.  This used to clear the display
@@ -2502,6 +3512,18 @@ private:
         // InstrImageDisplay::paint draws nothing for one.
         if (isCurrentSlotDrum())
         {
+            // THE EDM KIT (the drum synth) shows its own logo, whichever of its
+            // kits the slot holds - picked in SOUNDS or called by a style.  Asked
+            // before anything else: an EDM name never maps to a numbered kit
+            // picture, and the engine clears its full-kit flag whenever it
+            // publishes a synth kit, so the two answers below cannot claim it.
+            if (isEdmKitName (currentSlotParams().drumKit.lastLoadedKit))
+            {
+                instrDisplay.set (loadEdmKitImage());
+                repaint();
+                return;
+            }
+
             // A SAMPLED KIT IS ASKED ABOUT FIRST, and asked of the ENGINE.
             //
             // lastLoadedKit carries a sampled kit's readable label ("Arabic
@@ -2547,8 +3569,104 @@ private:
     // ── Editor popup helpers ──────────────────────────────────────────────────
     void toggleEditorWindow()
     {
-        if (isCurrentSlotDrum()) { toggleDrumsPopup(); return; }
+        if (isCurrentSlotDrum())
+        {
+            // EDM KIT: a synth kit has its own editor; the drum editor is
+            // built for sampled kits.
+            if (isEdmKitName (currentSlotParams().drumKit.lastLoadedKit)) { toggleEdmKitWindow(); return; }
+            toggleDrumsPopup();
+            return;
+        }
         toggleMelodicEditorWindow();
+    }
+
+    //==========================================================================
+    //  EDM KIT editor.  Edits the SELECTED slot's synth kit live: every change
+    //  is published exactly like a kit load (Channel swaps the cells without
+    //  cutting ringing hits) and lands in the slot's DrumKitParams, so the set
+    //  saves it with everything else.
+    //==========================================================================
+    void toggleEdmKitWindow()
+    {
+        if (editorWindow && editorWindow->isVisible()) editorWindow->setVisible (false);
+        if (drumsPopup   && drumsPopup->isVisible())   drumsPopup->setVisible (false);
+
+        if (edmWindow && edmWindow->isVisible())
+        {
+            closeEdmKitWindow();
+            return;
+        }
+
+        if (! edmWindow)
+        {
+            edmWindow = std::make_unique<EdmKitWindow>();
+            edmWindow->onClosed = [this]
+            {
+                btnEdit.setColour (juce::TextButton::buttonColourId, juce::Colour (0xFF222222));
+            };
+
+            auto& ed = edmWindow->getEditor();
+            ed.onKitChanged = [this] (const juce::String& baseKit, const juce::String& cells)
+            {
+                // Only ever write into a slot that still holds an EDM kit.  If a
+                // sampled kit arrived meanwhile, the edit has nowhere to go:
+                // close rather than overwrite it.
+                if (! isCurrentSlotDrum() || ! isEdmKitName (currentSlotParams().drumKit.lastLoadedKit))
+                {
+                    closeEdmKitWindow();
+                    return;
+                }
+                auto& dk = currentSlotParams().drumKit;
+                dk.lastLoadedKit = baseKit;
+                dk.edmKit        = cells;
+                publishDrumKit (selectedSlot, soloMode, dk);
+                refreshInstrDisplay();
+            };
+            ed.onNoteOn = [this] (int note, int vel)
+            {
+                if (onEditorNoteOn) onEditorNoteOn (selectedSlot, soloMode, note, vel);
+            };
+            ed.onNoteOff = [this] (int note)
+            {
+                if (onEditorNoteOff) onEditorNoteOff (selectedSlot, soloMode, note);
+            };
+            ed.onQueryPadActivity = [this] (uint32_t* mask)
+            {
+                if (onQueryPadActivity) onQueryPadActivity (selectedSlot, soloMode, mask);
+            };
+        }
+
+        const auto& dk = currentSlotParams().drumKit;
+        edmWindow->getEditor().setKit (dk.lastLoadedKit, dk.edmKit);
+        edmWindow->getEditor().setSlotLabel (buildSlotLabel());
+        edmWindow->openCentredOver (getTopLevelComponent(), 0.78f);
+        btnEdit.setColour (juce::TextButton::buttonColourId, juce::Colour (Betel::Pal::kAccent));
+    }
+
+    void closeEdmKitWindow()
+    {
+        if (edmWindow && edmWindow->isVisible())
+        {
+            edmWindow->setVisible (false);
+            btnEdit.setColour (juce::TextButton::buttonColourId, juce::Colour (0xFF222222));
+        }
+    }
+
+    // The window follows the selected slot: another EDM slot reloads it,
+    // anything else closes it.
+    void syncEdmWindowToSlot()
+    {
+        if (! edmWindow || ! edmWindow->isVisible()) return;
+        const auto& dk = currentSlotParams().drumKit;
+        if (isCurrentSlotDrum() && isEdmKitName (dk.lastLoadedKit))
+        {
+            edmWindow->getEditor().setKit (dk.lastLoadedKit, dk.edmKit);
+            edmWindow->getEditor().setSlotLabel (buildSlotLabel());
+        }
+        else
+        {
+            closeEdmKitWindow();
+        }
     }
 
     void toggleMelodicEditorWindow()
@@ -2579,7 +3697,13 @@ private:
             };
 
             editorWindow->onParamsChanged = [this](const SlotParams& p) { saveCurrentSlotParams(p); };
-            editorWindow->onBaseUnityRequested = [this] { showBaseUnityDialog(); };
+            // BASE VOLUME, SOLO ONLY - and checked when the dialog is asked for
+            // rather than when the window is built, because one window serves
+            // every slot and the mode can change under it.
+            editorWindow->onBaseUnityRequested = [this]
+            {
+                if (soloMode) showBaseUnityDialog();
+            };
 
             editorWindow->onFreezeToggled = [this] (bool f)
             {
@@ -2638,12 +3762,16 @@ private:
 
         editorWindow->setSoloMode(soloMode);
 
+        if (onGetEnergyCurveOffset)
+            editorWindow->setEnergyOffset (onGetEnergyCurveOffset());
+
+
         pushSlotIntoEditor();
         if (editorWindow && onGetBlobPresetNames)
             editorWindow->setPresetList(onGetBlobPresetNames());
 
         editorWindow->openCentredOver(getTopLevelComponent(), 0.8f);
-        btnEdit.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFFCC6600));
+        btnEdit.setColour(juce::TextButton::buttonColourId, juce::Colour(Betel::Pal::kAccent));
     }
 
     void toggleDrumsPopup()
@@ -2720,7 +3848,11 @@ private:
                 if (onSfzToggled) onSfzToggled (selectedSlot, soloMode, on);
             };
 
-            drumsPopup->onBaseUnityRequested = [this] { showBaseUnityDialog(); };
+            // NO BASE VOLUME ON DRUMS.  The per-family sliders stay - they are
+            // an "after decision" over the style's kit level, which is exactly
+            // what the model allows - but a base-unity calibration would be a
+            // second authority over the same channel level.
+            drumsPopup->onBaseUnityRequested = nullptr;
 
             drumsPopup->onKitGainChanged = [this] (float gainPercent)
             {
@@ -2728,7 +3860,10 @@ private:
                 // carries it to the engine and the ordinary .drm / set save
                 // carries it to disk — no separate path to keep in step.
                 currentSlotParams().gainPercent = gainPercent;
-                if (onSlotGainChanged) onSlotGainChanged (selectedSlot, soloMode, gainPercent);
+                if (onSlotGainChanged)
+                    onSlotGainChanged (selectedSlot, soloMode, gainPercent,
+                                       effectiveBaseUnityDb (selectedSlot, soloMode,
+                                                             currentSlotParams()));
             };
 
             drumsPopup->onKitFxChanged = [this] (const DrumKitFxParams& fx)
@@ -2792,7 +3927,7 @@ private:
         drumsPopup->setSlotLabel     (buildSlotLabel());
         drumsPopup->openCentredOver  (getTopLevelComponent(), 0.78f);
 
-        btnEdit.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFFCC6600));
+        btnEdit.setColour(juce::TextButton::buttonColourId, juce::Colour(Betel::Pal::kAccent));
     }
 
     //==========================================================================
@@ -2807,7 +3942,28 @@ private:
     {
         if (! onSetBaseUnity) return;
 
-        const float current = onGetBaseUnity ? onGetBaseUnity (selectedSlot, soloMode) : 0.0f;
+        // ── ASK THE OWNER, NOT THE FILE ──────────────────────────────────────
+        //
+        // This read used to go straight to onGetBaseUnity, which resolves
+        // through the preset files - and melodicPresetFor REFUSES style
+        // channels, so for a melodic style slot it found nothing and answered
+        // 0.0 dB every single time, whatever the set actually held.
+        //
+        // The dialog therefore opened at 0.00 on a slot that was playing at,
+        // say, -6, and pressing SAVE on what it showed wrote that 0 into the
+        // set for real. The value looked like it was "not being saved"; it was
+        // being saved correctly and then displayed as gone, and the next visit
+        // to the dialog destroyed it.
+        //
+        // effectiveBaseUnityDb is the function that already decides whose base
+        // a slot's base IS - the set for a melodic style slot, the .ins for the
+        // right hand, the per-kit map for a kit. The WRITE side was routed
+        // through it when the same defect was found in commitSlotParamsToEngine
+        // (see the note on onSlotGainChanged in MainComponent). The READ side
+        // was left resolving through the file, which is the identical bug
+        // pointing the other way.
+        const float current = effectiveBaseUnityDb (selectedSlot, soloMode,
+                                                    currentSlotParams());
 
         // Say where it lands, because the two are not the same thing.  A KIT's
         // base belongs to the SET and to that one kit - composed and sampled
@@ -2865,9 +4021,21 @@ private:
         return onGetPresetParams && onGetPresetParams (slot, isSolo, unused);
     }
 
+    /** The GM program of the slot the editor shows, for the SOUND ENGINE tab;
+        -1 on a drum slot. */
+    int editedEngineProgram() const
+    {
+        const int s = selectedSlot;
+        if (s < 0 || s >= 8) return -1;
+        if (! soloMode && styleIsDrumSlot[(size_t) s]) return -1;
+        return soloMode ? soloPatch[(size_t) s] : stylePatch[(size_t) s];
+    }
+
     void pushSlotIntoEditor()
     {
+        syncEdmWindowToSlot();   // EDM KIT window follows the slot (or closes)
         if (!editorWindow) return;
+        editorWindow->setEngineProgram (editedEngineProgram());   // SOUND ENGINE tab
 
         // SOLO SLOTS ONLY.
         //
@@ -2930,6 +4098,12 @@ private:
         // voice" in this sense.  Channel::renderBlock's useBand test mirrors
         // exactly this split, or the controls would be inert.
         editorWindow->setBandMode (soloMode || (selectedSlot >= 3 && selectedSlot <= 7));
+
+        // THE PER-SOUND GAIN IS SOLO-ONLY.  On a style slot the style states the
+        // level and the mixer fader is the single adjustment on top; a GAIN trim
+        // here would be a second authority over the same number, which is the
+        // arrangement that cost a night of "the set's gain keeps reverting".
+        editorWindow->setGainVisible (soloMode);
         editorWindow->setSlotLabel(buildSlotLabel());
 
         // setSlotParams only *seeds* the editor (GoldSlider::setValue does not
@@ -3099,12 +4273,56 @@ private:
         const float prevGain = dst.gainPercent;
         dst = p;
 
+        // The three mix/wet fields in `p` are the SENDS now, per slot, and reach
+        // the engine through commitSlotParamsToEngine like every other field.
+        // Nothing here writes the shared rack — that is the GLOBAL EFFECTS
+        // window's job alone.
+
         if (p.gainPercent != prevGain && onSlotGainChanged)
-            onSlotGainChanged (selectedSlot, soloMode, p.gainPercent);
+            onSlotGainChanged (selectedSlot, soloMode, p.gainPercent,
+                               effectiveBaseUnityDb (selectedSlot, soloMode, p));
+
+        // AND THE MIXER FOLLOWS, on solo only.  Guarded by `linking` so a move
+        // that ORIGINATED at the mixer does not bounce straight back.
+        if (p.gainPercent != prevGain && soloMode && ! linking && onSoloGainToMixer)
+        {
+            linking = true;
+            onSoloGainToMixer (selectedSlot, p.gainPercent * 0.01f);
+            linking = false;
+        }
 
         if (onClickParamsChanged)
             onClickParamsChanged(selectedSlot, soloMode,
                                  p.clickEnabled, p.clickVolume, p.clickDecayMs);
+
+        //----------------------------------------------------------------------
+        // THE SWEETENER, ON ITS OWN ROUTE - AND THIS IS WHERE IT WENT MISSING.
+        //
+        // slotParamsToChannelParams deliberately does NOT convert sp.sweet: the
+        // sweetener belongs to the SLOT and must survive an instrument change,
+        // so it never travels on the bulk params path. That decision is correct
+        // and its own comment says so.
+        //
+        // But it means every caller has to push the sweetener SEPARATELY, and
+        // this one - the handler for every edit made in the instrument editor -
+        // never did. commitSlotParamsToEngine remembered; this did not. So
+        // turning SWEETEN on for a melodic slot updated the stored SlotParams
+        // and sent everything EXCEPT the one field that had just changed:
+        // Channel::sweetEnabled stayed false, applySweetenerInPlace returned on
+        // its first line, and the block did nothing at all. The meters looked
+        // broken for the same reason - they report a processor that was never
+        // running.
+        //
+        // Drums were unaffected because the kit editor pushes through the drum
+        // FX state instead (Channel.cpp applySweetenerParams), which is why one
+        // side worked and the other did not.
+        //
+        // Same guard as commitSlotParamsToEngine: style slots 0 and 1 are the
+        // kit and the percussion, and those go the drum route.
+        //----------------------------------------------------------------------
+        if (onSweetenerChanged && ! roleIsDrum (soloMode, selectedSlot))
+            onSweetenerChanged (selectedSlot, soloMode, p.sweet);
+
         if (onSlotParamsChanged)
             onSlotParamsChanged (selectedSlot, soloMode, p);
     }
@@ -3138,16 +4356,77 @@ public:
     static juce::String displayNameForKit (const juce::String& kit)
     {
         if (kit.isEmpty()) return {};
+
+        // EDM KIT: exactly the name the EDM editor's kit list shows.  A set that
+        // still stores an old program-number name ("EDM PC69") resolves to the
+        // kit it became, so the canvas never shows an alias.
+        if (isEdmKitName (kit))
+        {
+            if (const auto* k = edm::findKit (kit.toStdString()))
+                return juce::String (k->name);
+            return kit;
+        }
+
+        // THE COMPARISONS USE THE RAW STRING, the RETURN is prettied.  `kit` is
+        // the stored identifier a slot and a saved set hold, so matching it
+        // against the tables must happen before any cosmetic change - only the
+        // value handed back to be drawn gets the underscores taken out.
         for (int i = 0; i < kMaxInstrCells; ++i)
             if (kit == kDrumKitNames[i] || registryKeyForKitName (kDrumKitNames[i]) == kit)
-                return kDrumKitNames[i];
-        return kit;
+                return Betel::prettyName (kDrumKitNames[i]);
+
+        // ── A SAMPLED KIT LOSES ITS NUMERIC PREFIX ───────────────────────────
+        //
+        // Composed kits arrive as a registry key and are resolved above. Sampled
+        // full kits arrive as their FOLDER NAME - "126-000-036_Arabic Kit" - and
+        // that is a name with a bank/PC address bolted to the front. On a button
+        // the address is what survives the elision, so the caption reads as a
+        // number again: the same complaint as a bare "000", from the other
+        // direction.
+        //
+        // Only a leading <digits>-<digits>-<digits>_ is removed, and only when
+        // something is left after it, so a kit genuinely called "808" keeps its
+        // name. Display only - every comparison above ran on the raw string.
+        const auto name = Betel::prettyName (kit);
+
+        // prettyName has already turned the underscore into a space, so the
+        // split is on the FIRST space and there is only one case to handle.
+        const int cut = name.indexOfChar (' ');
+        if (cut > 0)
+        {
+            const auto head = name.substring (0, cut);
+            const auto tail = name.substring (cut + 1).trim();
+
+            if (tail.isNotEmpty()
+                && head.containsOnly ("0123456789-")
+                && head.containsChar ('-'))
+                return tail;
+        }
+        return name;
     }
 private:
 
     // ── Drum-kit cell helpers ─────────────────────────────────────────────────
     void loadDrumKitIntoCurrentSlot (const juce::String& kitName)
     {
+        // EDM KIT: no registry, no preset map - the synth kit is published by
+        // name and Channel plays it live.  Its DrumKitParams deliberately has
+        // NO mapped keys (see Channel::loadDrumKit for why).
+        if (isEdmKitName (kitName))
+        {
+            DrumKitParams dk;
+            dk.lastLoadedKit = kEdmDefaultKit;
+            currentSlotParams().drumKit = dk;
+            publishDrumKit (selectedSlot, soloMode, dk);
+            publishKitFx   (selectedSlot, soloMode, dk.fx);
+            if (drumsPopup && drumsPopup->isVisible())
+                drumsPopup->setVisible (false);     // that editor is for sampled kits
+            syncEdmWindowToSlot();                    // an open EDM window reloads
+            refreshInstrDisplay();
+            repaint();
+            return;
+        }
+
         if (! onGetDrumKitRegistry) return;
         auto* reg = onGetDrumKitRegistry();
         if (reg == nullptr) return;
@@ -3213,6 +4492,7 @@ private:
 
         publishDrumKit (selectedSlot, soloMode, dk);
         publishKitFx   (selectedSlot, soloMode, dk.fx);
+        syncEdmWindowToSlot();   // a sampled kit closes the EDM KIT window
 
         if (drumsPopup && drumsPopup->isVisible())
         {
@@ -3248,12 +4528,24 @@ private:
     void selectSlot(int i)
     {
         const bool wasDrum = isCurrentSlotDrum();
+        const int  wasPack = selectedPack;
         selectedSlot = juce::jlimit(0, 7, i);
         syncTimbreToSlot();
-        refreshSlotButtons(); refreshTimbreButtons(); refreshInstrDisplay();
+
+        // THE BANK CAN MOVE NOW, so the bank row and the cell grid have to be
+        // refreshed too - selecting a slot never changed the bank before, so
+        // neither was in this list. Without them, stepping from a GM slot to a
+        // WORLD one relabelled the categories and left GM lit above a grid
+        // still laid out for program numbers.
+        refreshBankButtons();
+        refreshSlotButtons(); refreshTimbreButtons();
+        layoutInstrCells();
+        refreshInstrDisplay();
         reloadInstrImage();
         pushSlotIntoEditor();
-        if (wasDrum != isCurrentSlotDrum())
+        // The page +/- pair is only present in a pack, so a bank change needs the
+        // same relayout a drum/melodic change does.
+        if (wasDrum != isCurrentSlotDrum() || wasPack != selectedPack)
             resized();   // timbre row visibility flips with slot type
 
         if (drumsPopup && drumsPopup->isVisible())
@@ -3313,7 +4605,7 @@ private:
         World, it is a kit - so the selector is hidden there. */
     void setPack (int pack)
     {
-        selectedPack = juce::jlimit (0, 2, pack);
+        selectedPack = juce::jlimit (0, kNumPacks - 1, pack);
 
         // The category list belongs to the pack, so it is refetched on every
         // switch rather than cached per pack: a user can drop a pack folder in
@@ -3338,9 +4630,7 @@ private:
 
     void refreshBankButtons()
     {
-        btnBankGm      .setActive (selectedPack == 0);
-        btnBankWorld   .setActive (selectedPack == 1);
-        btnBankOriental.setActive (selectedPack == 2);
+        colPack.setSelected (selectedPack);
     }
 
     /** Pull the current category's sounds.  Called on every pack, category and
@@ -3444,36 +4734,102 @@ private:
         if (onInstrumentSelected) onInstrumentSelected(soloMode, selectedSlot, slotPatch);
     }
 
+    //==========================================================================
+    // PUT THE BROWSER WHERE THE SLOT'S SOUND ACTUALLY LIVES.
+    //
+    // THE OLD VERSION GAVE UP ON PACKS: `if (isPackBank()) return;`, with the
+    // reasoning that dividing a pack flag by 8 lands on a meaningless page.
+    // That reasoning was right and the conclusion was wrong - the answer is not
+    // to derive the position arithmetically, it is to ASK THE LIBRARY where the
+    // flag is. It also only ran at all when the bank was already a pack, so a
+    // slot holding a pack sound while the tab sat on GM never even reached it.
+    //
+    // The visible fault: a slot on flag 1103 came up showing GM with the first
+    // category selected, instead of WORLD / BRASS. Persisting the browser
+    // position does not fix that on its own - a set saved before that existed
+    // has no position stored, and a song, a favourite or a style program change
+    // sets a patch without any browsing having happened at all.
+    //
+    // Derivation covers every one of those, because it depends only on the flag.
+    //==========================================================================
     void syncTimbreToSlot()
     {
         if (isCurrentSlotDrum()) { selectedTimbre = 0; return; }
 
-        // In WORLD the row is pages, not timbres, so there is nothing to sync -
-        // dividing a flag of 214 by 8 would land on a meaningless page.
-        if (isPackBank()) return;
         const int p = soloMode ? soloPatch[selectedSlot] : stylePatch[selectedSlot];
-        selectedTimbre = juce::jlimit(0, 15, p / 8);
+
+        // WHICH BANK owns the flag - asked of the engine, never inferred from
+        // the number's range. A sound's pack is decided by the folder it was
+        // found in, so a range test here would be a second answer to a question
+        // that already has one, and would go wrong the day a pack is renumbered.
+        const int pack = (p > 127 && onGetInstrumentPack) ? onGetInstrumentPack (p) : 0;
+
+        if (pack == 0)
+        {
+            // GM: the grid IS the program number, so the family is arithmetic.
+            selectedPack   = 0;
+            selectedTimbre = juce::jlimit (0, 15, p / 8);
+            return;
+        }
+
+        selectedPack = juce::jlimit (1, 2, pack);
+
+        packCategoryNames.clear();
+        if (onGetPackCategories)
+            packCategoryNames = onGetPackCategories (selectedPack);
+
+        // Walk the pack's categories for the one that holds this flag. A scan,
+        // but it runs on slot selection and state restore - not per frame - and
+        // the alternative is a flag->category index that would need rebuilding
+        // every time a pack folder changes underneath us.
+        if (onGetPackInstruments)
+        {
+            for (int c = 0; c < packCategoryNames.size(); ++c)
+            {
+                const auto items = onGetPackInstruments (selectedPack, packCategoryNames[c]);
+
+                for (size_t k = 0; k < items.size(); ++k)
+                    if (items[(size_t) k].first == p)
+                    {
+                        selectedTimbre = c;
+                        packPage       = (int) (k / 8);   // the page the cell is on
+                        refreshPackInstruments();
+                        return;
+                    }
+            }
+        }
+
+        // IN THE PACK BUT IN NO CATEGORY - the folder was edited since the sound
+        // was chosen. Land on category 0 rather than on an arbitrary one, and
+        // leave the slot's flag alone: the sound is still loaded and still
+        // plays, it just has nowhere on this grid to be highlighted.
+        selectedTimbre = 0;
+        packPage       = 0;
+        refreshPackInstruments();
     }
 
     void refreshModeButtons()  { btnModeSolo.setActive(soloMode); btnModeStyle.setActive(!soloMode); }
     void refreshTimbreButtons()
     {
-        for (int i = 0; i < kNumTimbres; ++i)
-        {
-            timbreButtons[i].setActive (i == selectedTimbre);
+        // IN A PACK THE COLUMN IS A CATEGORY LIST, not a GM timbre list: these
+        // sounds have no GM family, so the entries are the pack's own subfolder
+        // names.  A pack with six categories now simply shows six rows - the
+        // horizontal row had to divide the whole width by whatever it held,
+        // which is what put ORIENTAL's six in the left third of the canvas.
+        juce::StringArray names;
 
-            // In a PACK the row is a CATEGORY selector, not a timbre selector:
-            // these sounds have no GM family, so the labels are the pack's own
-            // subfolder names and anything past the end is hidden rather than
-            // left as a dead button labelled PIANO.  Paging within a category
-            // is the +/- pair below the cells, not this row.
-            if (isPackBank())
-                timbreButtons[i].setButtonText (i < packCategoryNames.size()
-                                                    ? packCategoryNames[i]
-                                                    : juce::String());
-            else
-                timbreButtons[i].setButtonText (kTimbreNames[i]);
+        if (isPackBank())
+        {
+            names = packCategoryNames;
         }
+        else
+        {
+            for (int i = 0; i < 16; ++i)          // 16 melodic families; no DRUMS entry
+                names.add (kTimbreNames[i]);
+        }
+
+        colCategory.setItems (names);
+        colCategory.setSelected (juce::jlimit (-1, names.size() - 1, selectedTimbre));
     }
     void refreshSlotButtons()  { for (int i = 0; i < 8; ++i) slotButtons[i].setActive(i == selectedSlot); }
 
@@ -3530,7 +4886,15 @@ private:
             const int bw = (i == n-1) ? (padX + usW - bx) : (int)std::round(cw);
             slotButtons[i].setBounds(bx, slotRowY, bw, slotRowH);
             slotButtons[i].setVisible(true);
-            slotButtons[i].setButtonText(soloMode ? juce::String("SOLO ") + juce::String(i + 1)
+            // SOLO 8 IS THE HARMONY CHANNEL. Named here rather than numbered,
+            // because "SOLO 8" would be the one caption on this row that does
+            // not describe what the slot does. STYLE mode is untouched - the
+            // same button is LEAD 2 there and has nothing to do with harmony.
+            slotButtons[i].setHarmonyTint (soloMode && i == kHarmonySoloSlot);
+            slotButtons[i].setButtonText(soloMode
+                                             ? (i == kHarmonySoloSlot
+                                                    ? juce::String("HARMONY")
+                                                    : juce::String("SOLO ") + juce::String(i + 1))
                                                   : juce::String(kStyleRoleNames[i]));
         }
     }
@@ -3550,29 +4914,28 @@ private:
         as much as the UI needs to say about it. */
     void layoutInstrCells()
     {
-        if (instrRowH == 0) return;
         const int W = getWidth(), padX = 6, usW = W - padX*2, gap = 2;
         const bool drumSlot = isCurrentSlotDrum();
 
+        // ── MELODIC: THE CELLS ARE GONE ──────────────────────────────────────
+        //
+        // `colInstr` is the instrument selector now.  The cell buttons still
+        // exist because a DRUM slot uses the SAME array for its nine composed
+        // kits - one widget set, two jobs, which is why they could not simply
+        // be deleted.  Hidden AND zero-sized: a stale bound would leave an
+        // invisible click target sitting on top of a column.
         if (! drumSlot)
         {
-            const int n = 8;
-            const float cw = (float)(usW - (n-1)*gap) / (float)n;
-            for (int i = 0; i < n; ++i)
+            for (int i = 0; i < kMaxInstrCells; ++i)
             {
-                const int bx = padX + (int)std::round(i * (cw + gap));
-                const int bw = (i == n-1) ? (padX + usW - bx) : (int)std::round(cw);
-                instrButtons[i].setBounds(bx, instrRowY, bw, instrRowH);
-                instrButtons[i].setVisible(true);
-            }
-            for (int i = n; i < kMaxInstrCells; ++i)
-            {
-                instrButtons[i].setVisible(false);
-                instrButtons[i].setBounds(0, 0, 0, 0);
+                instrButtons[i].setVisible (false);
+                instrButtons[i].setBounds (0, 0, 0, 0);
             }
             for (auto& b : fullKitButtons) { b.setVisible(false); b.setBounds(0,0,0,0); }
             return;
         }
+
+        if (instrRowH == 0) return;
 
         // ── row 0: the GM kits ────────────────────────────────────────────────
         const int n = kMaxInstrCells;
@@ -3623,8 +4986,12 @@ private:
             auto& b = fullKitButtons[(size_t) i];
             if (i >= (int) fullKits.size()) continue;
 
+            // TEXT ONLY.  The lit-cell test below is `id == live`, built from
+            // the three ints, so prettying the label cannot affect it - which is
+            // exactly why the sampled kits (126-000-036_Arabic Kit and friends,
+            // the names underscores actually live in) are safe to convert here.
             const auto& k = fullKits[(size_t) i];
-            b.setButtonText (std::get<3> (k));
+            b.setButtonText (Betel::prettyName (std::get<3> (k)));
             b.setProgramNumber (-1);
 
             const auto id = juce::String (std::get<0>(k)) + "/"
@@ -3674,15 +5041,23 @@ public:
                                 && onGetFullKitOnSlot (selectedSlot, soloMode).isNotEmpty();
 
             const juce::String currentKit = displayNameForKit (currentSlotParams().drumKit.lastLoadedKit);
+            const bool edmLoaded = isEdmKitName (currentSlotParams().drumKit.lastLoadedKit);
             const bool noneLoaded = currentKit.isEmpty();
             for (int i = 0; i < kMaxInstrCells; ++i)
             {
-                const juce::String name (kDrumKitNames[i]);
-                instrButtons[i].setButtonText (name);
+                // `name` STAYS RAW for the registry lookup; `shown` is what is
+                // drawn AND what is compared, because displayNameForKit above
+                // now returns a prettied string - comparing raw against prettied
+                // is how the lit cell would quietly stop matching.
+                const juce::String name  (kDrumKitNames[i]);
+                const juce::String shown = Betel::prettyName (name);
+                instrButtons[i].setButtonText (shown);
                 instrButtons[i].setActive     (uniqueKit ? false
                                                          : (noneLoaded ? (i == 0)
-                                                                       : (name == currentKit)));
-                instrButtons[i].setProgramNumber (registryKeyForKitName (name).getIntValue());
+                                                                       : (isEdmKitName (name) ? edmLoaded
+                                                                                               : (shown == currentKit))));
+                instrButtons[i].setProgramNumber (isEdmKitName (name) ? -1   // EDM KIT: no program
+                                                                      : registryKeyForKitName (name).getIntValue());
             }
             return;
         }
@@ -3695,12 +5070,11 @@ public:
             const auto st = onGetSfzState (selectedSlot, soloMode);
             if (st.second && st.first.isNotEmpty())
             {
-                for (int i = 0; i < kMaxInstrCells; ++i)
-                {
-                    instrButtons[i].setButtonText (i == 0 ? st.first : juce::String());
-                    instrButtons[i].setProgramNumber (-1);
-                    instrButtons[i].setActive (i == 0);
-                }
+                // ONE ROW, THE SFZ'S OWN NAME.  While an override holds the
+                // slot, none of the library is what you are hearing, and a lit
+                // GM row would be a lie.
+                colInstr.setItems ({ st.first });
+                colInstr.setSelected (0);
                 return;
             }
         }
@@ -3710,16 +5084,27 @@ public:
             const int cur  = soloMode ? soloPatch[selectedSlot] : stylePatch[selectedSlot];
             const int base = packPage * 8;
 
+            // EIGHT ROWS PER PAGE, and only the ones the page actually fills -
+            // a short last page ends where its sounds end rather than padding
+            // out to eight blanks.  Paging stays the +/- pair: Grex has no
+            // scrolling anywhere and this is not the place to introduce it.
+            juce::StringArray names;
+            juce::Array<int>  flags;
+            int sel = -1;
+
             for (int i = 0; i < 8; ++i)
             {
                 const int idx = base + i;
-                const bool has = idx < (int) worldInstruments.size();
+                if (idx >= (int) worldInstruments.size()) break;
 
-                instrButtons[i].setButtonText (has ? worldInstruments[(size_t) idx].second
-                                                   : juce::String());
-                instrButtons[i].setProgramNumber (has ? worldInstruments[(size_t) idx].first : -1);
-                instrButtons[i].setActive (has && worldInstruments[(size_t) idx].first == cur);
+                names.add (worldInstruments[(size_t) idx].second);
+                flags.add (worldInstruments[(size_t) idx].first);
+                if (worldInstruments[(size_t) idx].first == cur) sel = i;
             }
+
+            colInstr.setItems (names);
+            for (int i = 0; i < flags.size(); ++i) colInstr.setNumber (i, flags[i]);
+            colInstr.setSelected (sel);
             return;
         }
 
@@ -3727,17 +5112,16 @@ public:
         // The active cell is the slot's instrument when we're viewing its timbre;
         // otherwise default to the first cell so a timbre never shows blank.
         const int activeCell = (cur >= 0 && cur / 8 == selectedTimbre) ? (cur % 8) : 0;
-        for (int i = 0; i < 8; ++i) {
-            const int patch = selectedTimbre * 8 + i;
-            instrButtons[i].setButtonText(kInstrNames[selectedTimbre][i]);
-            instrButtons[i].setProgramNumber(patch);     // GM program-change value
-            instrButtons[i].setActive(i == activeCell);
-        }
+        const int fam = juce::jlimit (0, 15, selectedTimbre);
+
+        juce::StringArray names;
+        for (int i = 0; i < 8; ++i) names.add (kInstrNames[fam][i]);
+
+        colInstr.setItems (names);
+        for (int i = 0; i < 8; ++i) colInstr.setNumber (i, fam * 8 + i);   // GM PC
+        colInstr.setSelected (activeCell);
     }
 private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SoundsTab)
 };
-
-
-

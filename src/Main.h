@@ -1,3 +1,6 @@
+
+
+
 #pragma once
 //==============================================================================
 // Main.h
@@ -23,6 +26,9 @@
 //   pass an empty string without issue.
 //==============================================================================
 
+#include "FstLibrary.h"
+#include "FstLoader.h"
+#include "RemoteMap.h"
 #include <JuceHeader.h>
 #include <tuple>
 #include <vector>
@@ -39,9 +45,13 @@
 
 #include "Finisher.h"
 #include "StylePlayer.h"
+#include "StyleLevels.h"   // the GLOBAL style boost, used by setStyleBoostDb
+#include "GlobalMacros.h"  // the funkey mix's live value, used by setFunkeyMix
 #include "StyleLoudness.h"   // per-section BS.1770 measurement + corrective trim
 #include "BetelFolderManager.h"
+#include "EdmKitFiles.h"            // EDM KIT base kits (.dsin)
 #include "MasterSettings.h"     // solo base unity + pitch bend live in the master file
+#include "Harmonizer.h"          // harmony note maths (pure)
 #include "GrexSongRecorder.h"   // MIDI performance capture (phase 1)
 #include "GrexSongPlayer.h"     // MIDI performance playback (phase 2)
 
@@ -65,7 +75,7 @@ public:
     }
 
     // ── AudioProcessor surface ────────────────────────────────────────────────
-    const juce::String getName() const override        { return "Grex"; }
+    const juce::String getName() const override        { return "Grex Ballada"; }
     bool acceptsMidi() const override                  { return true; }
     bool producesMidi() const override                 { return false; }
     bool isMidiEffect() const override                 { return false; }
@@ -75,8 +85,78 @@ public:
     void setCurrentProgram(int) override               {}
     const juce::String getProgramName(int) override    { return {}; }
     void changeProgramName(int, const juce::String&) override {}
-    void getStateInformation(juce::MemoryBlock&) override     {}
-    void setStateInformation(const void*, int) override       {}
+    //==========================================================================
+    // DAW PROJECT RECALL.
+    //
+    // These were empty stubs, which meant Grex stored NOTHING in a host project:
+    // save, reopen, and every per-set setting was back to default.bset. To a
+    // plugin audience that is not a missing feature, it is a broken plugin - and
+    // it is the first thing anyone tests.
+    //
+    // The pieces all existed; none of them were connected. `buildSetSnapshot()`
+    // produces the tree, `applySetPayload()` consumes it, and `editorSnapshot`
+    // already carried one across an editor close.
+    //
+    // THE AWKWARD PART is that both of those live on the EDITOR while these two
+    // run on the PROCESSOR and must work with no window open. Hence the two
+    // callbacks: fresh state when there IS an editor, the stored snapshot when
+    // there is not.
+    //==========================================================================
+    void getStateInformation (juce::MemoryBlock& dest) override
+    {
+        juce::ValueTree tree;
+
+        if (onCaptureSetTree)
+            tree = onCaptureSetTree();          // editor open: current state
+
+        if (! tree.isValid())
+            tree = editorSnapshot;              // closed: last known state
+
+        if (! tree.isValid()) return;           // nothing worth saving yet
+
+        // ── DO NOT SAVE A STYLELESS SNAPSHOT ─────────────────────────────────
+        //
+        // The other half of the trap. A host asking for state before a style has
+        // loaded - which it does, on instantiation - would otherwise store a
+        // snapshot naming no style, and that snapshot comes back on every open
+        // afterwards.
+        //
+        // Writing nothing is the honest answer to "what state do you have"
+        // before there is any: the host stores an empty block, setStateInformation
+        // early-returns on it, and startup falls through to default.bset exactly
+        // as a fresh instance should.
+        if (! hasStyle() && ! tree.getChildWithName ("GlobalState")
+                                  .getProperty ("currentStylePath").toString().isNotEmpty())
+            return;
+
+        juce::MemoryOutputStream os (dest, false);
+        tree.writeToStream (os);
+    }
+
+    void setStateInformation (const void* data, int sizeInBytes) override
+    {
+        if (data == nullptr || sizeInBytes <= 0) return;
+
+        juce::MemoryInputStream is (data, (size_t) sizeInBytes, false);
+        auto tree = juce::ValueTree::readFromStream (is);
+        if (! tree.isValid() || ! tree.hasType ("BetelSet")) return;
+
+        // Stored FIRST, because the host usually calls this before the editor
+        // exists - the first window open reads it from here.
+        editorSnapshot = tree;
+        projectStateRestored.store (true);
+
+        // And applied straight away when a window IS open, which is what happens
+        // when the user loads a preset while looking at the plugin.
+        if (onApplySetTree) onApplySetTree (tree);
+    }
+
+    /** True once a host has handed us project state.
+
+        THE ONE REAL DECISION IN ALL OF THIS: the project's state beats
+        default.bset. A project that reopened into someone's default rather than
+        into the song they saved would be the same bug in a politer form. */
+    bool hasProjectState() const noexcept { return projectStateRestored.load(); }
     bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
 
     void prepareToPlay(double sampleRate, int blockSize) override;
@@ -125,9 +205,108 @@ public:
     uint8_t noteRouteSolo  [128] {};   // bit per solo slot that got the note-on
     bool    noteRouteChord [128] {};   // the note-on went to chord recognition
 
+    //==========================================================================
+    // HARMONY VOICE PAIRING - the same latch, for the notes harmony INVENTS.
+    //
+    // A harmony note has no key of its own. Nothing will ever send a note-off
+    // for it, so the ONLY thing that can release it is the note-off of the key
+    // that spawned it. That makes this table load-bearing rather than
+    // bookkeeping: lose an entry and the voice sustains until the next panic.
+    //
+    // WHY IT CANNOT BE RECOMPUTED AT NOTE-OFF INSTEAD. The obvious shortcut is
+    // to run Harmonizer::compute again on the way out and release whatever it
+    // returns. That is wrong, and quietly so: the chord may have moved while
+    // the key was held, so the second call returns DIFFERENT notes - it
+    // releases voices that were never started and strands the ones that were.
+    // What went down has to be what comes up, so it is recorded, not derived.
+    //
+    // For the same reason a held note NEVER re-pitches when the chord changes.
+    // The interval is decided once, at note-on. Re-voicing mid-note sounds like
+    // a glitch, not like harmony, and it would put this table out of step with
+    // what is actually sounding.
+    //
+    // harmonyCount IS THE AUTHORITY, not a sentinel value in the note array.
+    // Entries past the count are never read, which matters because
+    // `int8_t a[128][3] {}` zero-fills to 0 - a valid MIDI note - so a -1
+    // sentinel would be a lie at construction even though clearNoteRoutes
+    // writes it. Storing the count also means a PARTIAL result releases
+    // correctly: two voices where three were asked for, which is what happens
+    // at the bottom of the keyboard, releases exactly two.
+    //
+    // Three slots because Block is the widest type (Harmonizer::kMaxVoices).
+    //
+    // Audio thread only, like the two routes above.
+    //==========================================================================
+    static constexpr int kMaxHarmonyVoices = Betel::Harmonizer::kMaxVoices;
+
+    int8_t harmonyNotes [128][kMaxHarmonyVoices] {};
+    uint8_t harmonyCount[128] {};
+
+    /** The highest solo note currently held, or -1.  THE MELODY, for harmony's
+        purposes: only the top note is harmonised, because harmonising every
+        note of a right-hand chord multiplies the voice count and is not what an
+        arranger does.
+
+        Audio thread only, like the two route tables. */
+    int highestHeldSoloNote = -1;
+
     void clearNoteRoutes() noexcept
     {
-        for (int i = 0; i < 128; ++i) { noteRouteSolo[i] = 0; noteRouteChord[i] = false; }
+        for (int i = 0; i < 128; ++i)
+        {
+            noteRouteSolo[i] = 0;
+            noteRouteChord[i] = false;
+            harmonyCount[i] = 0;
+            for (int v = 0; v < kMaxHarmonyVoices; ++v) harmonyNotes[i][v] = -1;
+        }
+        highestHeldSoloNote = -1;
+    }
+
+    /** Take everything a key currently holds and empty the row.
+        ONE function for both uses, because they are the same operation: at
+        note-off it releases the voices, and at a RESTRIKE it releases the
+        previous strike's voices before the new ones are latched.
+
+        Returns the count; the notes are in `out`. */
+    int takeHarmony (int phys, int out[kMaxHarmonyVoices]) noexcept
+    {
+        if (phys < 0 || phys > 127) return 0;
+
+        const int n = juce::jmin ((int) harmonyCount[phys], kMaxHarmonyVoices);
+        for (int v = 0; v < n; ++v) out[v] = (int) harmonyNotes[phys][v];
+
+        harmonyCount[phys] = 0;
+        return n;
+    }
+
+    /** Record what a note-on just spawned.  OVERWRITES - the caller must have
+        called takeHarmony first and released whatever came back.
+
+        THIS DOES NOT ACCUMULATE, and that is a deliberate difference from
+        noteRouteSolo beside it. That one accumulates safely because it is a
+        bitmask of eight fixed slots: striking a key again can only ever re-set
+        bits that already exist. Harmony has no such bound - a restrike under a
+        MOVED chord produces different notes, so accumulating would need four or
+        more rows and the fourth would be silently dropped and left sounding
+        forever. Releasing the old strike first is bounded and correct. */
+    void latchHarmony (int phys, const Betel::Harmonizer::Result& r) noexcept
+    {
+        if (phys < 0 || phys > 127) return;
+
+        harmonyCount[phys] = 0;
+
+        for (int i = 0; i < r.count && harmonyCount[phys] < kMaxHarmonyVoices; ++i)
+        {
+            const int n = r.notes[i];
+            if (n < 0 || n > 127) continue;
+
+            bool already = false;
+            for (int v = 0; v < harmonyCount[phys]; ++v)
+                if (harmonyNotes[phys][v] == (int8_t) n) { already = true; break; }
+
+            if (! already)
+                harmonyNotes[phys][harmonyCount[phys]++] = (int8_t) n;
+        }
     }
 
     /** LIVE-SAVED, like the pitch bend range and the low-velocity lift.
@@ -137,10 +316,314 @@ public:
         default, and the player set it again every time.  MasterSettings::
         setSplitPoint writes only on a real change, so dragging the knob costs
         one file write when the drag ends on a new note, not one per pixel. */
+    //==========================================================================
+    // HARMONY - the settings the note dispatch reads.
+    //
+    // ALL ATOMIC: written by the editor on the message thread, read inside
+    // processBlock. Relaxed is right for every one of them - they are
+    // independent scalars with nothing hanging off their ordering, and a note
+    // landing on the old value for one block is inaudible.
+    //
+    // THE TARGET SLOT IS FIXED AT 7 (solo 8), by design rather than by
+    // shortage. Harmony is right-hand material, so it belongs on the SOLO bus:
+    // the ducker keys the style bus FROM the solo bus, so harmony on a style
+    // channel would be ducked by the very melody it is harmonising. On solo 8
+    // it ducks the band alongside the lead, which is what it should do.
+    //==========================================================================
+    static constexpr int kHarmonySlot = 7;          // solo 8
+
+    //==========================================================================
+    // MULTI SPLIT - THREE ZONES, TWO BOUNDARIES.
+    //
+    //     note < bassSplit                 BASS zone
+    //     bassSplit <= note < splitPoint   CHORD zone (the style)
+    //     note >= splitPoint               SOLO zone (the right hand)
+    //
+    // splitPoint is the boundary Grex has always had; bassSplit is the new one
+    // BELOW it. Stated that way round on purpose - a player who never turns
+    // multi split on keeps exactly the keyboard they had, because with it off
+    // the bass zone has zero width and the test collapses to the old two-way
+    // one.
+    //
+    // The bass zone routes to a SOLO SLOT of its own, so an organ player's
+    // pedals or an accordion's left-hand buttons get their own instrument,
+    // level and FX. Slot 6 by default: it is the last slot that is not the
+    // harmony channel, so the two features do not fight over solo 8.
+    //
+    // WHAT THE BASS ZONE DOES FOR THE STYLE: it ALSO feeds the chord tracker.
+    // A left hand playing a bass line is still telling the band what the chord
+    // is, and a wide left hand that suddenly stopped moving the harmony would
+    // read as the arranger losing the plot. Manual bass - which silences the
+    // style's own bass - is a separate switch and a separate feature.
+    //==========================================================================
+    static constexpr int kBassSlotDefault = 6;      // solo 7
+
+    /** Which solo slot currently carries the bass zone, or -1 when multi split
+        is off.  The four views that tint a slot ask THIS rather than testing
+        kBassSlotDefault, so the colour follows the chosen slot instead of being
+        painted on slot 7 forever. */
+    //==========================================================================
+    // MANUAL BASS and BASS TO LOWEST - two switches, not one.
+    //
+    // MANUAL BASS IS CONDITIONAL, NOT A MUTE - and that is the whole feature.
+    //
+    // Yamaha's own patent for automatic bass chord accompaniment (US 4,864,907)
+    // describes it exactly: where the identified chord ROOT coincides with the
+    // bass note being played, the style's authored bass PATTERN plays normally;
+    // only where they DISAGREE - or where no chord is recognised at all - does
+    // the bass collapse to the note under the finger.
+    //
+    // So the pattern survives while the player agrees with the chord, and is
+    // abandoned only when they deliberately do not. Muting the channel outright
+    // would throw the pattern away permanently, which is musically much worse
+    // and is why a plain mute felt wrong the moment it was described out loud.
+    //
+    // BASS INVERSION re-roots the style's bass on the LOWEST note held rather
+    // than on the chord root, which is what makes an inversion audible: C/E and
+    // a root-position C are the SAME recognised chord - inversion is not part of
+    // chord identity - so the bass note has to come from the keyboard.
+    //
+    // The name is Korg's and so is the two-mode shape. The case that cannot be
+    // played any other way is C/B = Cmaj7: renaming gets you C/D as D11 and
+    // C/F as Fmaj9, but there is no relabelling that puts a major 7th in the
+    // bass without wrecking the harmony above it.
+    //
+    // BOTH ARE INDEPENDENT SWITCHES on every arranger that ships them - Korg
+    // lists Bass Inversion and Manual Bass side by side in its style controls -
+    // so neither is gated behind the other or behind multi split here either.
+    //==========================================================================
+    static constexpr int kStyleBassChannel = 2;     // BASS role
+
+    //==========================================================================
+    //  MANUAL BASS IS A ROUTING MODE, NOT ONLY A NOTE SUBSTITUTION.
+    //
+    //  It used to be the substitution alone - getManualBassNote() handed the
+    //  played note to StylePlayer, which swapped it into the style's own bass
+    //  pattern.  Nothing routed the keyboard, so the left hand went on feeding
+    //  the chord tracker and playing the arranger exactly as before: switching
+    //  the mode on changed nothing you could hear from the left hand.
+    //
+    //  What the mode actually means: the keyboard becomes TWO HANDS with no
+    //  chord-only zone in it.  The left hand plays SOLO 7 as a bass instrument
+    //  of its own, and it does NOT move the harmony - the band holds whatever
+    //  chord it was last given.  See bassZoneFeedsChords() for why that answer
+    //  is the opposite of multi split's.
+    //
+    //  MUTUALLY EXCLUSIVE WITH MULTI SPLIT.  Both claim the left hand and both
+    //  claim a bass solo slot, so with the two on at once the zone tests
+    //  overlap and whichever branch is written first silently wins.  Turning
+    //  one on therefore turns the other off, here rather than in the panel, so
+    //  a MIDI assignment or a set load cannot reach an impossible pair.
+    //==========================================================================
+    void setManualBassEnabled (bool b) noexcept
+    {
+        manualBassOn.store (b, std::memory_order_relaxed);
+        if (b) multiSplitOn.store (false, std::memory_order_relaxed);
+    }
+    bool isManualBassEnabled() const noexcept
+    {
+        return manualBassOn.load (std::memory_order_relaxed);
+    }
+
+    /** WHICH SOLO SLOT THE LEFT HAND PLAYS, for whichever mode owns it.
+
+        Manual bass is ALWAYS solo 7 and has no cycler; multi split keeps its
+        own BASS -> SOLO n choice.  One call answers for both so the router, the
+        M.BASS lamp and the four views that tint a slot can never disagree about
+        which slot is the bass. */
+    int getActiveBassSlot() const noexcept
+    {
+        if (manualBassOn.load (std::memory_order_relaxed)) return kBassSlotDefault;
+        return bassZoneSlot.load (std::memory_order_relaxed);
+    }
+
+    /** Does the left hand still tell the band what the chord is?
+
+        MULTI SPLIT : YES.  Its bass zone sits UNDER a chord zone, and a left
+                      hand walking a bass line down there is still speaking for
+                      the harmony.  Dropping the feed would make a wide left
+                      hand stop moving the chords, which reads as the arranger
+                      losing the plot rather than as a routing choice.
+
+        MANUAL BASS : NO.  The mode IS a two-hand split with no chord zone in it
+                      at all, so there is nothing for the left hand to speak
+                      for.  The band holds its last chord and the left hand is
+                      free to play anything. */
+    bool bassZoneFeedsChords() const noexcept
+    {
+        return ! manualBassOn.load (std::memory_order_relaxed);
+    }
+
+    /** Korg's two settings, kept because the difference is musical, not
+        cosmetic: ALWAYS treats the lowest note as the bass unconditionally,
+        while OnlyIfNotRoot leaves an ordinary root-position chord alone and
+        only re-roots when the player has actually inverted something. */
+    enum class BassInversionMode : int { Always = 0, OnlyIfNotRoot = 1 };
+
+    void setBassInversionEnabled (bool b) noexcept
+    {
+        bassInversionOn.store (b, std::memory_order_relaxed);
+    }
+    bool isBassInversionEnabled() const noexcept
+    {
+        return bassInversionOn.load (std::memory_order_relaxed);
+    }
+
+    void setBassInversionMode (BassInversionMode m) noexcept
+    {
+        bassInversionMode.store ((int) m, std::memory_order_relaxed);
+    }
+    BassInversionMode getBassInversionMode() const noexcept
+    {
+        return (BassInversionMode) bassInversionMode.load (std::memory_order_relaxed);
+    }
+
+    /** The note the style's bass should be rooted on, or -1 to leave it alone.
+        AUDIO THREAD. -1 whenever the feature is off or nothing is held, so the
+        caller's normal path is one relaxed load and a branch. */
+    int getBassRootOverride() const noexcept
+    {
+        if (! bassInversionOn.load (std::memory_order_relaxed)) return -1;
+
+        const int lowest = chordTracker.getLowestHeldNote();
+        if (lowest < 0) return -1;
+
+        if ((BassInversionMode) bassInversionMode.load (std::memory_order_relaxed)
+                == BassInversionMode::OnlyIfNotRoot)
+        {
+            // Root position is not an inversion. Leaving it alone means the
+            // style's own bass line keeps its shape for the 90% of chords that
+            // are played plainly, and only a deliberate inversion moves it.
+            const int rootPc = chordTracker.getCurrentChord().root;
+            if ((((lowest % 12) + 12) % 12) == rootPc) return -1;
+        }
+
+        return lowest;
+    }
+
+    /** MANUAL BASS, resolved: the note the bass should play INSTEAD of its
+        pattern, or -1 to let the pattern run.
+
+        The patent's test, verbatim in code: the pattern survives while the
+        played bass note agrees with the recognised chord root, and is replaced
+        only when it does not - or when no chord has been recognised at all. */
+    int getManualBassNote() const noexcept
+    {
+        if (! manualBassOn.load (std::memory_order_relaxed)) return -1;
+
+        const int lowest = chordTracker.getLowestHeldNote();
+        if (lowest < 0) return -1;        // nothing held: the pattern plays on
+
+        const int rootPc = chordTracker.getCurrentChord().root;
+        if ((((lowest % 12) + 12) % 12) == rootPc) return -1;   // agrees -> pattern
+
+        return lowest;                    // disagrees -> the finger wins
+    }
+
+    int getTintedBassSlot() const noexcept
+    {
+        // EITHER mode owns a bass slot now, so the tint follows both.  Reading
+        // getActiveBassSlot keeps this answer and the router's answer identical
+        // by construction.
+        if (manualBassOn.load (std::memory_order_relaxed)
+            || multiSplitOn.load (std::memory_order_relaxed))
+            return getActiveBassSlot();
+        return -1;
+    }
+
+    void setMultiSplitEnabled (bool b) noexcept
+    {
+        multiSplitOn.store (b, std::memory_order_relaxed);
+        // The other half of the exclusion - see setManualBassEnabled.
+        if (b) manualBassOn.store (false, std::memory_order_relaxed);
+    }
+    bool isMultiSplitEnabled() const noexcept
+    {
+        return multiSplitOn.load (std::memory_order_relaxed);
+    }
+
+    /** THE TWO BOUNDARIES CAN NEVER CROSS.
+        Clamped to one below the main split rather than merely to 0..127: if the
+        bass boundary reaches or passes it, the CHORD zone has zero or negative
+        width and simply vanishes - every note becomes bass or solo and the
+        style stops following the left hand at all, with nothing on screen
+        saying why. One drag was enough to reach that. */
+    void setBassSplitPoint (int midiNote) noexcept
+    {
+        const int ceiling = juce::jmax (0, getSplitPoint() - 1);
+        bassSplitPoint.store (juce::jlimit (0, ceiling, midiNote),
+                              std::memory_order_relaxed);
+    }
+
+    /** Re-apply the clamp after the MAIN split moves.  The invariant has to hold
+        when EITHER boundary changes, not just when the bass one does. */
+    void reclampBassSplit() noexcept
+    {
+        setBassSplitPoint (bassSplitPoint.load (std::memory_order_relaxed));
+    }
+    int getBassSplitPoint() const noexcept
+    {
+        return bassSplitPoint.load (std::memory_order_relaxed);
+    }
+
+    void setBassZoneSlot (int slot) noexcept
+    {
+        // Never the harmony slot: it would put the pedals on the harmony voice
+        // and the two would overwrite each other's notes.
+        if (slot == kHarmonySlot) return;
+        bassZoneSlot.store (juce::jlimit (0, 7, slot), std::memory_order_relaxed);
+    }
+    int getBassZoneSlot() const noexcept
+    {
+        return bassZoneSlot.load (std::memory_order_relaxed);
+    }
+
+    /** True when `note` is in the bass zone.  False whenever multi split is off,
+        which is what makes the three-way test collapse to the old two-way one. */
+    bool isBassZone (int note) const noexcept
+    {
+        // MANUAL BASS: the whole left hand, bounded by the MAIN split point.
+        // Not bassSplitPoint - that boundary belongs to multi split's THREE
+        // zones, and manual bass has only two.  Reusing it would have left the
+        // band a chord zone between the two boundaries that the mode says does
+        // not exist.  Tested first because the two modes are mutually exclusive
+        // (see setManualBassEnabled), so the order is a statement of that
+        // rather than a precedence anyone has to remember.
+        if (manualBassOn.load (std::memory_order_relaxed))
+            return note < getSplitPoint();
+
+        return multiSplitOn.load (std::memory_order_relaxed)
+            && note < bassSplitPoint.load (std::memory_order_relaxed);
+    }
+
+    void setHarmonyEnabled (bool b) noexcept { harmonyOn.store (b, std::memory_order_relaxed); }
+    bool isHarmonyEnabled() const noexcept   { return harmonyOn.load (std::memory_order_relaxed); }
+
+    void setHarmonyType (Betel::Harmonizer::Type t) noexcept
+    {
+        harmonyType.store ((int) t, std::memory_order_relaxed);
+    }
+    Betel::Harmonizer::Type getHarmonyType() const noexcept
+    {
+        return (Betel::Harmonizer::Type) harmonyType.load (std::memory_order_relaxed);
+    }
+
+    void setHarmonyBelow (bool b) noexcept { harmonyBelow.store (b, std::memory_order_relaxed); }
+    bool isHarmonyBelow() const noexcept   { return harmonyBelow.load (std::memory_order_relaxed); }
+
+    /** 0..100. Harmony velocity as a percentage of the lead's.
+        Default 82: at parity the melody stops reading as the melody. */
+    void setHarmonyLevel (int pct) noexcept
+    {
+        harmonyLevel.store (juce::jlimit (0, 100, pct), std::memory_order_relaxed);
+    }
+    int getHarmonyLevel() const noexcept { return harmonyLevel.load (std::memory_order_relaxed); }
+
     void setSplitPoint (int midiNote) noexcept
     {
         chordTracker.setSplitPoint (midiNote);
         Betel::MasterSettings::get().setSplitPoint (midiNote);
+        reclampBassSplit();
     }
 
     /** Split point WITHOUT touching the master file - for restoring a project's
@@ -152,6 +635,7 @@ public:
     void setSplitPointFromProject (int midiNote) noexcept
     {
         chordTracker.setSplitPoint (midiNote);
+        reclampBassSplit();
     }
     int  getSplitPoint() const noexcept                { return chordTracker.getSplitPoint(); }
     /** Per-section loudness measurement — readout, target and re-measure. */
@@ -160,6 +644,66 @@ public:
 
     // ── Style transport ───────────────────────────────────────────────────────
     bool loadStyle (const juce::File& file, juce::String& errorMsg);
+
+    //==========================================================================
+    // THE STYLE LIBRARY — a FOLDER of .fst files, scanned at open. No blob, no
+    // mapping, no packaging layer: the converter writes one file per style and
+    // the plugin reads the folder.
+    //
+    // STYLES ONLY. The SOUND packs (sounds_gm/*.frb) and DRUM KITS
+    // (drums/*_kit.frb) are still blobs, still memory-mapped, still opened with
+    // AccessCode.h — see `engine` and `drumKitRegistry` below.
+    //
+    // Opened once at startup; only the TOCs are read, so this costs a few
+    // hundred KB and no measurable time. A style's bytes are decrypted the
+    // moment it is loaded and never before.
+    //==========================================================================
+    void openStyleLibrary();
+
+    //==========================================================================
+    // EVERY FILE UNDER GrexPaths::root() THAT IS READ ONCE AND CACHED.
+    //
+    // One method, called from ONE place - the end of rescanFromFolderManager -
+    // so that "the root moved" and "re-read the things that live under it" can
+    // never drift apart again.
+    //
+    // The rule this exists to enforce: ANYTHING CACHED AT CONSTRUCTION THAT
+    // LIVES UNDER THE ROOT MUST BE INVALIDATED WHEN THE ROOT MOVES.  Every
+    // violation has the same signature and the same baffling symptom - it works
+    // only after a reload - and the cause is never visible from where it hurts.
+    //==========================================================================
+    void reloadRootBackedSettings();
+
+    /** Everything after a style is parsed, shared by the file and blob paths.
+        `sourceFile` is invalid for a blob load and the loudness cache is skipped
+        accordingly - see the definition.
+
+        `styleRef` is the id (or legacy path) the style will be known by, and it
+        is needed HERE rather than after the call because the set lookup that
+        decides whether CC 7 may touch the faders has to happen BEFORE
+        applyVoiceSetup runs. */
+    void adoptFreshStyle (std::unique_ptr<Betel::StyleData> fresh,
+                          const juce::File& sourceFile,
+                          const juce::String& styleRef);
+
+    /** Load by STYLE ID from the library, or by legacy absolute PATH.
+
+        BOTH, deliberately, and that IS the migration. Every set in the field
+        stores `currentStylePath` as a real filesystem path; refusing those would
+        orphan the entire existing library on the day the blobs ship. So an
+        argument that matches a library id loads from the blob, and anything else
+        is tried as a file exactly as before.
+
+        Nothing has to be rewritten, nothing is destroyed, and a set saved after
+        this point quietly starts carrying an id instead. */
+    bool loadStyleByRef (const juce::String& idOrPath, juce::String& errorMsg);
+
+    /** What `currentStylePath` should record for what is loaded now: the ID when
+        it came from a blob, the path when it did not. */
+    juce::String getCurrentStyleRef() const { return currentStyleRef; }
+
+    const Betel::FstLibrary& getStyleLibrary() const noexcept
+    { return styleLibrary; }
 
     // ── Bypass instrument audio chain (Global Settings toggle) ────────────────
     // When true, only the amp ADSR + channel volume survive.  Filter, amp LFO,
@@ -228,6 +772,66 @@ public:
     //    Owned here so processBlock can capture input and inject playback; the
     //    editor drives arm/stop/save/load/applySetup.
     GrexSongRecorder& getSongRecorder() noexcept { return songRecorder; }
+
+    //==========================================================================
+    // SONG TRANSPORT - what the song window drives.
+    //
+    // On the PROCESSOR, not the editor, for the reason every startup bug in this
+    // project had: a song must be able to play with no window open.
+    //==========================================================================
+    bool loadSongFile (const juce::File& f)
+    {
+        GrexSongRecorder::Setup setup;
+        std::vector<GrexSongRecorder::Event> evts;
+        if (! GrexSongRecorder::loadFromFile (f, setup, evts)) return false;
+
+        songPlayer.setSong (setup, evts);
+        songSetup = setup;
+
+        // THE EMBEDDED SET IS THE POINT OF THE FORMAT, so it is applied before a
+        // note plays. Without it the song replays against whatever set happens
+        // to be loaded, which is the one thing the format exists to prevent.
+        if (setup.setSnapshot.isValid() && onApplySetTree)
+            onApplySetTree (setup.setSnapshot);
+
+        // The SET no longer carries a split, so the SONG does - and it decides
+        // which recorded notes were chord and which were solo.
+        if (setup.splitPoint > 0)
+            chordTracker.setSplitPoint (setup.splitPoint);
+
+        return true;
+    }
+
+    void songPlay()   { songPlayer.setPaused (false); songPlayer.start(); }
+    void songStop()   { songPlayer.stop(); }
+    void songPause()  { songPlayer.setPaused (! songPlayer.isPaused()); }
+    void songSeekBeats (double b) { songPlayer.requestSeek (b); }
+
+    bool   isSongPlaying()        const noexcept { return songPlayer.isPlaying(); }
+    bool   isSongPaused()         const noexcept { return songPlayer.isPaused(); }
+    double getSongPositionBeats() const noexcept { return songPlayer.getPositionBeats(); }
+    double getSongLengthBeats()   const noexcept { return songPlayer.getLengthBeats(); }
+    double getSongTempoBpm()      const noexcept { return songSetup.tempoBpm; }
+
+    void setSongChannelMuted (int ch, bool m) { songPlayer.setChannelMuted (ch, m); }
+
+    /** BACKING-TRACK MODE - see GrexSongPlayer::isSuppressedRightHand. */
+    void setSongSoloLive (bool live) { songPlayer.setSoloLive (live); }
+    bool isSongSoloLive() const      { return songPlayer.isSoloLive(); }
+    bool isSongChannelMuted  (int ch) const   { return songPlayer.isChannelMuted (ch); }
+
+    /** Supplied by the editor: applies a <BetelSet> across the tabs.
+
+        Used by BOTH the song loader and DAW project recall - it is one
+        operation, and giving it two names would have hidden that. */
+    std::function<void (const juce::ValueTree&)> onApplySetTree;
+
+    /** Supplied by the editor: a FRESH snapshot of live state.
+
+        `getStateInformation` needs current state, and `editorSnapshot` is only
+        as new as the last editor close - so a project saved with the window open
+        would store whatever the state was when it was last shut. */
+    std::function<juce::ValueTree()> onCaptureSetTree;
     GrexSongPlayer&   getSongPlayer()   noexcept { return songPlayer;   }
 
     /** Capture / restore the host-side global state used by the Favorites
@@ -302,18 +906,114 @@ public:
     //   FREE   : sequencer uses the manual BPM set by the knob or by TAP.
     //   Speed  : ×1 / ×2 / ׽ multiplier applied on top of whichever base wins.
     //
-    // resetTempoOverride() snaps the manual BPM back to the loaded style's
-    // original tempo (or 120 if no style).
+    // ═════════════════════════════════════════════════════════════════════════
+    //  TEMPO IS AN OFFSET, NOT AN ABSOLUTE.  READ THIS BEFORE EDITING.
+    // ═════════════════════════════════════════════════════════════════════════
+    //
+    //  THE INVARIANT, maintained by every function below:
+    //
+    //      manualBPM  ==  clamp (styleBaseBPM + userBpmDelta)
+    //
+    //  THREE VALUES, AND ONLY ONE OF THEM IS SAVED:
+    //
+    //    styleBaseBPM  the tempo the LOADED STYLE asks for (its originalBPM).
+    //                  Owned by the style-load path.  Never saved - the style
+    //                  file already holds it and will hand it back next time.
+    //
+    //    userBpmDelta  what the PLAYER did to it, in BPM.  Style says 150, the
+    //                  player wants 170, this holds +20.  THIS IS WHAT THE SET
+    //                  SAVES.
+    //
+    //    manualBPM     the resolved working tempo, and the ONLY one the audio
+    //                  thread reads (processBlock, FREE mode).  Derived; never
+    //                  a source of truth.
+    //
+    //  ── WHY THE OFFSET RATHER THAN THE NUMBER ────────────────────────────────
+    //
+    //  A set used to store the absolute BPM, which meant it stored a number
+    //  belonging to the STYLE and then imposed it on whatever style the set
+    //  happened to load.  Re-time a style and every set naming it still forced
+    //  the old tempo; swap the style behind a set and it played at a speed that
+    //  had nothing to do with the new one.  The player's actual intention -
+    //  "a bit quicker than written" - was never recorded at all, because it was
+    //  baked into a total that could not be taken apart again.
+    //
+    //  This mirrors the mixer's style x user split: THE STYLE DECIDES, WE ADJUST
+    //  AFTER.  The style's own tempo leads, the player's nudge rides on top, and
+    //  the two are separable forever after.
+    //
+    //  ── THE DELTA SURVIVES A STYLE CHANGE.  THAT IS DELIBERATE ───────────────
+    //
+    //  Load a new style with +20 held and the new style plays at ITS tempo +20,
+    //  exactly as a mixer fader stays where the player left it across a style
+    //  change.  RESET TEMPO is the escape hatch and now clears the offset
+    //  outright, so one button still puts every style back on its own feet.
+    //
+    //  ── WHERE THE CLAMP LIVES, AND WHY NOT ON THE DELTA ──────────────────────
+    //
+    //  The 30..300 clamp is applied to the RESOLVED tempo, not to the delta, so
+    //  a big offset against a slow style is quietly limited rather than refused.
+    //  The delta keeps its full value across that clamp: park a +150 offset on a
+    //  60 BPM ballad (resolves to 210) and it still resolves to 300 rather than
+    //  240 when a 200 BPM style loads underneath it.  Clamping the stored offset
+    //  instead would let the ceiling silently eat the player's setting.
+    //
+    // resetTempoOverride() drops the offset and snaps back to the loaded style's
+    // own tempo (or 120 if no style).
+    static constexpr float kMinBPM = 30.0f;
+    static constexpr float kMaxBPM = 300.0f;
+
     void  tapTempo();
+
     void  resetTempoOverride() noexcept
     {
-        manualBPM.store (currentStyle != nullptr && currentStyle->originalBPM > 0.0f
-                             ? currentStyle->originalBPM : 120.0f);
+        userBpmDelta.store (0.0f);
+        refreshManualBPMFromDelta();
     }
 
+    /** Re-resolves the working tempo from the style's tempo plus the player's
+        offset.  Every writer below ends here, so the invariant holds no matter
+        which end was moved. */
+    void  refreshManualBPMFromDelta() noexcept
+    {
+        manualBPM.store (juce::jlimit (kMinBPM, kMaxBPM,
+                                       styleBaseBPM.load() + userBpmDelta.load()));
+    }
+
+    /** Called by the style-load path with the newly loaded style's originalBPM.
+        Re-resolves immediately, so the new style plays at ITS tempo plus
+        whatever offset the player is holding. */
+    void  setStyleBaseBPM (float bpm) noexcept
+    {
+        styleBaseBPM.store (bpm > 0.0f ? juce::jlimit (kMinBPM, kMaxBPM, bpm) : 120.0f);
+        refreshManualBPMFromDelta();
+    }
+    float getStyleBaseBPM() const noexcept { return styleBaseBPM.load(); }
+
+    /** THE KNOB'S AND TAP'S ENTRY POINT, AND IT STILL SPEAKS ABSOLUTE BPM.
+        The UI shows and sets a tempo, not an offset - asking a player to think
+        in deltas would be a worse instrument.  The offset is derived here, which
+        is the one place the translation has to happen. */
     void  setManualBPM (float bpm) noexcept
-        { manualBPM.store (juce::jlimit (30.0f, 300.0f, bpm)); }
+    {
+        const float wanted = juce::jlimit (kMinBPM, kMaxBPM, bpm);
+        userBpmDelta.store (wanted - styleBaseBPM.load());
+        manualBPM   .store (wanted);
+    }
     float getManualBPM() const noexcept { return manualBPM.load(); }
+
+    /** THE SET'S ENTRY POINT.  applyGlobalState calls this with the saved
+        offset; the resolved tempo falls out of the style already loaded. */
+    void  setUserBpmDelta (float delta) noexcept
+    {
+        // Bounded by the widest possible legal excursion rather than by the BPM
+        // range, so a hand-edited or corrupt set cannot park an absurd number
+        // here, while every offset a player can actually produce survives.
+        const float span = kMaxBPM - kMinBPM;
+        userBpmDelta.store (juce::jlimit (-span, span, delta));
+        refreshManualBPMFromDelta();
+    }
+    float getUserBpmDelta() const noexcept { return userBpmDelta.load(); }
 
     void  setTempoSynced (bool synced) noexcept { tempoSyncedToHost.store (synced); }
     bool  isTempoSynced() const noexcept        { return tempoSyncedToHost.load(); }
@@ -343,6 +1043,7 @@ public:
         The piano strip polls this to light up whatever the style (or the solo
         MIDI input) is playing on the slot being edited. */
     void getSoundingNotes (int engineChannel, uint32_t out[4]) const;
+    void getPadActivity   (int engineChannel, uint32_t out[4]) const;   // EDM KIT pad LEDs
 
     /** Fire a one-shot crash-cymbal hit on the DRUMS style slot. */
     void triggerCrash();
@@ -362,8 +1063,51 @@ public:
     bool  getFinisherEnabled   () const    noexcept { return finisher.isEnabled(); }
     void  setFinisherAmount    (float pct) noexcept { finisher.setAmount (pct); }
     float getFinisherAmount    () const    noexcept { return finisher.getAmount(); }
-    void  setFinisherCharacter (int c)     noexcept { finisher.setCharacter (c); }
-    int   getFinisherCharacter () const    noexcept { return finisher.getCharacter(); }
+    /** RESET: restore the Finisher's factory values.  Replaces "reload the
+        selected character", which needed a selector to reload FROM. */
+    void  resetFinisherToFactory()         noexcept { finisher.loadFactoryDefaults(); }
+
+    //==========================================================================
+    // THE LAST MIDI MESSAGE, packed into ONE int so the read cannot tear.
+    //
+    //   bits 16..  sequence   (rolls over; only there so a REPEAT of the same
+    //                          message is visible - hitting one pad twice has
+    //                          to light the monitor twice)
+    //   bits 15-14 kind       (1 = pad, 2 = cc, matching RemoteMap::Kind)
+    //   bits 13-7  number
+    //   bits  6-0  value
+    //
+    // Four separate atomics would let the reader catch an update halfway and
+    // show a CC's number against a note's velocity. One word cannot do that.
+    //==========================================================================
+    std::atomic<int> lastMidiPacked { 0 };
+
+    void noteLastMidi (int kind, int number, int value) noexcept
+    {
+        const int seq = (lastMidiSeq.fetch_add (1, std::memory_order_relaxed) + 1) & 0xFFFF;
+        lastMidiPacked.store ((seq << 16) | ((kind & 0x3) << 14)
+                                          | ((number & 0x7F) << 7)
+                                          | (value & 0x7F),
+                              std::memory_order_relaxed);
+    }
+
+    int getLastMidiPacked() const noexcept
+    { return lastMidiPacked.load (std::memory_order_relaxed); }
+
+    /** While armed, an incoming pad or CC is RECORDED and NOT acted on.  Without
+        this, arming LEARN and hitting a pad would also fire whatever that pad
+        currently drives - which for a variation pad means the arrangement jumps
+        while you are trying to set something up. */
+    // LEARN IS GONE.  It was an arm-and-wait that swallowed every MIDI message
+    // while armed, so forgetting to disarm it made the plugin look deaf with
+    // nothing on screen to say why.  Assignment is drag-and-drop now: the
+    // source is captured passively by the monitor below and never intercepted,
+    // so nothing has to be armed and nothing can be left armed.
+
+
+    // setFinisherCharacter / getFinisherCharacter are GONE with the selector.
+    // See Finisher.h: it was a preset loader, and the sliders it wrote into
+    // were always the real owners of those values.
     float getFinisherGainReductionDb() const noexcept { return finisher.getGainReductionDb(); }
 
     void  setFinisherParam        (int id, float v) noexcept { finisher.setParam (id, v); }
@@ -699,6 +1443,11 @@ public:
             const int kit = fixedKitKey[(size_t) s];
             if (kit >= 0)
             {
+                // AN EDM KIT publishes under key 0 - the composed Standard kit's key -
+                // so the key cannot bring it back.  SoundsState has just restored it
+                // WITH its edits; "restoring key 0" here swapped it for acoustic
+                // Standard on every set load.
+                if (kit == 0 && engine.channelHoldsEdmKit (s)) continue;
                 engine.setDrumChannel (s, true);
 
                 if ((kit & Betel::SamplePlayerEngine::kFullKitUnityBit) != 0)
@@ -734,6 +1483,38 @@ public:
     void performVariation (int variButtonIdx);   // 0-15, same indexing as MainTab
     void togglePlayStop();
     void toggleSyncPlay();
+
+    //==========================================================================
+    // PLAY REFUSED FOR WANT OF A STYLE.
+    //
+    // `togglePlayStop` is `else if (hasStyle()) sequencer.start()`, so with no
+    // style loaded it did LITERALLY NOTHING: no start, no lamp, no caption
+    // change, no sound - from the mouse and from a hardware pad alike, because
+    // both routes go through that one function.  A control that does nothing
+    // and says nothing is indistinguishable from a broken control, and this has
+    // now cost two separate debugging sessions chasing the transport when the
+    // fault was upstream, in style loading.
+    //
+    // Raising a flag here rather than fixing it here is deliberate: the
+    // processor must not reach into the browser (it has to work headless, where
+    // there IS no browser).  The editor drains this on its 30 Hz mirror and
+    // does the recovery - load a style, then start - so pressing PLAY with
+    // nothing loaded now PLAYS instead of appearing dead.
+    //
+    // Relaxed is right: it is a one-bit hint between two threads with no other
+    // state hanging off it.
+    //==========================================================================
+    void notePlayRefusedNoStyle() noexcept
+    {
+        playRefusedNoStyle.store (true, std::memory_order_relaxed);
+    }
+
+    /** True ONCE per refusal.  Consuming it here means a stream of presses
+        cannot queue a stream of recoveries. */
+    bool consumePlayRefusedNoStyle() noexcept
+    {
+        return playRefusedNoStyle.exchange (false, std::memory_order_relaxed);
+    }
     void togglePianoMode() noexcept { pianoMode.store (! pianoMode.load()); }
     void toggleHold();
     void requestRestart() noexcept { restartRequested.store (true); }
@@ -764,7 +1545,10 @@ public:
     // it inside its own note-on shift.  That is what makes the knob move the
     // STYLE parts and not just the solo voices, and it is why turning it while
     // notes are held is safe (Channel latches the shift per note).
-    static constexpr int kMaxTranspose = 12;
+    // 11, not 12: an octave is the same note, so the twelfth step only ever
+    // duplicated the root a player already had at 0.  Eleven each way covers
+    // every key without offering a position that does nothing.
+    static constexpr int kMaxTranspose = 11;
 
     void setGlobalTranspose (int semis) noexcept
     {
@@ -864,6 +1648,11 @@ public:
         // to follow the library scan and cover all three.
         engine.setInstrumentPresetFolders      (allInstrumentPresetsFolders());
         engine.setStyleInstrumentPresetFolders (allStyleInstrumentPresetsFolders());
+
+        // EDM KIT base kits (.dsin) live in the GM pack beside the style presets,
+        // so they follow the library root like everything else.
+        EdmKitFiles::setBaseKitFolder (folderManager.getGmSoundsFolder()
+                                                    .getChildFile ("style_instruments_presets"));
     }
     int              getSoundLibraryCount() const   { return engine.getSoundLibraryCount(); }
     std::vector<int> getInstrumentFlags()   const   { return engine.getInstrumentFlags(); }
@@ -959,6 +1748,54 @@ public:
             engine.setChannelGlobalVelCurve (
                 Betel::SamplePlayerEngine::kNumStyleChannels + i, curve);
     }
+
+    //==========================================================================
+    /** ENERGY — style dynamics, 0..100 with 50 = EXACTLY AS AUTHORED.
+
+        The style side's twin of setSoloLowVelBoost: that one owns the global
+        velocity-curve term on the eight solo channels, this one owns it on the
+        sixteen style channels.  See SamplePlayerEngine::setStyleEnergyCurve for
+        why sharing that term is free and why the ordering does not matter.
+
+        0..200 WITH 100 AS NEUTRAL, matching gainPercent.  It was 0..100 with a
+        50 detent, and 50-is-neutral reads as "half" on a 0..100 slider however
+        the detent is drawn.  100-is-unity is a convention this plugin already
+        has and nobody misreads.
+
+        The stored curve is unchanged - only the number on screen moved - so no
+        set migrates and nothing sounds different at the same setting.
+
+        WHAT IT CANNOT DO: 0 and 127 are fixed points of the curve, so this
+        reshapes the DISTRIBUTION - widening the gap between an ordinary hit and
+        an accent, and reaching the kit's softer sample layers - but it never
+        lowers the ceiling.  A style that slams still needs the sweetener's PEAK
+        stage or a trim.  Two controls, two different jobs. */
+    void setStyleEnergy (int energy) noexcept
+    {
+        const int e = juce::jlimit (0, 200, energy);
+        styleEnergy.store (e, std::memory_order_relaxed);
+        engine.setStyleEnergyCurve ((float) (e - 100) / 100.0f);
+    }
+
+    /** ENERGY as a CURVE OFFSET, which is what the instrument editor has to add
+        to a slot's own velocity curve to show what is actually in force.
+
+        The two compose by ADDITION and that is exact, not an approximation:
+        VelCurve is out = 127*(in/127)^g with g = 2.5^-curve, so running two
+        curves in sequence multiplies the exponents - and multiplying 2.5^-a by
+        2.5^-b is 2.5^-(a+b).  ENERGY is therefore a pure offset: every slot
+        keeps its voicing relative to every other, and nothing has to be written
+        into a slot to make the control work. */
+    float getStyleEnergyCurveOffset() const noexcept
+    { return (float) (getStyleEnergy() - 100) / 100.0f; }
+
+    int getStyleEnergy() const noexcept
+    { return styleEnergy.load (std::memory_order_relaxed); }
+
+    /** Re-push the stored value.  ENERGY is not part of any slot's params, so
+        nothing re-asserts it when the style slots are re-voiced; called beside
+        the other startup pushes rather than reasoned about. */
+    void pushStyleEnergy() noexcept { setStyleEnergy (getStyleEnergy()); }
 
     /** Re-push whatever the master file currently says.  Called at startup
         beside the other master pushes, so a saved value is live before the
@@ -1121,14 +1958,10 @@ public:
     //==========================================================================
     // PRESETS NOW LIVE INSIDE THE PACK THEY DESCRIBE.
     //
-    // This used to derive one shared folder from the library's parent.  With
-    // three packs that answer is wrong in both directions: a WORLD sound's
-    // preset must be WRITTEN into the world pack (so deleting the pack takes
-    // its voicing with it), and READING has to cover all three at once.
-    //
-    // So the getter takes the FLAG and routes by the pack the engine says that
-    // flag came from.  A negative flag - "no particular instrument" - answers
-    // GM, which is the pack that is always installed.
+    // The getter takes the FLAG and routes by the pack the engine says that
+    // flag came from.  In Ballada that always resolves to GM - there is nowhere
+    // else to route to - but the routing is kept rather than short-circuited so
+    // this file stays a straight diff against Grex's copy.
     //==========================================================================
     juce::File getInstrumentPresetsFolder (int flag = -1) const
     {
@@ -1136,7 +1969,8 @@ public:
                    flag < 0 ? 0 : engine.getInstrumentPack (flag));
     }
 
-    /** All three, for the read side. */
+    /** The read side.  ONE FOLDER PER PACK, merged - a pack ships its sounds
+        and their voicing together, so both arrive and leave together. */
     std::vector<juce::File> allInstrumentPresetsFolders() const
     {
         return { folderManager.getPackPresetsFolder (0),
@@ -1209,18 +2043,59 @@ public:
             return true;
         }
 
+        // ── A MELODIC STYLE SLOT WRITES NO FILE, BECAUSE THE SET OWNS IT ────
+        //
+        // melodicPresetFor refuses style channels, so a .ins written from here
+        // is never read back on this slot - it is dead weight. That alone would
+        // only be waste. The harm is what it does to the RIGHT HAND: the file
+        // is keyed by INSTRUMENT, so calibrating the PAD's strings rewrote the
+        // base of the solo strings too, and a slot the user never touched
+        // changed level. Two slots, one file, one of them not even reading it.
+        //
+        // The set is the melodic style slot's only voicing authority - the same
+        // rule melodicPresetFor, effectiveBaseUnityDb and reassertStyleSlotVoicing
+        // already enforce. So this pushes the value to the engine to make it
+        // audible now and returns; SoundsTab has already put it into the slot's
+        // SlotParams, and SAVE SET is what persists it.
+        //
+        // No schedulePresetReload either: there is no file to re-read, and
+        // reapplyMelodicPreset skips style channels anyway.
+        if (Betel::SamplePlayerEngine::isStyleChannel (channelIdx))
+        {
+            engine.setChannelInstrumentGainPercent (channelIdx, 100.0f, baseUnityDb);
+            return true;
+        }
+
         const int flag = engine.getChannelInstrumentFlag (channelIdx);
         if (flag < 0) return false;
 
         const juce::String name = engine.getInstrumentName (flag);
         const juce::String frb  = engine.getInstrumentFile (flag).getFileName();
 
+        // ── SOLO SCOPE ONLY.  THE STYLE SCOPE IS NOT THIS EDIT'S TO WRITE ───
+        //
+        // This used to write BOTH files, and that is the same bug the style
+        // branch above already documents, running the other way.  Up there:
+        // "calibrating the PAD's strings rewrote the base of the solo strings
+        // too, and a slot the user never touched changed level."  It was fixed
+        // by making a style edit write no file - and the solo side was left
+        // writing two.
+        //
+        // What that cost: setting the right-hand piano to +8 dB wrote a
+        // STYLE-scope .ins for the same instrument, SamplePlayerEngine scans
+        // those folders into styleInstrumentPresets and pools them, so every
+        // style slot holding that sound came up 8 dB louder.  Nothing got
+        // quieter; one instrument got louder everywhere, permanently, and every
+        // other part had to be raised to catch it.
+        //
+        // It was unfixable from the UI too.  A style slot's base is owned by the
+        // SET - melodicPresetFor refuses style channels - so nothing a user
+        // could do to a style slot would ever rewrite that file, and
+        // resetAllSoloBaseUnity cleared only the solo copy.  One edit wrote two
+        // scopes and one reset cleared one.
         const auto a = Betel::InstrumentPresetIO::writeBaseUnity (
                            getInstrumentPresetsFolder (flag), flag, name, frb,
                            baseUnityDb, /*isDrum*/ false, /*isStyle*/ false);
-        const auto b = Betel::InstrumentPresetIO::writeBaseUnity (
-                           getStyleInstrumentPresetsFolder (flag), flag, name, frb,
-                           baseUnityDb, /*isDrum*/ false, /*isStyle*/ true);
 
         rescanInstrumentPresets();
 
@@ -1229,7 +2104,7 @@ public:
         engine.setChannelInstrumentGainPercent (channelIdx, 100.0f, baseUnityDb);
         schedulePresetReload (flag, /*isDrumKit*/ false);
 
-        return a != juce::File() && b != juce::File();
+        return a != juce::File();
     }
 
     /** The base unity currently on file for this channel's instrument, so the
@@ -1254,6 +2129,63 @@ public:
         if (flag >= 0 && engine.presetParamsForAnyScope (channelIdx, flag, sp))
             return sp.baseUnityDb;
         return 0.0f;
+    }
+
+    //==========================================================================
+    //  EVERY SOLO INSTRUMENT'S BASE UNITY BACK TO 0 dB, IN ONE PASS.
+    //
+    //  The single-instrument path above is setInstrumentBaseUnity, and doing a
+    //  whole library through it means opening the calibration dialog once per
+    //  sound.  This is the same write, applied to every .ins in every installed
+    //  pack's instruments_presets folder.
+    //
+    //  SOLO SET ONLY (.ins).  The .sins half of the split is not touched: a
+    //  melodic STYLE slot takes its voicing from the SET rather than from a
+    //  preset file (melodicPresetFor refuses style channels outright), so the
+    //  style files are not what any solo base gain is read from.
+    //
+    //  AND IT IS AUDIBLE IMMEDIATELY.  Rewriting the files alone would leave
+    //  every currently-loaded sound on the base it was loaded with until the
+    //  next program change, so the pass ends by re-reading the folder and
+    //  re-applying to each solo channel - the same rescan-then-reapply the
+    //  scheduled reload does after a single save, run inline because there is
+    //  no burst of edits to coalesce here.
+    //
+    //  Returns the number of files that actually changed.
+    //==========================================================================
+    int resetAllSoloBaseUnity()
+    {
+        int written = 0;
+
+        for (const auto& folder : allInstrumentPresetsFolders())
+            written += Betel::InstrumentPresetIO::resetBaseUnityInFolder (folder,
+                                                                          /*isStyle*/ false);
+
+        // AND THE STYLE SCOPE, because until now nothing could clear it.  Solo
+        // edits used to write style-scope files that no style edit could ever
+        // rewrite and this reset did not touch, so a stray calibration was
+        // permanent.  Nothing writes them any more - see setInstrumentBaseUnity -
+        // but the ones already on disk still have to be removable.
+        for (const auto& folder : allStyleInstrumentPresetsFolders())
+            written += Betel::InstrumentPresetIO::resetBaseUnityInFolder (folder,
+                                                                          /*isStyle*/ true);
+
+        rescanInstrumentPresets();
+
+        for (int sl = 0; sl < Betel::SamplePlayerEngine::kNumSoloChannels; ++sl)
+        {
+            const int ch   = Betel::SamplePlayerEngine::kNumStyleChannels + sl;
+            const int flag = engine.getChannelInstrumentFlag (ch);
+            if (flag < 0) continue;
+
+            engine.reapplyMelodicPreset (flag);
+
+            // Let the SOUNDS tab adopt the new value too, or its editor would
+            // keep showing the old base until the slot was re-picked.
+            if (onPresetReloaded) onPresetReloaded (flag, /*isDrumKit*/ false);
+        }
+
+        return written;
     }
 
     /** The saved voice governing whatever is loaded on this channel, if any.
@@ -1338,9 +2270,14 @@ public:
     {
         return engine.kitUnityKeyForChannel (channelIdx);
     }
-    juce::String getKitNameForKitKey (int unityKey) const
+    /** PASS channelIdx WHENEVER YOU HAVE IT.  A Revo! style's kit is redirected
+        to Standard at compose time (see revoFallbackFamily), and that redirect
+        is keyed on the CHANNEL'S drum bank — so without the channel this
+        returns the kit the PC maps to rather than the one that is sounding.
+        Omitting it is only correct where no channel is in hand. */
+    juce::String getKitNameForKitKey (int unityKey, int channelIdx = -1) const
     {
-        return engine.kitNameForUnityKey (unityKey);
+        return engine.kitNameForUnityKey (unityKey, channelIdx);
     }
 
     //==========================================================================
@@ -1351,6 +2288,176 @@ public:
     // Absent block = a set written before this existed, and absent means "no
     // opinion": whatever the .drm or the load path applied stands.
     //==========================================================================
+    //==========================================================================
+    // SECTION FX — the two shared reverb/delay buses, as a set block.
+    //
+    // ONE BLOCK FOR BOTH SECTIONS, indexed 0 = LEFT (style + drums), 1 = RIGHT
+    // (solo).  These are not per-slot and never were: there is exactly one delay
+    // and one reverb behind each section, so a set carries two of each and every
+    // slot in a section reads the same values.
+    //
+    // The per-slot reverb/delay fields still in SoundsState are the SENDS now
+    // (see Channel::applyParams) - `reverbWet` and `delayWet` are read, the rest
+    // are inert and will fall out of the file on its next save.
+    //==========================================================================
+    //==========================================================================
+    // THE REVERB / DELAY PAGES EDIT THE BUS, NOT THE SLOT
+    //
+    // EffectsPanel is templated over the params struct and has no idea an engine
+    // exists - it reads and writes SlotParams fields and nothing else.  Rather
+    // than teach it about section buses, the two fields it exchanges are
+    // OVERLAID at the seam: the bus's values are written into the SlotParams
+    // copy just before the page is seeded, and read back out of it just after
+    // the user moves something.
+    //
+    // The page therefore shows the same reverb from every slot in a section,
+    // which is the requirement, and does it without a single new control.
+    //
+    // WHAT IS NOT OVERLAID: reverbWet and delayWet.  Those are the per-slot
+    // SENDS - the one genuinely per-instrument thing on either page - and
+    // overwriting them from the bus would make every slot in a section share one
+    // send amount, which is the opposite of the point.
+    //
+    // `section` is 0 = LEFT (style + drums), 1 = RIGHT (solo).
+    //==========================================================================
+    /** The section's global effect rack, for the GLOBAL EFFECTS window.
+
+        Handed out whole rather than proxied field by field: the window binds
+        EffectsPanel to it through SectionFxBridge, which lives with the window
+        because it speaks FamilyFxParams — a UI type this file has no business
+        including. */
+    Betel::SectionSendFx&       sectionFx (int s)       noexcept { return engine.sectionFx (s); }
+    const Betel::SectionSendFx& sectionFx (int s) const noexcept { return engine.sectionFx (s); }
+
+    // readSectionFxInto / writeSectionFxFrom are GONE.
+    //
+    // They bridged the section rack to a SlotParams so the per-slot REVERB and
+    // DELAY pages could edit it.  Those pages are gone — the editor's third tab
+    // is EFFECT SENDS now — and the rack is reached through sectionFx() above,
+    // which the GLOBAL EFFECTS window binds to EffectsPanel via
+    // SectionFxBridge.  One route, one owner.
+
+    //==========================================================================
+    // SECTION FX — all six global effects as one set block.
+    //
+    // 0 = LEFT (style + drums), 1 = RIGHT (solo), three effects each — chorus,
+    // reverb and delay.  Wah, phaser and sweetener are not here: they are
+    // per-instrument inserts and travel in SoundsState with their slot.  None of it
+    // is per-slot: there is exactly one of each behind a section, so a set
+    // carries two of each and every slot in a section reads the same values.
+    //
+    // The per-slot reverb/delay/chorus/wah/phaser fields still in SoundsState
+    // are the SENDS now (see Channel::applyParams) — their mix and wet values
+    // are read, the rest are inert and fall out of the file on its next save.
+    //==========================================================================
+    juce::ValueTree captureSectionFxState() const
+    {
+        using S = Betel::SectionSendFx;
+        juce::ValueTree t ("SectionFx");
+
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto& fx = engine.sectionFx (i);
+            juce::ValueTree b (i == 0 ? "Left" : "Right");
+
+            for (int sl = 0; sl < S::kNumSlots; ++sl)
+            {
+                const juce::String n (S::slotName (sl));
+                b.setProperty (n + "On",    fx.enabled[(size_t) sl].load(), nullptr);
+                b.setProperty (n + "Level", fx.level  [(size_t) sl].load(), nullptr);
+            }
+
+            b.setProperty ("chorusRateHz", fx.chorusRateHz.load(), nullptr);
+            b.setProperty ("chorusDepth",  fx.chorusDepth .load(), nullptr);
+            b.setProperty ("chorusCentre", fx.chorusCentreMs.load(), nullptr);
+
+            // Wah and phaser are NOT here.  They went back to being per-instrument
+            // inserts — a shaper cannot be fed by a send, and they need their own
+            // settings per slot — so their parameters live in the slot state with
+            // the rest of that instrument, not in this block.
+            b.setProperty ("reverbSize",   fx.reverbSize   .load(), nullptr);
+            b.setProperty ("reverbDamp",   fx.reverbDamp   .load(), nullptr);
+            b.setProperty ("reverbTail",   fx.reverbTail   .load(), nullptr);
+            b.setProperty ("reverbPreDelay",fx.reverbPreDelay.load(), nullptr);
+            b.setProperty ("reverbHpNorm", fx.reverbHpNorm .load(), nullptr);
+            b.setProperty ("reverbLpNorm", fx.reverbLpNorm .load(), nullptr);
+            b.setProperty ("reverbErMix",  fx.reverbErMix  .load(), nullptr);
+            b.setProperty ("reverbErSize", fx.reverbErSize .load(), nullptr);
+            b.setProperty ("reverbAlgo",   fx.reverbAlgo   .load(), nullptr);
+
+            b.setProperty ("delayFeedback",fx.delayFeedback.load(), nullptr);
+            b.setProperty ("delayDampHz",  fx.delayDampHz  .load(), nullptr);
+            b.setProperty ("delayHpHz",    fx.delayHpHz    .load(), nullptr);
+            b.setProperty ("delaySmoothMs",fx.delaySmoothMs.load(), nullptr);
+            b.setProperty ("delayTimeSig", fx.delayTimeSig .load(), nullptr);
+            b.setProperty ("delayDiv",     fx.delayDiv     .load(), nullptr);
+
+            t.appendChild (b, nullptr);
+        }
+        return t;
+    }
+
+    void applySectionFxState (const juce::ValueTree& t)
+    {
+        using S = Betel::SectionSendFx;
+        if (! t.isValid() || ! t.hasType ("SectionFx")) return;
+
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto b = t.getChildWithName (i == 0 ? "Left" : "Right");
+            if (! b.isValid()) continue;                 // absent means unchanged
+
+            auto& fx = engine.sectionFx (i);
+            auto f = [&b] (const char* k, float d) { return (float) (double) b.getProperty (k, d); };
+            auto n = [&b] (const char* k, int   d) { return (int)          b.getProperty (k, d); };
+
+            for (int sl = 0; sl < S::kNumSlots; ++sl)
+            {
+                const juce::String nm (S::slotName (sl));
+                fx.enabled[(size_t) sl].store ((bool) b.getProperty (nm + "On",
+                                                fx.enabled[(size_t) sl].load()));
+                fx.level  [(size_t) sl].store (juce::jlimit (0.0f, 2.0f,
+                        (float) (double) b.getProperty (nm + "Level",
+                                                        fx.level[(size_t) sl].load())));
+            }
+
+            fx.chorusRateHz.store (juce::jlimit (0.01f, 20.0f, f ("chorusRateHz", fx.chorusRateHz.load())));
+            fx.chorusDepth .store (juce::jlimit (0.0f,  1.0f,  f ("chorusDepth",  fx.chorusDepth .load())));
+            fx.chorusCentreMs.store (juce::jlimit (1.0f, 50.0f, f ("chorusCentre", fx.chorusCentreMs.load())));
+
+            // Wah and phaser: see captureSectionFxState.  A set written before
+            // they moved still carries those properties; they are simply not
+            // read, which is the same "absent means unchanged" rule this whole
+            // block follows.
+            fx.reverbSize   .store (juce::jlimit (0.0f, 1.0f, f ("reverbSize",     fx.reverbSize.load())));
+            fx.reverbDamp   .store (juce::jlimit (0.0f, 1.0f, f ("reverbDamp",     fx.reverbDamp.load())));
+            fx.reverbTail   .store (juce::jlimit (0.0f, 1.0f, f ("reverbTail",     fx.reverbTail.load())));
+            fx.reverbPreDelay.store(juce::jlimit (0.0f, 1.0f, f ("reverbPreDelay", fx.reverbPreDelay.load())));
+            fx.reverbHpNorm .store (juce::jlimit (0.0f, 1.0f, f ("reverbHpNorm",   fx.reverbHpNorm.load())));
+            fx.reverbLpNorm .store (juce::jlimit (0.0f, 1.0f, f ("reverbLpNorm",   fx.reverbLpNorm.load())));
+
+            // A set saved before early reflections existed carries neither
+            // property, so both fall back to the live value - which on a fresh
+            // load is the 0.0 default, i.e. the reverb exactly as it was.  That
+            // is the whole reason the default had to be a no-op.
+            fx.reverbErMix  .store (juce::jlimit (0.0f, 1.0f, f ("reverbErMix",    fx.reverbErMix.load())));
+            fx.reverbErSize .store (juce::jlimit (0.0f, 1.0f, f ("reverbErSize",   fx.reverbErSize.load())));
+
+            fx.reverbAlgo   .store (juce::jlimit (0, 1,       n ("reverbAlgo",     fx.reverbAlgo.load())));
+
+            fx.delayFeedback.store (juce::jlimit (0.0f, 0.95f, f ("delayFeedback", fx.delayFeedback.load())));
+
+            // Absent in a set written before these existed, so all three fall
+            // back to the live value - which on a fresh load is the old
+            // hard-coded behaviour.
+            fx.delayDampHz  .store (juce::jlimit (200.0f, 20000.0f, f ("delayDampHz",   fx.delayDampHz.load())));
+            fx.delayHpHz    .store (juce::jlimit (20.0f,  2000.0f,  f ("delayHpHz",     fx.delayHpHz.load())));
+            fx.delaySmoothMs.store (juce::jlimit (1.0f,   500.0f,   f ("delaySmoothMs", fx.delaySmoothMs.load())));
+            fx.delayTimeSig .store (juce::jlimit (0, 1,        n ("delayTimeSig",  fx.delayTimeSig.load())));
+            fx.delayDiv     .store (juce::jmax  (0,            n ("delayDiv",      fx.delayDiv.load())));
+        }
+    }
+
     juce::ValueTree captureKitUnityState() const
     {
         juce::ValueTree t ("KitUnity");
@@ -1411,6 +2518,11 @@ public:
             // change reloads it; name it by family for a readable file name.
             juce::String kit = params.drumKit.lastLoadedKit;
             if (kit.isEmpty()) kit = engine.getChannelDrumKitName (channelIdx);
+
+            // EDM KIT: a synth kit is saved with the set, never as a sampled
+            // kit's default.  "EDM Dance".getIntValue() is 0, so writing it
+            // here would overwrite the STANDARD kit's default file.
+            if (kit.startsWith ("EDM ")) return {};
             const int flag = kit.getIntValue();
 
             const auto out = Betel::InstrumentPresetIO::write (
@@ -1556,6 +2668,37 @@ public:
         once at startup, right after MasterSettings::load. */
     void applyStoredSoloBaseUnity()
     { engine.setSoloBusBaseUnity (Betel::MasterSettings::get().getSoloBaseUnityGain()); }
+
+    //==========================================================================
+    // STYLE BUS BASE UNITY -- what the STYLE VOLUME fader's unity detent is worth.
+    //
+    // PER SET, and that is the difference from the solo base above.  The solo
+    // base describes this INSTALL's balance between the player's two hands,
+    // which no song changes.  This one describes how loud the band should sit
+    // for THIS song, so it travels in MixerState beside the faders.
+    //
+    // The FADER IS NOT MOVED -- same rule as the solo base and the crash box.
+    //==========================================================================
+    static constexpr float kDefaultStyleBaseUnityDb =   0.0f;
+    static constexpr float kMinStyleBaseUnityDb     = -24.0f;
+    static constexpr float kMaxStyleBaseUnityDb     =  24.0f;
+
+    void setStyleBaseUnityDb (float dB)
+    {
+        const float v = juce::jlimit (kMinStyleBaseUnityDb, kMaxStyleBaseUnityDb, dB);
+        styleBaseUnityDb.store (v);
+        engine.setStyleBusBaseUnity (std::pow (10.0f, v / 20.0f));
+    }
+
+    float getStyleBaseUnityDb() const noexcept { return styleBaseUnityDb.load(); }
+
+    //==========================================================================
+    // THE STYLE DUCKER -- lives in the engine because it acts on the style bus
+    // before the sum; exposed here so the editor can reach it.  Its window is
+    // a TAB of the Finisher, which is a UI grouping and not a signal one.
+    //==========================================================================
+    Betel::StyleDucker& getDucker() noexcept             { return engine.getDucker(); }
+    const Betel::StyleDucker& getDucker() const noexcept { return engine.getDucker(); }
     float getRightHandVolume() const                              { return engine.getSoloBusGain(); }
     /** The master fader gain BEFORE the boost is folded in — i.e. what the
         mixer's master fader shows.  applyMasterOut() multiplies this by the
@@ -1563,6 +2706,78 @@ public:
         the product and a save/restore round trip would compound it. */
     float getMasterVolume  () const noexcept                      { return masterFaderGain.load(); }
     void setChannelVolume  (int channelIdx, float linearGain)     { engine.setChannelVolume(channelIdx, linearGain); }
+
+    /** Every user fader back to 127 - "whatever the style asks for".  Called by
+        the EDITOR at the two moments that mean a fresh mix: a set load (just
+        before the set applies its own faders) and a bare style load (where no
+        set is coming).  Deliberately NOT called per style adopt - see the note
+        in adoptFreshStyle. */
+    /** THE GLOBAL STYLE BOOST, in dB.  One entry point for every caller - the
+        GLOBAL SETTINGS slider and the MIDI remote - because it has to do three
+        things in order and doing two of them is what made the slider look dead:
+        store the value, write grex_boost.xml, and push it to the style bus. */
+    void setStyleBoostDb (float db)
+    {
+        Betel::StyleLevels::get().setBoostDbAndSave (db);
+        stylePlayer.pushStyleBoost();
+    }
+
+    float getStyleBoostDb() const { return Betel::StyleLevels::get().boostDb(); }
+
+    void setChannelFunkeyFx (int ch, const Betel::Channel::FunkeyFx& f)
+    { engine.setChannelFunkeyFx (ch, f); }
+
+    /** THE FUNKEY MIX, 0..1 - one value for every funkeyed instrument, owned
+        by the SET (it travels in the set's UiState; see
+        GlobalMacros::kFunkeyMixDefault).  One entry point that does both
+        halves: store the live value, then push it to the engine.  Doing only
+        the first is how a slider looks dead. */
+    void setFunkeyMix (float mix01)
+    {
+        Betel::GlobalMacros::get().setFunkeyMix (mix01);
+        engine.setFunkeyMix (Betel::GlobalMacros::get().funkeyMix());
+    }
+
+    float getFunkeyMix() const { return Betel::GlobalMacros::get().funkeyMix(); }
+
+    void resetUserVolumesToUnity() { engine.resetUserVolumesToUnity(); }
+
+    //==========================================================================
+    //  WHERE A STYLE'S SET LIVES — ON THE PROCESSOR, NOT THE EDITOR.
+    //
+    //  This used to be MainComponent::setFileForStyle, and it had to move.  The
+    //  editor applies sets, but the editor is not always THERE: a DAW project
+    //  reopened with the window closed never ran applySetPayload at all.  That
+    //  was survivable while CC 7 seeded every fader on every load and the set
+    //  merely overwrote it afterwards.  It stopped being survivable the moment
+    //  CC 7 stood down for styles that have a set - the set became the only
+    //  thing setting those levels, so the processor has to be able to find and
+    //  apply it on its own.
+    //
+    //  The editor now calls these too, so there is ONE spelling of the rule.
+    //==========================================================================
+
+    /** The .bset a style would use, whether or not it exists.  Invalid File if
+        the root folder is not set. */
+    juce::File setFileForStyleRef (const juce::String& styleRef) const;
+
+    /** The style's set as a tree, or an invalid tree if there is no set file or
+        it will not parse. */
+    juce::ValueTree setTreeForStyleRef (const juce::String& styleRef) const;
+
+    /** The MixerState node of that set, or an invalid tree.
+
+        THE TEST IS THE NODE, NOT THE FILE.  A .bset can hold only <StyleSlots> -
+        applySetPayload handles exactly that case - and a slots-only set must NOT
+        suppress CC 7, or every fader would sit wherever the reset left it with
+        nothing to state otherwise. */
+    juce::ValueTree mixerSetForStyleRef (const juce::String& styleRef) const;
+
+    /** The POST base trim on a style mixer fader, in dB. A third factor on top
+        of the style's own level and the fader; it never changes what the style
+        sent. Saved in the set, reset to 0 dB on a style load. */
+    void  setChannelUserBaseDb (int channelIdx, float db) { engine.setChannelUserBaseDb (channelIdx, db); }
+    float getChannelUserBaseDb (int channelIdx) const     { return engine.getChannelUserBaseDb (channelIdx); }
     float getChannelVolume (int channelIdx) const                 { return engine.getChannelVolume(channelIdx); }
 
     //==========================================================================
@@ -1802,6 +3017,19 @@ private:
     std::atomic<float>        masterFaderGain { 1.0f };   // pre-boost gain (fader / CC)
     std::atomic<float>        masterBoostDb   { 0.0f };   // selected boost, default 0 dB
 
+    // Per-set STYLE VOLUME base unity in dB.  Held here rather than read back
+    // from the engine because the engine stores the LINEAR gain, and a
+    // dB -> linear -> dB round trip through a save file drifts.
+    std::atomic<float>        styleBaseUnityDb { kDefaultStyleBaseUnityDb };
+    std::atomic<int>          lastMidiSeq      { 0 };
+
+
+    // THE STYLES FOLDER, scanned for loose .fst files. The blob library it
+    // replaced is gone entirely - see FstLibrary.h for why the filename is
+    // now the style id.
+    Betel::FstLibrary styleLibrary;
+    juce::String                   currentStyleRef;
+
     // ── Style pipeline ────────────────────────────────────────────────────────
     Betel::StyleSequencer                       sequencer;
 
@@ -1827,7 +3055,21 @@ private:
     // closed, so re-opening the window never reverts state or re-cues playback.
     bool                                           editorInitialized = false;
     juce::ValueTree                                editorSnapshot;
+    std::atomic<bool>                              projectStateRestored { false };
     std::atomic<uint8_t>                           soloEnableMask { 0 };
+    // Harmony. See the setters above for why these are relaxed.
+    // Multi split. See setMultiSplitEnabled for the zone model.
+    // Manual bass / bass to lowest. See setManualBassEnabled.
+    std::atomic<bool> manualBassOn      { false };
+    std::atomic<bool> bassInversionOn  { false };
+    std::atomic<int>  bassInversionMode { (int) BassInversionMode::Always };
+    std::atomic<bool> multiSplitOn   { false };
+    std::atomic<int>  bassSplitPoint { 48 };      // C3
+    std::atomic<int>  bassZoneSlot   { kBassSlotDefault };
+    std::atomic<bool> harmonyOn    { false };
+    std::atomic<int>  harmonyType  { (int) Betel::Harmonizer::Type::Duet };
+    std::atomic<bool> harmonyBelow { true };
+    std::atomic<int>  harmonyLevel { 82 };
     std::atomic<int>                               globalTranspose { 0 };
     std::atomic<bool>                              pianoMode { false };
 
@@ -1835,9 +3077,19 @@ private:
     // perfSongBeats is the monotonic performance beat clock used to timestamp
     // recorded events; it is touched only on the audio thread.
     GrexSongRecorder                               songRecorder;
+    GrexSongRecorder::Setup                        songSetup;
     GrexSongPlayer                                 songPlayer;
     double                                         perfSongBeats { 0.0 };
+
+    /** A variation gesture waiting to be written into the song.
+        Parked by whichever thread made it, drained by the audio thread - see
+        performVariation for why it cannot be recorded where it happens. */
+    std::atomic<int>                               pendingUiGesture { -1 };
     std::atomic<bool>                              restartRequested { false };
+    // Raised by togglePlayStop when it cannot start for want of a style;
+    // drained by the editor's mirror, which does the recovery.  See
+    // notePlayRefusedNoStyle above.
+    std::atomic<bool> playRefusedNoStyle { false };
     // Tracks the sequencer's playing state across audio blocks so we can flush
     // hung style notes on the playing->stopped edge (audio thread only).
     bool                                           wasSequencerPlaying { false };
@@ -1848,7 +3100,21 @@ private:
     juce::String                                   comments;
 
     // Dispatch a reserved control-note (0–35) to its action.  Audio thread.
-    void handleControlNote (int note);
+    /** Drive one mapped control.  `value` is 0-127 (a CC value, or 127 for a
+        pad). Processor state only — see the comment on the definition. */
+    void performRemote (Betel::RemoteId id, int value);
+
+    /** The RELEASE half of RemoteMap::Mode::Push - see performRemoteRelease in
+        Main.cpp.  Only stateful controls have anything to give back. */
+    void performRemoteRelease (Betel::RemoteId id);
+
+    /** True once the player has assigned ANY pad, which retires the legacy
+        0-35 control-note block. See the note dispatch in processBlock. */
+    /** Set by the audio thread when a remote moved something; the editor's
+        30 Hz mirror consumes it. */
+    std::atomic<bool> remoteTouched { false };
+
+
 
     //==========================================================================
     // MIDI CC CONTROL - NOTHING IS ASSIGNED UNTIL THE USER ASSIGNS IT.
@@ -1904,7 +3170,17 @@ private:
     void applyCcToTarget (int target, int value);
 
     // Tap-tempo + tempo-mode state (message thread writes, audio thread reads).
+    //
+    // manualBPM is DERIVED from the two below and is the only one processBlock
+    // reads - see the tempo block in the public section for the invariant.
     std::atomic<float>                             manualBPM { 120.0f };
+    std::atomic<float>                             styleBaseBPM { 120.0f };  // the loaded style's own tempo
+    std::atomic<float>                             userBpmDelta { 0.0f };    // the player's nudge, in BPM. SAVED WITH THE SET
+
+    // ENERGY, 0..100, 50 = as authored.  SAVED WITH THE SET, like the tempo
+    // nudge and for the same reason: how hard the band plays belongs to the
+    // song, not to the installation.
+    std::atomic<int>                               styleEnergy  { 100 };
     std::atomic<bool>                              tempoSyncedToHost { false }; // FREE default (matches selector)
     std::atomic<float>                             tempoSpeedMult { 1.0f };
     std::atomic<float>                             currentBaseBPM { 120.0f };   // last resolved base, for UI
@@ -1922,6 +3198,3 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BetelgeuseProcessor)
 };
-
-
-

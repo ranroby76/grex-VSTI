@@ -1,3 +1,6 @@
+
+
+
 //==============================================================================
 // Channel.cpp  —  implementation of the per-channel sampler engine.
 //
@@ -33,7 +36,7 @@
 //==============================================================================
 
 #include "Channel.h"          // pulls JuceHeader.h first
-#include "PerfMonitor.h"
+#include "EdmKitFiles.h"          // EDM KIT base kits (.dsin) + the set's shifts
 #include "GlobalMacros.h"
 #include "DrumKitRegistry.h"
 #include <algorithm>
@@ -110,18 +113,21 @@ namespace Betel
     // A lesson for the next diagnostic: changing one voice class and not the
     // other shifts the BALANCE, so the symptom shows up somewhere other than
     // where the change was made.
+    // ── BOTH AT 1.00: EVERY VOICE IS HEARD AS RECORDED ───────────────────────
+    //
+    // The kit used to be narrowed to 0.35 - "glued" - which made a kit sound
+    // measurably different in Grex from the identical blob in an SFZ player,
+    // with no control anywhere to turn it off. Rob's call: the samples are the
+    // product, and a global tone decision baked into the engine is not.
+    //
+    // WATCH THE BALANCE, NOT JUST THE KITS. The note above this records the
+    // lesson the hard way: changing one voice class and not the other shifts
+    // the RELATIVE level between them. Kits regain their side energy here, so
+    // on a style with genuinely stereo drum samples the kit will sit WIDER and
+    // slightly stronger against the melodic parts than it did. That is the
+    // samples being heard, not a bug - but it is why the mix may want a look.
     static constexpr float kMelodicStereoWidth = 1.00f;   // melodic: as recorded
-    static constexpr float kDrumStereoWidth    = 0.35f;   // kit: narrowed, glued
-
-    //==========================================================================
-    // TEMP kick-mix diagnostics -> D:\workspace\BetelgeuseArranger\grex_drum.txt
-    // (same file the registry's kickmix startup log uses).  Message-thread only.
-    //==========================================================================
-    static void kmLog (const juce::String& line)
-    {
-        GrexPaths::drumLog()      // plugin root — see GrexPaths
-            .appendText ("[kickmix] " + line + juce::newLine);
-    }
+    static constexpr float kDrumStereoWidth    = 1.00f;   // kit:     as recorded
 
     //==========================================================================
     // RBJ biquad coefficient setters (cookbook formulas, normalised by a0).
@@ -203,13 +209,26 @@ namespace Betel
     {
         active = false;
         note = -1; srcNote = -1; fromEditor = false; extraGain = 1.0f;
-        velocity = 0; regionIndex = -1;
+        velocity = 0; regionIndex = -1; synthIndex = -1;
+        oscEngine = false;
+        rrCutoffMul = 1.0f;
         preset.reset();
         playPosition = 0.0;
         currentPitchSemitones  = 60.0;
         targetPitchSemitones   = 60.0;
         glideCoeff = 0.0;
         portamentoActive = false;
+
+        // ATTACK GLIDE.  reset() runs on a STOLEN voice, and a voice caught
+        // mid-scoop would otherwise hand the next note a pitch offset it never
+        // asked for.  startVoice sets all of these anyway on every normal
+        // start; this is for the paths that reset without restarting.
+        glideSemis  = 0.0f;
+        glideDepth  = 0.0f;
+        glidePhase  = 0.0f;
+        glideInc    = 0.0f;
+        glideActive = false;
+
         velocityGain = 1.0f;
         regionGain   = 1.0f;
         kickMixGain  = 1.0f;
@@ -261,8 +280,25 @@ namespace Betel
         currentSampleRate = sampleRate;
         currentBlockSize  = blockSize;
         for (auto& v : voices) v.reset();
+        // EDM KIT: synth voices (one per voice slot) + one voice-block of scratch
+        for (int i = 0; i < kMaxVoices; ++i)
+            synthVoices[i].prepare (sampleRate, 0x9E3779B9u ^ (uint32_t) ((i + 1) * 7919));
+        synthScratch.assign ((size_t) juce::jmax (512, blockSize), 0.0f);
+        if (synthPlaceholder.empty()) synthPlaceholder.resize (1);
         heldNotes.clear();
         currentPitchBendValue = 0.0f;
+
+        // START IDLE.  prepare() runs before a note has ever sounded, and the
+        // block size it was just given is what kChainTailBlocks is measured in -
+        // so a channel that nothing plays never runs its chain at all, rather
+        // than burning the first second of every session on silence.
+        silentBlocks  = kChainTailBlocks;
+        eqListDirty   = true;         // force the band list to rebuild
+
+        // SETTLED, not ramping: prepare() runs before anything sounds, and a
+        // channel that woke up gliding toward its own resting value would put a
+        // swell on its first note for no reason.
+        expSmoothed = expStart = expEnd = channelExpression.load();
 
         tempBuffer.setSize (2, blockSize, false, true, true);
         tempBuffer.clear();
@@ -286,10 +322,39 @@ namespace Betel
         drumFxDry.setSize (2, blockSize, false, true, true);
         drumFxDry.clear();
 
+        // EDM KIT: each family's rack, sweetener and buffer
+        for (int f = 0; f < edm::kNumFamilies; ++f)
+        {
+            // The rack's EQ / SAT / COMP only.  Its reverb and delay never run
+            // (they moved to the section bus), so they are never prepared here -
+            // fifteen families on every channel would allocate them all.
+            auto& bus = edmFamBus[(size_t) f];
+            bus.prepareEq (sampleRate);          // sets bus.sampleRate too
+            bus.compEnv = 0.0f;
+            edmFamSweet[(size_t) f].prepare (sampleRate);
+            edmFamBuf  [(size_t) f].setSize (2, blockSize, false, true, true);
+            edmFamBuf  [(size_t) f].clear();
+        }
+
         // Sounds-path insert FX.
         chorusFx.prepare (sampleRate);
         wahFx   .prepare (sampleRate);
         phaserFx.prepare (sampleRate);
+
+        // FUNKEY's own pair.  SEPARATE INSTANCES MEAN SEPARATE PREPARES — and
+        // forgetting these is exactly what made the funkey phaser ignore its mix
+        // slider: PhaserFx::prepare is what sets sampleRate, prepares the LFO
+        // and resets the all-pass stages, and an unprepared one runs on an
+        // uninitialised LFO whatever it is told.
+        //
+        // ANY NEW STAGE ADDED TO applyFunkeyInPlace BELONGS HERE TOO.
+        funkeyWahFx   .prepare (sampleRate);
+        funkeyPhaserFx.prepare (sampleRate);
+
+        // THE FUNKEY MIX's dry copy - allocated here, never on the audio thread.
+        funkeyDry.setSize (2, blockSize, false, true, true);
+        funkeyDry.clear();
+        funkeyMixNow = funkeyMix.load();
     }
 
     void Channel::release()
@@ -446,7 +511,17 @@ namespace Betel
         return 1.0 - std::exp (-5.0 / n);      // ~99.3% of the way in `secs`
     }
 
-    void Channel::startVoice(Voice* v, int note, int velocity, int regionIdx, bool glideFromCurrent)
+    double Channel::soundingPitchOf (const Voice& v) noexcept
+    {
+        // A voice's pitch is RELATIVE to its own sample: (note - keycenter) +
+        // tune.  The same sounding pitch therefore reads differently on another
+        // sample zone or another voice, which is why a glide must be handed
+        // over in absolute terms.  The SOUND ENGINE's oscOffset is this same
+        // keycenter - tune, so one formula covers both kinds of voice.
+        return v.currentPitchSemitones + (double) v.pitchKeycenter - (double) v.tuneCents / 100.0;
+    }
+
+    void Channel::startVoice(Voice* v, int note, int velocity, int regionIdx, double glideFromPitch)
     {
         if (v == nullptr) return;
         auto pv = std::atomic_load (&active);
@@ -461,13 +536,31 @@ namespace Betel
         const auto& region = regions[(size_t) regionIdx];
         const auto& sample = samples[(size_t) regionIdx];
 
-        const double oldPitchSemi = v->currentPitchSemitones;
         const bool   drumMode     = isDrumChannel.load();
+        // SOUND ENGINE: what this voice was before the note, for a legato hand-over.
+        const bool   wasOscVoice  = v->active && v->oscEngine;
 
         v->active           = true;
         v->note             = note;
         v->velocity         = velocity;
         v->regionIndex      = regionIdx;
+        v->synthIndex       = -1;   // a sample voice, even if this slot last played a synth hit
+
+        // SOUND ENGINE (GM 38 / 39): the oscillators replace this sample.  The
+        // region still does the bookkeeping - ranges, level, the voice slot - but
+        // the engine plays the NOTE: oscOffset cancels the region's root and tune.
+        {
+            const int flag = currentInstrumentFlag.load();
+            v->oscEngine = ! drumMode && oscengine::servesProgram (flag);
+            if (v->oscEngine)
+            {
+                v->oscProgram = flag;
+                v->oscOffset  = (double) region.pitchKeycenter - (double) region.tune / 100.0;
+                oscengine::noteOn (v->osc, (float) velocity / 127.0f,
+                                   (std::uint32_t) ((unsigned) note * 2654435761u + (unsigned) velocity + 1u),
+                                   wasOscVoice);
+            }
+        }
 
         // ── Velocity → gain ──────────────────────────────────────────────────
         // DRUMS use a LINEAR law on the absolute 0..127 scale, peaking at UNITY:
@@ -511,7 +604,9 @@ namespace Betel
                 v->velocityGain = u * (1.4f - 0.7f * u);
             }
         }
-        v->regionGain       = juce::Decibels::decibelsToGain(region.volume);
+        // SOUND ENGINE: the engine has its own level - the old sample's calibration
+        // volume would only make it louder or quieter at random.
+        v->regionGain       = v->oscEngine ? 1.0f : juce::Decibels::decibelsToGain(region.volume);
         v->kickMixGain      = 1.0f;   // KICK MIX overrides this after startVoice for kick voices
 
         // Crossfade state.  allocateVoice returns a FREE voice without calling
@@ -597,9 +692,65 @@ namespace Betel
             }
         }
 
-        if (glideFromCurrent && portamentoTime.load() > 0.1f && ! drumMode)
+        //----------------------------------------------------------------------
+        // MELODIC PSEUDO ROUND ROBIN.
+        //
+        // Two deviations only - pitch and filter cutoff - and BOTH FROM ONE
+        // DRAW.  That is the point rather than an economy: a take that is a
+        // touch brighter is a touch sharper too, because both come from the
+        // player leaning in.  Rolling them separately gives a wobble that reads
+        // as a fault; rolling them together reads as a different take.
+        //
+        // The correlation is deliberately not 1:1.  Cutoff carries the full
+        // deviation because brightness is what the ear compares between takes;
+        // pitch carries 60% of the same draw so it moves WITH the brightness
+        // without ever being the thing you notice.
+        //
+        // Skipped entirely at amount 0, which is the default - so this cannot
+        // change a single existing patch until somebody asks it to.
+        //
+        // Not applied on a glide continuation: startVoice runs for a fresh
+        // voice, and a legato slide keeps the voice it already had, so a held
+        // phrase cannot re-roll under its own sustain.
+        //----------------------------------------------------------------------
+        if (! drumMode)
         {
-            v->currentPitchSemitones = oldPitchSemi;
+            const float vamt = (float) variationAmount.load() * 0.01f;
+
+            if (vamt > 0.0f)
+            {
+                const float draw = rrNextBipolar();          // ONE draw, -1..+1
+
+                v->targetPitchSemitones +=
+                    (double) (draw * 0.6f * vamt * kVarPitchCents) / 100.0;
+
+                // Cents -> ratio.  Stated in cents so the same slider position
+                // means the same musical amount wherever the patch's cutoff
+                // happens to sit; the render path clamps the result to the
+                // filter's legal range.
+                v->rrCutoffMul =
+                    std::pow (2.0f, (draw * vamt * kVarCutoffCents) / 1200.0f);
+            }
+        }
+
+        // ── THE GLIDE STARTS WHERE THE PREVIOUS NOTE ACTUALLY WAS ────────────
+        //
+        // It used to start from THIS voice's own leftover pitch.  But the mono
+        // path hands a glide to a FRESH voice (the old one is fast-released),
+        // and a fresh voice's leftover is either Voice::reset()'s 60 - five
+        // octaves up - or whatever it played last, in another sample's frame.
+        // Every glide that changed voice therefore began somewhere arbitrary
+        // and swooped in: the "laser" on a legato bass crossing a sample zone,
+        // and on every overlapping note with RETRIG on.  Measured on the real
+        // Channel: 40 -> 43 across a zone border started at 104 and fell to 43.
+        //
+        // The caller now passes the pitch the previous note was SOUNDING, and
+        // it is put into this voice's frame here (its sample's keycenter and
+        // tune were set above).
+        if (std::isfinite (glideFromPitch) && portamentoTime.load() > 0.1f && ! drumMode)
+        {
+            v->currentPitchSemitones = glideFromPitch - (double) v->pitchKeycenter
+                                                      + (double) v->tuneCents / 100.0;
             v->glideCoeff = glideCoeffFor ((double) portamentoTime.load(), currentSampleRate);
             v->portamentoActive = true;
         }
@@ -607,6 +758,33 @@ namespace Betel
         {
             v->currentPitchSemitones = v->targetPitchSemitones;
             v->portamentoActive = false;
+        }
+
+        // ── ATTACK GLIDE ─────────────────────────────────────────────────────
+        //
+        // Armed here because startVoice is the ONE place a voice begins - poly
+        // note-on, mono re-attack and the kick-mix layer all come through it -
+        // so there is no path that can start a note and miss this.
+        //
+        // The trigger decision itself is NOT made here: it is made once per
+        // note in noteOn and latched into pendingGlide.  That matters for the
+        // counter and the dice, which must advance once per NOTE and not once
+        // per VOICE - a kick-mix note starts two voices, and counting them
+        // separately would silently halve "every 4th note".
+        v->glideActive = false;
+        v->glideSemis  = 0.0f;
+
+        if (pendingGlide && ! drumMode)
+        {
+            const float ms = juce::jlimit (1.0f, 500.0f, glideTimeMs.load());
+            const float n  = (float) (currentSampleRate * (double) ms * 0.001);
+
+            v->glideDepth  = -juce::jlimit (0.0f, 12.0f, glideDepth.load());
+            v->glidePhase  = 0.0f;
+            v->glideInc    = (n > 1.0f) ? (1.0f / n) : 1.0f;
+            v->glideShapeK = glideShapeK.load();
+            v->glideSemis  = v->glideDepth;
+            v->glideActive = (v->glideDepth < 0.0f);
         }
 
         // All four filter instances, not just the SVF pair: the band HP stage
@@ -636,7 +814,7 @@ namespace Betel
             if (ovS >= 0.0f) aS = ovS;
         }
 
-        v->ampEnv.curve = (AHDSREnvelope::Curve) ampCurve.load();
+        v->ampEnv.curveK = ampCurveK.load();
         v->ampEnv.noteOn  (aA,                 ampHold.load(),  aD,
                            aS,                  currentSampleRate);
         v->filtEnv.noteOn (filtAttack.load(),  filtHold.load(), filtDecay.load(),
@@ -650,14 +828,197 @@ namespace Betel
     }
 
     //==========================================================================
+    //==========================================================================
+    //  EDM KIT - one hit on a synth kit.
+    //
+    //  Mirrors noteOn + startVoice for a sampled drum key, minus everything that
+    //  belongs to a sample (region, loop, offset, source rate, resampling).
+    //  Identical: the three velocity curves, the choke group, allocation and
+    //  stealing, and the per-key amp envelope - so LENGTH, the band filter,
+    //  gain, FX send and the inserts act on a synth hit exactly as on a sample.
+    //
+    //  Velocity: the synth voice applies its own response (level AND tone), so
+    //  velocityGain stays at kVelPeak (v127 = unity) instead of scaling twice.
+    //  Pitch: the per-key PITCH slider becomes the synth's tune.
+    //==========================================================================
+    void Channel::noteOnSynthDrum (const edm::Kit& kit, int note, int velocity,
+                                   bool fromEditor, float extraGain)
+    {
+        const auto& cell = kit.cells[(size_t) note];
+        if (cell.sound.isEmpty()) return;                  // silent key in this kit
+
+        velocity = VelCurve::apply (velocity, globalVelCurve.load());
+        velocity = VelCurve::apply (velocity, drumKeyStates[(size_t) note].velCurve.load());
+        velocity = VelCurve::apply (velocity, energyCurve.load());
+        velocity = juce::jlimit (1, 127, velocity);
+
+        // Choke group - the same 4 ms release the sampled path gives
+        const int cg = drumChokeGroup[(size_t) note].load();
+        if (cg != 0)
+            for (auto& v : voices)
+                if (v.active && v.note >= 0 && v.note < 128
+                    && drumChokeGroup[(size_t) v.note].load() == cg)
+                    v.ampEnv.noteOff (4.0f, currentSampleRate);
+
+        // Per-key cap: past kMaxSynthVoicesPerKey, release this key's oldest
+        // still-sounding hit (30 ms) - it is buried under the new ones anyway.
+        {
+            int    sounding = 0;
+            Voice* oldest   = nullptr;
+            for (auto& v : voices)
+                if (v.active && v.synthIndex >= 0 && v.note == note
+                    && ! v.fadingOut && v.ampEnv.stage != AHDSREnvelope::Release)
+                {
+                    ++sounding;
+                    if (oldest == nullptr || v.startSerial < oldest->startSerial)
+                        oldest = &v;
+                }
+            if (sounding >= kMaxSynthVoicesPerKey && oldest != nullptr)
+                oldest->ampEnv.noteOff (30.0f, currentSampleRate);
+        }
+
+        Voice* v = allocateVoice();
+        if (v == nullptr) return;
+        const int idx = (int) (v - voices);
+
+        v->preset           = nullptr;        // no sample behind this voice
+        v->startSerial      = ++voiceSerialCounter;
+        v->active           = true;
+        v->note             = note;
+        v->srcNote          = note;
+        v->velocity         = velocity;
+        v->regionIndex      = -1;
+        v->synthIndex       = idx;
+        v->edmFamily        = kit.family[(size_t) note];
+        v->synthHpNorm      = cell.filterHpNorm;
+        v->synthLpNorm      = cell.filterLpNorm;
+        v->fromEditor       = fromEditor;
+        v->extraGain        = extraGain;
+        v->velocityGain     = kVelPeak;
+        v->regionGain       = juce::Decibels::decibelsToGain (cell.gainDb);
+        v->kickMixGain      = 1.0f;
+        v->xfadeGain        = 1.0f;
+        v->xfadeInc         = 0.0f;
+        v->fadingOut        = false;
+        v->looping          = false;
+        v->loopStart        = 0;
+        v->loopEnd          = 0;
+        v->pitchKeycenter   = note;
+        v->oscEngine        = false;   // an EDM hit is never the sound engine
+        v->tuneCents        = 0;
+        v->sourceSampleRate = currentSampleRate;
+        v->playPosition     = 0.0;
+        v->targetPitchSemitones  = 0.0;
+        v->currentPitchSemitones = 0.0;
+        v->portamentoActive = false;
+        v->glideActive      = false;
+        v->glideSemis       = 0.0f;
+        v->filterL.reset();
+        v->filterR.reset();
+        v->hpFilterL.reset();
+        v->hpFilterR.reset();
+
+        const auto& st = drumKeyStates[(size_t) note];
+        float aA = ampAttack.load();
+        float aD = ampDecay.load();
+        float aS = ampSustain.load();
+        if (const float ovA = st.userAttackMs.load(); ovA >= 0.0f) aA = ovA;
+        if (const float ovD = st.userDecayMs.load();  ovD >= 0.0f) aD = ovD;
+        if (const float ovS = st.userSustain.load();  ovS >= 0.0f) aS = ovS;
+        v->ampEnv.curveK = ampCurveK.load();
+        v->ampEnv.noteOn  (aA,                 ampHold.load(),  aD,
+                           aS,                  currentSampleRate);
+        v->filtEnv.noteOn (filtAttack.load(),  filtHold.load(), filtDecay.load(),
+                           filtSustain.load(), currentSampleRate);
+        v->pitchEnv.noteOn(pitchAttack.load(), pitchHold.load(), pitchDecay.load(),
+                           pitchSustain.load(), currentSampleRate);
+        v->ampLfo.reset  (ampLfoRate.load(),   ampLfoDelay.load(),   currentSampleRate);
+        v->filtLfo.reset (filtLfoRate.load(),  filtLfoDelay.load(),  currentSampleRate);
+        v->pitchLfo.reset(pitchLfoRate.load(), pitchLfoDelay.load(), currentSampleRate);
+
+        synthVoices[idx].trigger (cell.sound, cell.macros, velocity, st.userPitchSemi.load());
+    }
+
+    //  EDM KIT - the style-driven pool (see Channel.h).
+    void Channel::preloadSynthKit (int program, const edm::Kit& kit)
+    {
+        if (program < 0 || program > 127) return;
+        auto k = std::make_shared<edm::Kit> (kit);
+        edm::assignFamilies (*k);                      // key -> family: which rack each key plays through
+        std::atomic_store (&edmPool[program], std::shared_ptr<const edm::Kit> (std::move (k)));
+    }
+
+    bool Channel::isSynthKitPooled (int program) const
+    {
+        return program >= 0 && program <= 127 && std::atomic_load (&edmPool[program]) != nullptr;
+    }
+
+    bool Channel::selectPooledSynthKit (int program, bool syncName)
+    {
+        if (program < 0 || program > 127) return false;
+        auto k = std::atomic_load (&edmPool[program]);
+        if (k == nullptr) return false;
+        for (int n = 0; n < 128; ++n)
+            drumChokeGroup[n].store (k->cells[(size_t) n].chokeGroup);
+        if (syncName)
+            loadedDrumKitName = juce::String (k->name);      // message thread only
+        std::atomic_store (&synthKit, std::move (k));
+        return true;
+    }
+
+    //  EDM KIT - publish a synth kit on this channel (message thread).
+    void Channel::publishSynthKit (const edm::Kit& kit)
+    {
+        for (int k = 0; k < 128; ++k)
+            drumChokeGroup[k].store (kit.cells[(size_t) k].chokeGroup);
+        loadedDrumKitName = juce::String (kit.name);
+        auto k = std::make_shared<edm::Kit> (kit);
+        edm::assignFamilies (*k);                      // key -> family: which rack each key plays through
+        std::atomic_store (&synthKit, std::shared_ptr<const edm::Kit> (std::move (k)));
+    }
+
     void Channel::noteOn(int note, int velocity, bool fromEditor, float extraGain)
     {
         if (note < 0 || note > 127) return;   // srcNote / latch tables index by it
+
+        // EDM KIT: a synth kit plays every key itself - no sample regions, no
+        // low-key substitution - so it branches before either is looked at.
+        if (isDrumChannel.load())
+            if (auto sk = std::atomic_load (&synthKit))
+            {
+                // Key-down bookkeeping FIRST - this branch returns before the
+                // sampled path's own, which left EDM keys dark on the strip and
+                // the pad LEDs.  A synth kit plays the key itself (no octave
+                // shift, no low-key substitution), so the latched shift is 0 and
+                // noteOff pairs with exactly this key.
+                keyDownXpose[(size_t) note] = 0;
+                {
+                    uint8_t& c = fromEditor ? editorKeyDown[(size_t) note]
+                                            : keyDownCount [(size_t) note];
+                    if (c < 255) ++c;
+                }
+                noteLatch[(size_t) note] = (int) (currentSampleRate * 0.055);   // strip only
+                padHitMask[(size_t) (note >> 5)].fetch_or (1u << (note & 31), std::memory_order_relaxed);
+                noteOnSynthDrum (*sk, note, velocity, fromEditor, extraGain);
+                return;
+            }
+
+        // SX920 KIT MAP - a style note is re-pointed to the key that plays the
+        // same instrument on a composed kit (see remapStyleDrumKey).
+        note = remapStyleDrumKey (note, fromEditor);
 
         auto pv = std::atomic_load (&active);
         if (!ready.load() || ! pv || pv->regions.empty()) return;
         const auto& regions = pv->regions;
         const auto& samples = pv->samples;
+
+        // WHAT THE PLAYER ACTUALLY STRUCK, kept before any curve touches it.
+        //
+        // The velocity-triggered glide compares against THIS, not against the
+        // curved value.  A threshold that moved whenever the slot's own curve or
+        // ENERGY changed would be indefensible: "scoop when I hit hard" has to
+        // mean the hit, not what the voicing did to it afterwards.
+        const int rawVelocity = velocity;
 
         // ── VELOCITY CURVE, AND THIS IS THE ONLY PLACE IT IS APPLIED ─────────
         //
@@ -697,6 +1058,77 @@ namespace Betel
             const float c = isDrum ? drumKeyStates[(size_t) note].velCurve.load()
                                    : slotVelCurve.load();
             velocity = VelCurve::apply (velocity, c);
+
+            // ── AND THEN STYLE ENERGY, LAST ──────────────────────────────────
+            //
+            // Last because it is the performance control: the two above are
+            // voicing decisions that should already be made by the time a
+            // player reaches for the dynamics, and a curve applied after them
+            // bends whatever they produced rather than being bent by it.
+            //
+            // DRUMS INCLUDED, deliberately.  They are where this earns its
+            // keep: a kit has three velocity layers per key, so a soft setting
+            // lands on the brush/soft sample rather than playing the stick
+            // sample quieter.  A pad has one sample and only gets quieter,
+            // which is why the feature reads as "the band playing softly"
+            // rather than "the mix turned down".
+            velocity = VelCurve::apply (velocity, energyCurve.load());
+        }
+
+        // ── ATTACK GLIDE: DECIDED ONCE PER NOTE, HERE ────────────────────────
+        //
+        // Ahead of every path that can allocate a voice, so the counter and the
+        // dice advance exactly once however many voices this note turns into.
+        //
+        // The solo gate is the engine's, not the panel's.  ModulationPanel
+        // hides the controls for a style slot, but a set is a file and a file
+        // can say anything; refusing here means a style channel cannot be made
+        // to scoop by editing XML, which is the only honest place to enforce
+        // "right hand only".
+        pendingGlide = false;
+        {
+            const int mode = glideMode.load();   // 0 off, 1 every, 2 Nth, 3 random, 4 velocity
+
+            if (mode != 0 && isSoloChannel.load() && ! isDrumChannel.load())
+            {
+                if (mode == 1)                       // EVERY note
+                {
+                    pendingGlide = true;
+                }
+                else if (mode == 2)                  // EVERY Nth note
+                {
+                    const int n = juce::jlimit (2, 16, glideEveryN.load());
+                    if (++glideNoteCounter >= n) { glideNoteCounter = 0; pendingGlide = true; }
+                }
+                else if (mode == 4)                  // VELOCITY THRESHOLD
+                {
+                    // >= , so the labelled number is the softest hit that
+                    // triggers rather than the loudest that does not.
+                    pendingGlide = (rawVelocity >= juce::jlimit (1, 127, glideVelMin.load()));
+                }
+                else if (mode == 3)                  // RANDOM, 1 note in N
+                {
+                    // ODDS, NOT A PERCENTAGE.  Above about 60% a random glide
+                    // is indistinguishable from EVERY, so a 0..100 control spent
+                    // more than half its travel on settings nobody wants.  1 in
+                    // 2 .. 1 in 16 is the band that is actually musical, and it
+                    // shares its vocabulary with EVERY above - the difference
+                    // being that this one is an AVERAGE, which is why its
+                    // readout is tilde-prefixed.
+                    //
+                    // EXPECT CLUMPING.  At 1 in 5 the dice will sometimes give
+                    // three scoops in four notes and then nothing for twenty.
+                    // That is what independent trials do, not a fault, and no
+                    // amount of re-seeding changes it; only a minimum-gap rule
+                    // would, and that is a different feature.
+                    const int odds = juce::jlimit (2, 16, glideOdds.load());
+                    pendingGlide = (glideNextUnit() * (float) odds < 1.0f);
+                }
+            }
+            else
+            {
+                glideNoteCounter = 0;   // a mode change restarts the pattern
+            }
         }
 
         // ── The ONE place a note's sounding pitch is decided ─────────────────
@@ -747,6 +1179,46 @@ namespace Betel
         // benefit — the choke lookup below sees the FOLDED note, so a hit on 32
         // chokes the open hat through 44's group without any mirrored table.
         //----------------------------------------------------------------------
+        //----------------------------------------------------------------------
+        // REVO! LOW ZONE — NOW A FALLBACK, NOT A BLANKET DROP
+        //
+        // On a Revo! kit these keys are hi-hat / tambourine / no-rim-snare
+        // articulations, not the XG elements the_second supplies (see
+        // isRevoRemappedLowKey).  Playing a whip slap where the style wrote a
+        // hi-hat edge is worse than silence, so they used to be dropped
+        // OUTRIGHT — the honest answer while nobody had sampled the Revo!
+        // reading of them.
+        //
+        // WHAT CHANGED: revo_first now supplies exactly this span for Revo!
+        // kits, and resolveDrumKitParams merges it ahead of the_second so it
+        // owns 13..22 and overrides 25..28.  An unconditional drop here would
+        // throw those samples away the moment they arrived, and the symptom
+        // would be the original complaint unchanged — a Revo! ballad losing
+        // most of its drum hits, with the new blob loading perfectly and
+        // sounding not at all.
+        //
+        // So the test now asks whether the key ACTUALLY RESOLVED to something.
+        // With revo_first installed it has, and the note plays.  Without it —
+        // an install that has not been re-blobbed, or a Revo! kit whose span
+        // revo_first does not cover — nothing is mapped and the drop still
+        // applies, exactly as before.  One condition, and it degrades to the
+        // old behaviour on its own.
+        //
+        // THE ORDER STILL MATTERS.  The mirror below folds an unmapped key up
+        // an octave; on these keys that fold is precisely what must not happen,
+        // because it answers a Revo! hi-hat with whatever sits an octave above.
+        // Testing hasRegionForNote HERE — before the mirror — keeps that intact:
+        // a key revo_first did not supply is dropped rather than folded, and a
+        // key it did supply never reaches the mirror at all.  Returning here
+        // also keeps the piano-strip latch and the choke lookup from ever
+        // seeing a note that will not be heard.
+        //----------------------------------------------------------------------
+        if (isDrumChannel.load()
+            && revoLowZone.load()
+            && isRevoRemappedLowKey (transposedNote)
+            && ! hasRegionForNote (transposedNote))
+            return;
+
         if (isDrumChannel.load() && transposedNote < 36
             && ! hasRegionForNote (transposedNote))
         {
@@ -771,6 +1243,8 @@ namespace Betel
             if (c < 255) ++c;
         }
         noteLatch[(size_t) transposedNote] = (int) (currentSampleRate * 0.055);   // ~55 ms
+        padHitMask[(size_t) (transposedNote >> 5)].fetch_or (1u << (transposedNote & 31),
+                                                            std::memory_order_relaxed);
 
         const int regionIdx = findRegion(transposedNote, velocity);
         if (regionIdx < 0 || regionIdx >= (int) samples.size()) return;
@@ -807,7 +1281,7 @@ namespace Betel
             Voice* v = allocateVoice();
             if (v != nullptr)
             {
-                startVoice(v, transposedNote, velocity, regionIdx, false);
+                startVoice(v, transposedNote, velocity, regionIdx, kNoGlide);
                 v->srcNote    = note;   // pairing identity — see Voice::srcNote
                 v->fromEditor = fromEditor;
                 v->extraGain  = extraGain;
@@ -823,8 +1297,16 @@ namespace Betel
             // sampled kit has no tagged blend layers, so without this guard a
             // MIX left enabled from a composed kit would duck the sampled kick
             // and put nothing in its place.
+            //
+            // 35 AND 36 ONLY.  Key 33 used to be here too, back when it was a
+            // clone of the kit's own kick and "the same drum as 36".  It is not
+            // any more: it is its own sample (33_soft_kick / 33_edm_kick) with
+            // its own SOFT KICK page, and the editor has only ever offered MIX on
+            // 35 and 36.  Blending 36's EDM/WOOD layer onto it would change a
+            // drum the user set on a different page.  Kept in step with the
+            // compose and restore loops in composeDrumKit / publishDrumKit.
             if (drum && v != nullptr && ! fullKitActive.load()
-                && (transposedNote == 33 || transposedNote == 35 || transposedNote == 36))
+                && (transposedNote == 35 || transposedNote == 36))
             {
                 auto& ks = drumKeyStates[(size_t) transposedNote];
                 if (ks.kickMixEnabled.load())
@@ -852,7 +1334,7 @@ namespace Betel
                         && samples[(size_t) layerIdx].buffer.getNumSamples() > 0)
                         if (Voice* lv = allocateVoice())
                         {
-                            startVoice (lv, transposedNote, velocity, layerIdx, false);
+                            startVoice (lv, transposedNote, velocity, layerIdx, kNoGlide);
                             lv->kickMixGain = suppG;
                             lv->srcNote     = note;   // same identity as the kit voice
                             lv->fromEditor  = fromEditor;
@@ -974,7 +1456,13 @@ namespace Betel
                 }
 
                 // Pitch continues from where the old voice actually was, so
-                // portamento is unbroken across the boundary.
+                // portamento is unbroken across the boundary - converted into
+                // the NEW sample's frame (the copy above still holds the old
+                // one), and the SOUND ENGINE's offset follows the new root.
+                nv->currentPitchSemitones = soundingPitchOf (*existing)
+                                            - (double) r.pitchKeycenter + (double) r.tune / 100.0;
+                if (nv->oscEngine)
+                    nv->oscOffset = (double) r.pitchKeycenter - (double) r.tune / 100.0;
                 const float glideMs = portamentoTime.load();
                 if (glideMs > 0.1f)
                 {
@@ -1009,8 +1497,14 @@ namespace Betel
         {
             // Fresh note: fast-release any running voice (~5 ms, no click) and
             // start a new one from the sample start with fresh envelopes — or
-            // there is nothing sounding to glide from.  glideFromCurrent only
-            // affects pitch (portamento); the envelope always re-attacks.
+            // there is nothing sounding to glide from.  The glide only affects
+            // pitch (portamento); the envelope always re-attacks.
+            //
+            // The pitch to glide FROM is read here, before the release and
+            // before allocateVoice - which may steal `existing` itself and
+            // reset it - and handed over as a sounding pitch, not a voice.
+            const double glideFrom = (existing != nullptr) ? soundingPitchOf (*existing) : kNoGlide;
+
             if (existing != nullptr)
                 for (auto& v : voices)
                     if (v.active && ! v.fromEditor)   // never guillotine a held strip note
@@ -1018,7 +1512,7 @@ namespace Betel
 
             if (Voice* v = allocateVoice())
             {
-                startVoice(v, transposedNote, velocity, regionIdx, existing != nullptr);
+                startVoice(v, transposedNote, velocity, regionIdx, glideFrom);
                 v->srcNote = note;   // pairing identity — see Voice::srcNote
             }
             return;
@@ -1063,9 +1557,26 @@ namespace Betel
     }
 
     //==========================================================================
+    //==========================================================================
+    //  SX920 KIT MAP.  A style asking for an SX920 kit writes its notes in THAT
+    //  kit's layout - conga strokes on 24..30, extra brush snares on 60..70, a
+    //  Revo! snare on 30.  On a COMPOSED kit those keys hold other instruments,
+    //  so the note is re-pointed to the key that plays the same one here
+    //  (Sx920KitMap.h, generated from Yamaha's Data List).  Never for the drum
+    //  editor's own notes, a sampled full kit or an EDM synth kit: each of those
+    //  already speaks its own layout.  Note-on and note-off use the same map.
+    //==========================================================================
+    int Channel::remapStyleDrumKey (int note, bool fromEditor) const noexcept
+    {
+        if (fromEditor || ! isDrumChannel.load() || fullKitActive.load()) return note;
+        if (std::atomic_load (&synthKit) != nullptr) return note;
+        return sx920::remapKey (styleKitMsb.load(), styleKitLsb.load(), styleKitPc.load(), note);
+    }
+
     void Channel::noteOff(int note, bool fromEditor)
     {
         if (note < 0 || note > 127) return;   // srcNote / latch tables index by it
+        note = remapStyleDrumKey (note, fromEditor);
 
         auto pv = std::atomic_load (&active);
         static const std::vector<Region> kNoRegions;
@@ -1214,11 +1725,51 @@ namespace Betel
 
         const auto& r = regions[(size_t) returnRegion];
 
+        // ── A RETURN INTO ANOTHER SAMPLE ZONE IS A NEW NOTE ──────────────────
+        //
+        // This fallback used to re-point the SOUNDING voice at the returned
+        // note's region, whatever it was.  Inside one zone that is a legato
+        // glide.  Across zones it kept reading at the old position out of a
+        // different sample, left the voice's keycenter / tune / rate / SOUND
+        // ENGINE offset on the old zone, and glided from a pitch expressed in
+        // the old zone's frame.  Measured on the real Channel: 40 -> 43 across a
+        // zone border came back via 46, and the SOUND ENGINE landed on 37 - six
+        // semitones flat - and stayed there.  noteOn already refuses to splice
+        // across zones (see crossesRegion); this is the same rule on the way
+        // back: fast-release, and a fresh voice glides in from the pitch the
+        // old one was sounding.
+        if (returnRegion != existing->regionIndex)
+        {
+            const double glideFrom = soundingPitchOf (*existing);   // before any reset
+            const int    vel       = existing->velocity;
+
+            for (auto& v : voices)
+                if (v.active && ! v.fromEditor)        // never guillotine a held strip note
+                    v.ampEnv.noteOff (5.0f, currentSampleRate);
+
+            if (Voice* v = allocateVoice())
+            {
+                startVoice (v, returnNote, vel, returnRegion, glideFrom);
+                v->srcNote = returnSrc;               // pairing identity - see Voice::srcNote
+            }
+            return;
+        }
+
         existing->note          = returnNote;
         existing->srcNote       = returnSrc;   // identity follows the fallback
-        existing->regionIndex   = returnRegion;
+        existing->regionIndex   = returnRegion;   // the same zone, by the test above
         existing->targetPitchSemitones =
             (double)(returnNote - r.pitchKeycenter) + (double) r.tune / 100.0;
+
+        // THE SCALE TUNING TOO.  Every other path that sets a melodic target
+        // adds it; this one did not, so with a scale active (quarter tones) a
+        // returned note came back in plain equal temperament.
+        if (! isDrumChannel.load())
+        {
+            const int pitchClass = ((returnNote % 12) + 12) % 12;
+            existing->targetPitchSemitones +=
+                (double) scaleTuningCents[pitchClass].load() / 100.0;
+        }
 
         const float glideMs = portamentoTime.load();
         if (glideMs > 0.1f)
@@ -1234,7 +1785,7 @@ namespace Betel
         if (monoRetrigStolen.load())
         {
             // Fresh attack on the returned note (restart envelopes + sample).
-            existing->ampEnv.curve = (AHDSREnvelope::Curve) ampCurve.load();
+            existing->ampEnv.curveK = ampCurveK.load();
             existing->ampEnv.noteOn  (ampAttack.load(),  ampHold.load(),  ampDecay.load(),
                                       ampSustain.load(), currentSampleRate);
             existing->filtEnv.noteOn (filtAttack.load(), filtHold.load(), filtDecay.load(),
@@ -1290,7 +1841,19 @@ namespace Betel
                 }
                 keyDownXpose[(size_t) newNote] = (int8_t) (soundingNew - newNote);
 
-                const double deltaSemi = (double) (soundingNew - soundingOld);
+                double deltaSemi = (double) (soundingNew - soundingOld);
+
+                // THE SCALE TUNING MOVES WITH THE NOTE.  The voice's pitch
+                // carries the cents of its OLD pitch class (startVoice added
+                // them), so a plain semitone delta kept them: with a scale
+                // active, a chord change re-pitched E+50c to F+50c instead of F.
+                {
+                    const int pcOld = ((soundingOld % 12) + 12) % 12;
+                    const int pcNew = ((soundingNew % 12) + 12) % 12;
+                    deltaSemi += (double) (scaleTuningCents[pcNew].load()
+                                         - scaleTuningCents[pcOld].load()) / 100.0;
+                }
+
                 v.targetPitchSemitones  += deltaSemi;
                 v.currentPitchSemitones += deltaSemi;
                 v.portamentoActive       = false;   // instant, in-tune jump
@@ -1341,6 +1904,23 @@ namespace Betel
     //==========================================================================
     void Channel::applyParams(const ChannelParams& p)
     {
+        // SOUND ENGINE: the slot's settings for the program they were made on; the
+        // other program keeps its factory sound.  Both are ready before a note
+        // needs them, so a program change on the audio thread only picks.
+        if (p.engineSpec != lastEngineSpec)
+        {
+            lastEngineSpec = p.engineSpec;
+            oscengine::Params edited;
+            const bool has = oscengine::fromString (p.engineSpec.toStdString(), edited);
+            for (int prog : { 38, 39 })
+            {
+                std::shared_ptr<const oscengine::Params> np =
+                    std::make_shared<const oscengine::Params> ((has && edited.program == prog) ? edited
+                                                                                            : oscengine::factory (prog));
+                std::atomic_store (&oscParams[(size_t) oscengine::programSlot (prog)], np);
+            }
+        }
+
         setSlotVelCurve (p.velCurve);
         channelPan.store (juce::jlimit (-1.0f, 1.0f, p.pan));
         // instrumentGain is deliberately absent — see its declaration.  A bulk
@@ -1350,10 +1930,11 @@ namespace Betel
         ampDecay  .store (p.ampDecay);
         ampSustain.store (p.ampSustain);
         ampRelease.store (p.ampRelease);
-        ampCurve  .store (juce::jlimit (0, 2, p.ampCurve));
+        ampCurveK .store (juce::jlimit (-20.0f, 20.0f, p.ampCurveK));
 
         filterType    .store (juce::jlimit (0, 3, p.filterType));
         filterCutoff  .store (juce::jlimit (20.0f, 20000.0f, p.filterCutoff));
+        variationAmount.store (juce::jlimit (0, 100, p.variationAmount));
         filterReso    .store (juce::jlimit (0.0f, 1.0f,      p.filterReson));
         filterKeytrack.store (p.filterKeytrack);
         // bandHpFreq / bandLpFreq are deliberately absent, exactly like
@@ -1373,6 +1954,16 @@ namespace Betel
         pitchDecay   .store (p.pitchDecay);
         pitchSustain .store (p.pitchSustain);
         pitchRelease .store (p.pitchRelease);
+        // ATTACK GLIDE.  Pushed unconditionally; the gate is in noteOn, which
+        // refuses a style or drum channel whatever these say.
+        glideMode  .store (juce::jlimit (0, 4,       p.glideMode));
+        glideDepth .store (juce::jlimit (0.0f, 12.0f,  p.glideDepth));
+        glideTimeMs.store (juce::jlimit (0.0f, 500.0f, p.glideTimeMs));
+        glideShapeK.store (p.glideShapeK);
+        glideEveryN.store (juce::jlimit (2, 16,      p.glideEveryN));
+        glideOdds  .store (juce::jlimit (2, 16,      p.glideOdds));
+        glideVelMin.store (juce::jlimit (1, 127,     p.glideVelMin));
+
         // Pitch env removed from this instrument — force depth to 0 so the
         // render loop's depth gate skips it regardless of preset/style data.
         pitchEnvDepth.store (0.0f);
@@ -1417,6 +2008,9 @@ namespace Betel
         delayTimeSig .store (juce::jlimit (0, 1, p.delayTimeSig));
         delayDiv     .store (juce::jmax  (0,    p.delayDiv));
         delayFeedback.store (juce::jlimit (0.0f, 0.95f, p.delayFeedback));
+        delayDampHz  .store (juce::jlimit (200.0f, 20000.0f, p.delayDampHz));
+        delayHpHz    .store (juce::jlimit (20.0f,  2000.0f,  p.delayHpHz));
+        delaySmoothMs.store (juce::jlimit (1.0f,   500.0f,   p.delaySmoothMs));
         delayWet     .store (juce::jlimit (0.0f, 1.0f,  p.delayWet));
         delayDry     .store (juce::jlimit (0.0f, 1.0f,  p.delayDry));
         // Bases go up to 2.0: the box is a calibration, and a quiet source can
@@ -1427,6 +2021,58 @@ namespace Betel
         eqEnabled    .store (p.eqEnabled);
         reverbEnabled.store (p.reverbEnabled);
         delayEnabled .store (p.delayEnabled);
+
+        // ── THE PER-SLOT MIX/WET SLIDERS ARE NOW THE SECTION SENDS ─────────
+        //
+        // Each of the three effects that moved to the bus already had a per-slot
+        // amount — reverbWet, delayWet and chorusMix.  Each keeps its meaning to
+        // the player ("how much of this effect on this instrument") and becomes
+        // that instrument's send.
+        //
+        // wahMix, phaserMix and the sweetener's own mix are NOT in that list:
+        // those three stayed per-instrument INSERTS, and their amounts still
+        // drive the inserts directly a few lines below.
+        //
+        // NO NEW SAVED FIELD FOR ANY OF THEM.  Every .ins, .drm and .bset already
+        // carries all three, so every existing sound arrives with amounts its
+        // author actually dialled — a better migration than any default.
+        //
+        // GATED BY THE PER-SLOT ENABLE, so a slot with an effect switched off is
+        // absent from that bus rather than merely quiet.
+        //
+        // *** delayWetBase IS NO LONGER APPLIED, AND THAT IS THE FIX ***
+        //
+        // It defaults to 0.5 and was CORRECT in the insert topology this
+        // replaced: there, dry 1.0 + wet 1.0 peaked at 2.0, so the wet was
+        // pre-halved to compensate.  A SEND HAS NO DRY ON IT - the channel's dry
+        // reaches the mix by its own route, one block above - so the
+        // compensation had nothing left to compensate for and simply took 6 dB
+        // off every delay send in the plugin.  Reported as "the repeats are
+        // barely noticeable"; measured at feedback 0.35 the first repeat was
+        // landing at -6 dB instead of unity and the third at -24 dB.
+        //
+        // Fixed HERE rather than by changing the default, because every .bset on
+        // disk carries an explicit delayWetBase="0.5" - BetelStateXml saves it
+        // unconditionally - so a new default would have fixed nothing that
+        // already exists.  Not applying it fixes every set at once, with no
+        // migration and no schema change.
+        //
+        // reverbWetBase IS still applied, deliberately.  Its default is 1.0, so
+        // it is a no-op on every set anyone has; leaving the line alone means
+        // fixing a delay complaint cannot move the reverb.  The two lines
+        // reading differently is the point, not an oversight.
+        setSend (SectionSendFx::kReverb,
+                 p.reverbEnabled ? p.reverbWet * p.reverbWetBase : 0.0f);
+        setSend (SectionSendFx::kDelay,
+                 p.delayEnabled  ? p.delayWet                    : 0.0f);
+        setSend (SectionSendFx::kChorus, p.chorusEnabled ? p.chorusMix : 0.0f);
+        // wahMix / phaserMix are NOT sends any more — they are the inserts' own
+        // mix controls, applied by applyWah/PhaserInPlace from the atomics this
+        // function already stores.
+        // THE SWEETENER'S SEND IS NOT SET HERE.  ChannelParams deliberately
+        // carries no sweetener — it belongs to the SLOT, not to the instrument
+        // sitting in it, so it travels its own route.  Its send is set in
+        // applySweetenerParams, which is the one place both routes converge.
 
         // ── Sounds-path insert FX ──────────────────────────────────────────
         chorusEnabled .store (p.chorusEnabled);
@@ -1447,6 +2093,30 @@ namespace Betel
         phaserDepth   .store (juce::jlimit (0.0f, 1.0f,   p.phaserDepth));
         phaserFeedback.store (juce::jlimit (0.0f, 1.0f,   p.phaserFeedback));
         phaserMix     .store (juce::jlimit (0.0f, 1.0f,   p.phaserMix));
+    }
+
+    //==========================================================================
+    // setFunkeyFx — the FUNKEY stage's twelve values (message thread).
+    //
+    // Same clamps as the slot's own pair above, because it is the same DSP with
+    // a different owner.  Deliberately NOT reachable from applyParams: see the
+    // note on Channel::FunkeyFx.
+    //==========================================================================
+    void Channel::setFunkeyFx (const FunkeyFx& f)
+    {
+        fkWahEnabled    .store (f.wahEnabled);
+        fkWahSensitivity.store (juce::jlimit (0.0f, 1.0f,     f.wahSensitivity));
+        fkWahRate       .store (juce::jlimit (0.05f, 8.0f,    f.wahRate));
+        fkWahLfoDepth   .store (juce::jlimit (0.0f, 1.0f,     f.wahLfoDepth));
+        fkWahBaseHz     .store (juce::jlimit (80.0f, 1500.0f, f.wahBaseHz));
+        fkWahQ          .store (juce::jlimit (0.0f, 1.0f,     f.wahQ));
+        fkWahMix        .store (juce::jlimit (0.0f, 1.0f,     f.wahMix));
+
+        fkPhaserEnabled .store (f.phaserEnabled);
+        fkPhaserRate    .store (juce::jlimit (0.0f, 1.0f,     f.phaserRate));
+        fkPhaserDepth   .store (juce::jlimit (0.0f, 1.0f,     f.phaserDepth));
+        fkPhaserFeedback.store (juce::jlimit (0.0f, 1.0f,     f.phaserFeedback));
+        fkPhaserMix     .store (juce::jlimit (0.0f, 1.0f,     f.phaserMix));
     }
 
     //==========================================================================
@@ -1499,12 +2169,6 @@ namespace Betel
         st.kickMixEnabled.store (p.kickMixEnabled);
         st.kickMixAmount .store (juce::jlimit (0.0f, 100.0f, p.kickMixAmount));
         st.kickMixVariant.store (juce::jlimit (0, 1, p.kickMixVariant));
-
-        if (midiKey == 35 || midiKey == 36)
-            kmLog ("setDrumKeyParams key=" + juce::String (midiKey)
-                   + " enabled=" + juce::String (p.kickMixEnabled ? 1 : 0)
-                   + " amount="  + juce::String (p.kickMixAmount, 1)
-                   + " variant=" + juce::String (p.kickMixVariant));
     }
 
     void Channel::setDrumKeyFxSend (int midiKey, float sendNorm)
@@ -1523,14 +2187,36 @@ namespace Betel
         // Drum channel pan rides on the kit-FX bus (user PAN tab).
         channelPan.store (juce::jlimit (-1.0f, 1.0f, fx.pan));
         applySweetenerParams (fx.sweet);   // drum route into the shared block
+                                           // (which sets the send too)
         drumFxBus.eqEnabled  .store (fx.eqEnabled);
         drumFxBus.satEnabled .store (fx.satEnabled);
         drumFxBus.compEnabled.store (fx.compEnabled);
+        // revEnabled / delEnabled are still stored so the .drm round-trips
+        // unchanged, but nothing in the rack reads them any more — those two
+        // stages moved to the section bus.
         drumFxBus.revEnabled .store (fx.revEnabled);
         drumFxBus.delEnabled .store (fx.delEnabled);
 
-        for (int i = 0; i < 10; ++i)
-            drumFxBus.eqGainDb[i].store (juce::jlimit (-60.0f, 20.0f, fx.eqGainDb[i]));
+        // ── AND THE KIT'S SENDS ──────────────────────────────────────────────
+        //
+        // Three now.  A drum slot never goes through applyParams for its FX —
+        // the rack arrives here instead — so without this the kit is bone dry.
+        // revWet x base was how much of this kit's reverb was heard and is now
+        // how much of it reaches the section's.
+        //
+        // delWetBase IS NOT APPLIED, for the same reason delayWetBase is not on
+        // the melodic path above: it is 0.5 by default and that 0.5 was insert
+        // compensation.  The drums were 6 dB down on delay along with everything
+        // else.  revWetBase stays for the same reason reverbWetBase does.
+        setSend (SectionSendFx::kReverb,
+                 fx.revEnabled ? fx.revWet * fx.revWetBase : 0.0f);
+        setSend (SectionSendFx::kDelay,
+                 fx.delEnabled ? fx.delWet                 : 0.0f);
+        setSend (SectionSendFx::kChorus, fx.chorusSend);
+
+        for (int i = 0; i < DrumSplitEq::kBands; ++i)
+            drumFxBus.eqGainDb[i].store (juce::jlimit (DrumSplitEq::kSilenceDb, DrumSplitEq::kMaxDb,
+                                                       fx.eqGainDb[i]));
 
         drumFxBus.satDrive    .store (juce::jlimit (0.0f, 1.0f,  fx.satDrive));
         drumFxBus.satMix      .store (juce::jlimit (0.0f, 1.0f,  fx.satMix));
@@ -1614,8 +2300,19 @@ namespace Betel
     //==========================================================================
     struct XgLowKeySub { int primary; int secondary; };
 
-    // Snare-derived low keys play at 40% gain -- i.e. 60% quieter.
-    static constexpr float kXgSnareSubGain = 0.40f;
+    // ── NO TRIM ON A SUBSTITUTED SNARE ───────────────────────────────────────
+    //
+    // Snare-derived low keys used to play at 40%, on the reasoning that XG's
+    // 25..31 range is SOFT articulations (brush taps, rolls) while our only
+    // donor is the full snare, so a straight borrow would be too hot.
+    //
+    // Removed on Rob's call. The reasoning is sound in the abstract and wrong
+    // in practice: it is a fixed guess applied to every style, and Slow & Easy
+    // shows why it misfires - its ENTIRE backbeat is on key 31, so the trim was
+    // quietly holding that style's snare 8 dB down with no way to see or undo
+    // it. Where a borrow really is too hot, the per-key gain in the drum editor
+    // is the right place to fix it, per kit, visibly, and saved with the set.
+    static constexpr float kXgSnareSubGain = 1.00f;
 
     static XgLowKeySub xgLowKeySubstitute (int key) noexcept
     {
@@ -1731,6 +2428,15 @@ namespace Betel
                 // Build the engine Region.  lokey/hikey/pitchKeycenter all == k
                 // so findRegion picks it exactly on note==k and startVoice does
                 // no melodic transposition.
+                //
+                // I briefly changed this to honour the blob's own rootKey,
+                // reasoning that a component authored with root != key would
+                // play untransposed here while the full sampled-kit path (which
+                // reads blobRegion.rootKey) transposed it correctly.  REVERTED:
+                // the_first.sfz shows Sampler Arena writes
+                // pitch_keycenter == lokey == hikey on every region, so no such
+                // component exists, the change was inert, and it carried a
+                // latent risk for any blob with a stray non-zero root.
                 Region reg;
                 reg.lokey          = k;
                 reg.hikey          = k;
@@ -1764,6 +2470,20 @@ namespace Betel
                                    + (int) srcRegion.coarseTune * 100;
                 reg.offset         = 0;
                 reg.roleId         = entry.sourceRoleId;
+
+                // ── THE DEPARTMENT TRIM, from balance.grexv ──────────────────
+                //
+                // Applied HERE, once per element at compose time, because that
+                // is the only place a region's ROLE is known and because it
+                // then costs nothing per note. One line in the file moves every
+                // kick in every kit rather than one key in one kit, which is
+                // the whole point of a department control.
+                //
+                // Additive in dB on the region's own recorded attenuation, so
+                // it composes with the sample's level instead of replacing it -
+                // the same shape the XG snare substitution used.
+                reg.volume        += juce::Decibels::gainToDecibels (
+                                         balanceRoleGain (reg.roleId), -40.0f);
 
                 // Build the SampleData (deinterleave FloatSample → per-channel buffers).
                 SampleData sd;
@@ -1810,12 +2530,24 @@ namespace Betel
         // loaded, then immediately overwritten.
         //
         // ── XG low keys (25..34): substitute from the kit's OWN sounds ───────
-        // See xgLowKeySubstitute() above.  Gap-fill only -- a real kit element
-        // always wins.  Key 33 (XG's soft kick) donates from 36; it used to be
-        // able to fall through to the forced low_kick on 35 as well, which is
-        // gone -- but that path is no longer needed, because a kick blob that
-        // carries a 35 carries a 36 beside it, and one with neither has no
-        // kick to clone either way.
+        // See xgLowKeySubstitute() above.  THIS IS THE FALLBACK, NOT THE SOURCE.
+        // the_second supplies 23..34 for real, as a GLOBAL merged into every kit
+        // (with revo_first overriding 25..28 on a Revo! kit); the `alreadyMapped`
+        // test below means installing them switches this whole block off by
+        // itself, key by key.  It stays for a library with no low-zone blob, and
+        // for any kit whose blob leaves a hole in the range.
+        //
+        // Key 33 (XG's soft kick) donates from 36; it used to be able to fall
+        // through to the forced low_kick on 35 as well, which is gone -- but
+        // that path is no longer needed, because a kick blob that carries a 35
+        // carries a 36 beside it, and one with neither has no kick to clone
+        // either way.
+        //
+        // NOTE FOR ANYONE READING THE MIRROR IN Channel::noteOn: that mirror is
+        // LIVE, and because this block populates 25..34 it now STOPS HERE rather
+        // than reaching 36..47 the way its own comment describes.  With a
+        // low-zone blob installed the fold lands on real samples; without one,
+        // on these clones.
         for (int key = 25; key <= 34; ++key)
         {
             bool alreadyMapped = false;
@@ -1924,24 +2656,21 @@ namespace Betel
         // inside the composed (and pooled) voice while the blend is driven by
         // per-key atomics, MIX / EDM-WOOD / on-off are fully live — no
         // re-compose, no clearPreset — and survive style program changes.
-        // KEY 33 IS IN THIS LIST, and that is the fix for "the blend does not
-        // work on kicks below note 35".
+        // KEY 33 IS NOT IN THIS LIST ANY MORE.
         //
-        // 33 is XG's BASS DRUM SOFT and the ONLY kick under 35 - every other low
-        // key substitutes from a snare or a stick (see xgLowKeySubstitute).  It
-        // is built as a CLONE of the kit's kick, so a style that writes its kick
-        // there got the right sample and no blend at all, while the identical
-        // sample on 36 blended fine.
+        // It was, when 33 was built as a CLONE of the kit's kick: the same drum
+        // as 36, so it inherited 36's MIX rather than asking the user to dial
+        // it twice.  That premise has gone.  33 is now its own sample - the
+        // family's soft kick or EDM kick, from kick/33_soft_kick.frb or
+        // kick/33_edm_kick.frb - with its own SOFT KICK page, and the editor
+        // has never shown MIX for it.  Inheriting 36's blend would lay an EDM or
+        // WOOD kick over a different drum, driven by a control on another page.
         //
-        // Its settings are INHERITED, never its own: 33 is the same drum as 36,
-        // so asking the user to dial MIX twice for one kick - on a key the
-        // editor deliberately does not show MIX for - would be a trap.  It
-        // follows 36, or 35 when the kit has no 36 to clone.
-        for (int kk : { 33, 35, 36 })
+        // The note-on trigger and the publish restore were narrowed in the same
+        // change; all three must agree or a key gets layers it never plays.
+        for (int kk : { 35, 36 })
         {
-            const int srcKey = (kk == 33)
-                                 ? (kit.keys[(size_t) 36].sourceRoleId != 0 ? 36 : 35)
-                                 : kk;
+            const int srcKey = kk;
 
             // Snapshot the per-key blend controls (restored into the drumKeyState
             // atomics by publishDrumKit).
@@ -1954,21 +2683,11 @@ namespace Betel
             // against.  Both keys now get theirs from the kit's kick blob, so a
             // kit whose blob carries no 35 simply gets no blend there rather
             // than blending against a sub-kick borrowed from another kit.
-            bool   hasBase = false;
-            double baseSR  = 0.0;
+            bool hasBase = false;
             for (size_t i = 0; i < kitVoice->regions.size(); ++i)
                 if (kitVoice->regions[i].lokey == kk && kitVoice->regions[i].hikey == kk
                     && kitVoice->regions[i].kickMixVariant < 0)
-                { hasBase = true; baseSR = kitVoice->samples[i].sampleRate; break; }
-
-            kmLog ("composeDrumKit kick " + juce::String (kk)
-                   + ": base=" + juce::String (hasBase ? "yes" : "NO")
-                   + " baseSR=" + juce::String ((int) baseSR)
-                   + " enabled=" + juce::String (e.kickMixEnabled ? 1 : 0)
-                   + " amount="  + juce::String (e.kickMixAmount, 1)
-                   + " variant=" + juce::String (e.kickMixVariant)
-                   + " hasEDM="  + juce::String (registry.hasKickMix (0) ? 1 : 0)
-                   + " hasWOOD=" + juce::String (registry.hasKickMix (1) ? 1 : 0));
+                { hasBase = true; break; }
 
             if (! hasBase) continue;
 
@@ -1983,12 +2702,6 @@ namespace Betel
                 for (const auto& L : layers)
                     if (L.meta.velRangeHigh >= 127) { fs = &L.sample; break; }
                 if (fs->numFrames <= 0) continue;
-
-                kmLog ("  + layer key=" + juce::String (kk)
-                       + " variant=" + juce::String (variant)
-                       + " SR=" + juce::String ((int) fs->sampleRate)
-                       + " ch=" + juce::String ((int) fs->channels)
-                       + " frames=" + juce::String (fs->numFrames));
 
                 Region reg;
                 reg.lokey          = kk;
@@ -2030,6 +2743,8 @@ namespace Betel
     //==========================================================================
     void Channel::publishDrumKit (const PooledDrumKit& pk, int poolKey, bool syncName)
     {
+        std::atomic_store (&synthKit, std::shared_ptr<const edm::Kit>{});   // a sampled kit ends EDM KIT
+
         isDrumChannel.store (true);
         fullKitActive.store (false);   // a composed kit: kick mix applies again
 
@@ -2040,10 +2755,47 @@ namespace Betel
         drumChokeGroup[44].store (1);   // HH Foot Close
         drumChokeGroup[46].store (1);   // HH Open
 
-        // Per-key state from the snapshot (all 128 keys, so any previous kit's
-        // per-key edits on keys this kit doesn't use are reset to neutral).
-        for (int k = 0; k < 128; ++k)
+        // ── PER-KEY STATE FROM THE SNAPSHOT - BUT NOT ON A STYLE-DRIVEN SWAP ──
+        //
+        // All 128 keys, so any previous kit's per-key edits on keys this kit
+        // does not use are reset to neutral. That is right for an EXPLICIT USER
+        // KIT LOAD: you picked a new kit, you get its values.
+        //
+        // IT IS WRONG FOR A STYLE-DRIVEN POOL SWAP ON A SET-OWNED CHANNEL, and
+        // that is the drum half of the bug that took all night on the melodic
+        // side. The set restores the player's per-key gains through
+        // setDrumKeyParams; the style then re-publishes the kit at the next
+        // program change or section boundary, and this loop stamped all 128
+        // keys back to the kit's defaults. Same shape as the neutral voice
+        // stamp guarded in selectPooledPreset, same cause: a style-driven
+        // refresh overwriting values the SET owns.
+        //
+        // THE RULE IS ALREADY IN THIS FUNCTION - the KICK MIX block below has
+        // used exactly this test since it was written: "only an EXPLICIT user
+        // kit load (syncName == true) restores the saved values. Style-driven
+        // pool swaps leave the user's live mix untouched." The rest of the
+        // per-key state simply never got the same treatment.
+        //
+        // ── poolKey < 0, NOT syncName - AND THAT CORRECTION IS THE FIX ───────
+        //
+        // I first keyed this on syncName, reading it as "an explicit user kit
+        // load". IT DOES NOT MEAN THAT. It means "also sync the displayed kit
+        // name", and the STYLE uses it too: applyVoiceSetup's drum branch calls
+        // publishDrumKitWithName -> selectPooledDrumKit(program, syncName=true).
+        // So the style's own publish walked straight through the guard and
+        // stamped all 128 keys - the probe caught it exactly, tab 0.480 and
+        // engine 1.000 three seconds after a load that had been correct.
+        //
+        // poolKey is the honest discriminator, and it costs nothing:
+        //     loadDrumKit          -> publishDrumKit (composed, -1, ...)
+        //     selectPooledDrumKit  -> publishDrumKit (pooled,  >=0, ...)
+        // A composed publish IS the explicit user kit pick; a pooled one is a
+        // swap, whoever asked for it. !voiceOwnedBySet still covers the right
+        // hand, where the kit's own snapshot is the authority.
+        if (poolKey < 0 || ! voiceOwnedBySet.load())
         {
+            for (int k = 0; k < 128; ++k)
+            {
             const auto& s  = pk.keys[(size_t) k];
             auto&       st = drumKeyStates[(size_t) k];
             st.userGain      .store (s.gain);
@@ -2056,6 +2808,7 @@ namespace Betel
             st.roundRobinAmount.store (juce::jlimit (0, 100, s.roundRobinAmount));
             st.userFxSendNorm.store (s.fxSendNorm);
             st.fullLength    .store (s.fullLength);
+            }
         }
 
         // KICK MIX (notes 35/36) is a persistent, kit-independent setting: only
@@ -2064,7 +2817,17 @@ namespace Betel
         // leave the user's live mix untouched, so a style/kit change never
         // resets the blend.  The blend LAYERS themselves ride inside every
         // composed voice, so the crossfade keeps working across the swap.
-        if (syncName)
+        // poolKey < 0 for the same reason the two blocks above changed. This
+        // block's comment has always CLAIMED "style-driven pool swaps leave the
+        // user's live mix untouched" - but syncName is true on the style's own
+        // publish, so the claim was not true in practice. It is now.
+        // 35 AND 36, MATCHING THE BLEND ITSELF. Key 33 was here while the blend
+        // also fired on it (a clone of the kit's kick, inheriting 36's MIX).
+        // It is its own sample now, with its own page and no MIX, and the
+        // note-on trigger and composeDrumKit's layer loop both dropped it in
+        // the same change - the three sites move together or a key gets
+        // layers it never plays.
+        if (poolKey < 0)
             for (int kk : { 35, 36 })
             {
                 auto& st = drumKeyStates[(size_t) kk];
@@ -2074,7 +2837,18 @@ namespace Betel
                 st.kickMixVariant.store (s.kickMixVariant);
             }
 
-        applyDrumKitFx (pk.fx);                 // atomics — RT-safe
+        // ── THE FX RACK FOLLOWS THE SAME OWNERSHIP RULE AS THE KEYS ──────────
+        //
+        // pk.fx is the POOLED KIT's rack. Stamping it on a style-driven swap
+        // wiped the EQ / saturation / compressor / reverb / delay the SET had
+        // restored through publishKitFx - the third of the three drum-side
+        // overwrites, and it was hiding one line below the per-key one.
+        //
+        // Same test as the keys above, and for the same reason: an explicit
+        // (composed) kit load takes the new kit's rack; a pool swap on a
+        // set-owned channel keeps what the set said.
+        if (poolKey < 0 || ! voiceOwnedBySet.load())
+            applyDrumKitFx (pk.fx);             // atomics — RT-safe
         std::atomic_store (&active, pk.voice);  // the swap
         ready.store (true);
         activeDrumPoolKey.store (poolKey);
@@ -2099,6 +2873,27 @@ namespace Betel
         // already tests hasMappedKeys() before getting here; making the guard
         // unconditional means no path — set restore, editor reopen, favourite
         // load — can silently mute a drum channel by handing over a shell.
+        // EDM KIT: a synth kit has NO mapped keys by design (so no caller that
+        // guards on hasMappedKeys() can compose it from the registry, and a
+        // drum-editor default can never write synth keys into a sampled kit).
+        // It is found by NAME and published whole, before the guard below.
+        if (kit.lastLoadedKit.startsWith ("EDM "))
+        {
+            // The kit's BASE (the developer's .dsin, else the built-in kit)
+            // plus the user's changes, which the set stores as shifts.
+            auto skHeap = std::make_unique<edm::Kit>();          // ~37 KB kit: heap, not the UI thread's stack
+            edm::Kit& sk = *skHeap;
+            if (EdmKitFiles::resolve (kit.lastLoadedKit, kit.edmKit, sk))
+            {
+                // Arriving from a sampled kit clears it.  An EDIT to the kit that
+                // is already playing swaps the cells only: ringing hits carry on
+                // and a knob drag in the window never chokes the groove.
+                if (std::atomic_load (&synthKit) == nullptr)
+                    clearPreset();
+                publishSynthKit (sk);
+            }
+            return;
+        }
         if (! kit.hasMappedKeys()) return;
 
         clearPreset();
@@ -2132,15 +2927,45 @@ namespace Betel
     //==========================================================================
     // renderBlock — voices + click → tempBuffer → EQ → delay → reverb → outBuffer
     //==========================================================================
-    void Channel::renderBlock(juce::AudioBuffer<float>& outBuffer, int numSamples, double hostBPM)
+    void Channel::renderBlock(juce::AudioBuffer<float>& outBuffer, int numSamples, double hostBPM,
+                              SectionSendFx* sectionFx)
     {
         if (outBuffer.getNumChannels() < 1) return;
+
+        // CC74 brightness: glide toward the style's target once per block.
+        {
+            const float bt = brightnessTarget.load (std::memory_order_relaxed);
+            brightnessSmoothed += (bt - brightnessSmoothed) * 0.35f;
+            if (std::abs (bt - brightnessSmoothed) < 1.0e-4f) brightnessSmoothed = bt;
+        }
 
         if (tempBuffer.getNumSamples() < numSamples)
             tempBuffer.setSize (2, numSamples, false, false, true);
 
         tempBuffer.clear (0, 0, numSamples);
         tempBuffer.clear (1, 0, numSamples);
+
+        // ── THE EXPRESSION RAMP FOR THIS BLOCK ───────────────────────────────
+        //
+        // One one-pole step per block toward what the style asked for, and the
+        // two endpoints kept so the voice loop can draw a straight line between
+        // them.  Cheap: one exp() per block per channel, no per-sample state.
+        {
+            const float target = channelExpression.load();
+            const float ms     = juce::jmax (1.0f, kExpSmoothMs);
+            const float blockMs = (currentSampleRate > 0.0)
+                                ? (float) (numSamples * 1000.0 / currentSampleRate) : 0.0f;
+            const float k      = 1.0f - std::exp (-blockMs / ms);
+
+            expStart    = expSmoothed;
+            expSmoothed += k * (target - expSmoothed);
+
+            // SNAP WHEN IT IS ESSENTIALLY THERE, so a held value does not creep
+            // for ever and the multiply settles on exactly what was asked.
+            if (std::abs (target - expSmoothed) < 1.0e-4f) expSmoothed = target;
+            expEnd = expSmoothed;
+        }
+
 
         auto activePreset = std::atomic_load (&active);
         const bool haveContent = ready.load() && activePreset && ! activePreset->regions.empty();
@@ -2149,15 +2974,31 @@ namespace Betel
         // Drum mode runs a kit-wide FX bus in parallel with the dry mix.
         // Make sure its wet-path scratch is sized and zeroed before voices
         // write into it.
+        // EDM KIT: the kit this block plays (held for the whole block), and
+        // which of its families run their own rack.
+        const auto edmKitNow = drumMode ? std::atomic_load (&synthKit) : std::shared_ptr<const edm::Kit>();
+        for (int f = 0; f < edm::kNumFamilies; ++f)
+            edmFamOn[(size_t) f] = edmKitNow != nullptr && ! edmKitNow->fx[(size_t) f].isNeutral();
+
         if (drumMode)
         {
             if (drumFxScratch.getNumSamples() < numSamples)
                 drumFxScratch.setSize (2, numSamples, false, false, true);
             drumFxScratch.clear (0, 0, numSamples);
             drumFxScratch.clear (1, 0, numSamples);
+
+            for (int f = 0; f < edm::kNumFamilies; ++f)
+                if (edmFamOn[(size_t) f])
+                {
+                    auto& fb = edmFamBuf[(size_t) f];
+                    if (fb.getNumSamples() < numSamples)
+                        fb.setSize (2, numSamples, false, false, true);
+                    fb.clear (0, 0, numSamples);
+                    fb.clear (1, 0, numSamples);
+                }
         }
 
-        if (haveContent)
+        if (haveContent || std::atomic_load (&synthKit) != nullptr)   // EDM KIT has no regions
         {
             // Snapshot per-block params (channel-wide).
             const float fCutoffChannel = filterCutoff.load();
@@ -2191,13 +3032,56 @@ namespace Betel
             // for the same reason the fader does): with it bypassed you could
             // not balance instruments against each other, which is the one
             // thing bypass must not break.
-            const float chVol          = channelVolume.load() * channelExpression.load()
+            // EXPRESSION IS NOT IN HERE.  It is the one factor that can step,
+            // so it is applied per SAMPLE from the block ramp below rather than
+            // baked into a per-block constant.
+            const float chVol          = channelVolume.load()
                                        * channelAutoLevel.load() * instrumentGain.load();
+
+            // The ramp, as a start value and a per-sample increment.
+            const float expInc         = (numSamples > 0)
+                                       ? (expEnd - expStart) / (float) numSamples : 0.0f;
             const float chPan          = juce::jlimit(-1.0f, 1.0f, channelPan.load());
 
+            // ── PAN IS A STEREO PAN NOW, NOT A BALANCE ───────────────────────
+            //
+            // The LAW was always right: cos/sin across 0..pi/2 is the standard
+            // energy-preserving split, -3 dB at centre.  What was wrong was what
+            // it multiplied.  It ran
+            //
+            //     out.L = source.L * panL;      out.R = source.R * panR;
+            //
+            // which is a BALANCE control, not a panner: at hard left the source's
+            // RIGHT channel is multiplied by zero and thrown away, and at hard
+            // right its LEFT channel is.  On a stereo sample whose two channels
+            // differ — a different mic, a different round-robin, any stereo
+            // width baked into the sample — the two extremes then play
+            // genuinely different material, which is heard as one side being
+            // brighter than the other.  (Studio One shipped exactly this as its
+            // default "pan" for years; the giveaway is a stereo part vanishing
+            // when panned away from itself.)
+            //
+            // A true stereo pan repositions the image instead of discarding half
+            // of it: pan the MID with the same constant-power law, and let the
+            // SIDE shrink as the image narrows, so hard pan FOLDS TO MONO rather
+            // than dropping a channel.
+            //
+            //     mid  = (L + R) / 2        side = (L - R) / 2
+            //     outL = mid*cos(a) + side*w
+            //     outR = mid*sin(a) - side*w        w = 0.7071 * (1 - |pan|)
+            //
+            // MONO SOURCES ARE BIT-IDENTICAL TO BEFORE.  With L == R the side is
+            // zero and this reduces to exactly the old expression, so nothing in
+            // the mix needs recalibrating — only stereo samples change, and they
+            // change from "loses a channel" to "narrows".
+            //
+            // The 0.7071 on the side is what makes centre a pass-through at the
+            // same -3 dB the mid gets: at pan 0 the pair sums back to the
+            // original L and R, scaled by 0.7071, exactly as a mono source is.
             const float panAngle = (chPan * 0.5f + 0.5f) * juce::MathConstants<float>::halfPi;
-            const float panL = std::cos(panAngle);
-            const float panR = std::sin(panAngle);
+            const float panL    = std::cos(panAngle);
+            const float panR    = std::sin(panAngle);
+            const float panSide = 0.7071068f * (1.0f - std::abs (chPan));
 
             // Snapshot the global "bypass instrument audio chain" toggle once
             // per block.  When set, gates EVERY per-voice and per-channel DSP
@@ -2220,6 +3104,9 @@ namespace Betel
             const bool chainBypass = chainBypassed.load();
             const float panLEff    = chainBypass ? 0.7071068f : panL;
             const float panREff    = chainBypass ? 0.7071068f : panR;
+            // Bypass means centre at full width — the same pass-through the pan
+            // law gives at 0, so bypassing cannot change the stereo image.
+            const float panSideEff = chainBypass ? 0.7071068f : panSide;
 
             for (auto& voice : voices)
             {
@@ -2227,13 +3114,38 @@ namespace Betel
 
                 // Each voice plays from the instrument it started on, so a
                 // program change can't pull the sample out from under it.
-                const auto& vsamples = voice.preset ? voice.preset->samples
-                                                     : activePreset->samples;
-                const int ri = voice.regionIndex;
+                // EDM KIT: a synth voice renders its whole block up front into
+                // synthScratch and is read below in place of the sample.  It has
+                // no SampleData, so `sample` binds to the never-read placeholder
+                // (empty buffer -> sampleLen 0, stereoSrc false: the mono path).
+                // A synth that finished during the previous block retires here.
+                const bool synthVoice = (voice.synthIndex >= 0);
+
+                // SOUND ENGINE: this voice's settings and its per-block constants.
+                std::shared_ptr<const oscengine::Params> oscP;
+                if (voice.oscEngine && ! synthVoice)
+                {
+                    oscP = std::atomic_load (&oscParams[(size_t) oscengine::programSlot (voice.oscProgram)]);
+                    if (oscP != nullptr)
+                        oscengine::prepareBlock (voice.osc, *oscP, currentSampleRate);
+                }
+                if (synthVoice)
+                {
+                    auto& sv = synthVoices[voice.synthIndex];
+                    if (! sv.isActive() || synthPlaceholder.empty()) { voice.active = false; continue; }
+                    if ((int) synthScratch.size() < numSamples)
+                        synthScratch.resize ((size_t) numSamples);
+                    sv.renderMono (synthScratch.data(), numSamples);
+                }
+
+                const auto& vsamples = synthVoice ? synthPlaceholder
+                                     : (voice.preset ? voice.preset->samples
+                                                     : activePreset->samples);
+                const int ri = synthVoice ? 0 : voice.regionIndex;
                 if (ri < 0 || ri >= (int) vsamples.size()) { voice.active = false; continue; }
 
                 auto& sample = vsamples[(size_t) ri];
-                if (sample.buffer.getNumSamples() == 0) { voice.active = false; continue; }
+                if (! synthVoice && sample.buffer.getNumSamples() == 0) { voice.active = false; continue; }
 
                 const int sampleLen = sample.buffer.getNumSamples();
                 // TRUE STEREO input stage.  A sample stored with two channels is
@@ -2283,10 +3195,12 @@ namespace Betel
 
                     // Per-key band edges, same 20 * 1000^norm law as everywhere
                     // else.  Left fully open they cost one comparison below.
+                    // EDM KIT: a synth voice carries its own key's band (set at
+                    // note-on from the kit), never a sampled kit's per-key edits.
                     voiceHpHz = 20.0f * std::pow (1000.0f, juce::jlimit (0.0f, 1.0f,
-                                                              st.userHpNorm.load()));
+                                                  synthVoice ? voice.synthHpNorm : st.userHpNorm.load()));
                     voiceLpHz = 20.0f * std::pow (1000.0f, juce::jlimit (0.0f, 1.0f,
-                                                              st.userLpNorm.load()));
+                                                  synthVoice ? voice.synthLpNorm : st.userLpNorm.load()));
                 }
 
                 // The per-voice multiplier the note-on asked for.  Defaults to
@@ -2294,6 +3208,27 @@ namespace Betel
                 // set its own level without moving the kit it shares a channel
                 // with.
                 voiceGainMult *= juce::jmax (0.0f, voice.extraGain);
+
+                // MELODIC PSEUDO-RR CUTOFF.  Exactly 1.0 unless the note-on
+                // latched a deviation, so the compare costs one branch per voice
+                // per block and the multiply never runs on an untouched patch.
+                //
+                // Clamped to the same 20 Hz .. 20 kHz the channel parameter is,
+                // so a deviation applied near either end can never push the SVF
+                // outside its legal range - which at the top would mean tan()
+                // near the Nyquist asymptote, and at the bottom a cutoff of
+                // zero.
+                if (voice.rrCutoffMul != 1.0f)
+                    voiceFCutoff = juce::jlimit (20.0f, 20000.0f,
+                                                 voiceFCutoff * voice.rrCutoffMul);
+
+                // CC74 BRIGHTNESS - the style's filter sweep.  Exactly 1.0 at the
+                // neutral 64, so ordinary playback skips the multiply.  Applied
+                // BEFORE the bypass test below, so closing a fully open voice
+                // (cutoff at 20 kHz) switches its filter on.
+                if (brightnessSmoothed != 1.0f)
+                    voiceFCutoff = juce::jlimit (20.0f, 20000.0f,
+                                                 voiceFCutoff * brightnessSmoothed);
 
                 // ── Filter bypass test (per voice, per block) ─────────────────
                 //
@@ -2335,6 +3270,30 @@ namespace Betel
                                            && std::abs(fAmount)   < 0.001f
                                            && fLfoDepth           < 0.001f);
 
+                // ── KEYTRACK, HOISTED OUT OF THE SAMPLE LOOP ─────────────────
+                //
+                // Both inputs are constant for the whole block - voice.note does
+                // not change while a voice sounds, and fKeytrack was loaded once
+                // above the voice loop - so this was a std::pow PER SAMPLE PER
+                // VOICE computing the same number every time.  At 48 voices and
+                // a 512-sample block that is up to 24576 pow() calls per channel
+                // per block, for one value.
+                //
+                // Guarded on the same 0.1 threshold the old inline test used, so
+                // a patch with no keytrack (the default) pays one compare rather
+                // than one compare per sample.
+                const bool  keytrackOn  = std::abs (fKeytrack) > 0.1f;
+                const float keytrackMul = keytrackOn
+                    ? std::pow (2.0f, (float) (voice.note - 60) * fKeytrack / 1200.0f)
+                    : 1.0f;
+
+                // EDM KIT: a synth voice whose family runs its own rack sums
+                // into that family's buffer; every other voice into the kit mix.
+                juce::AudioBuffer<float>* const voiceDest =
+                    (synthVoice && voice.edmFamily >= 0 && voice.edmFamily < edm::kNumFamilies
+                     && edmFamOn[(size_t) voice.edmFamily])
+                        ? &edmFamBuf[(size_t) voice.edmFamily] : &drumFxScratch;
+
                 for (int i = 0; i < numSamples; ++i)
                 {
                     // ── PORTAMENTO: ONE-POLE GLIDE IN THE PITCH (LOG) DOMAIN ──
@@ -2373,12 +3332,61 @@ namespace Betel
 
                     if (!voice.ampEnv.isActive()) { voice.active = false; break; }
 
+                    // ── ATTACK GLIDE, ADVANCED PER SAMPLE ────────────────
+                    //
+                    // fallAmount is the amp envelope's own fall law, reused
+                    // rather than reimplemented: k is the same signed exponent
+                    // the SHAPE knob writes, so +6 reads as EXP on both pages
+                    // and means the same contour.  Here it is the fraction of
+                    // the distance ALREADY TRAVELLED, so the offset is
+                    // depth * (1 - fallAmount) and reaches exactly zero at the
+                    // end of the labelled time.
+                    if (voice.glideActive)
+                    {
+                        voice.glidePhase += voice.glideInc;
+
+                        if (voice.glidePhase >= 1.0f)
+                        {
+                            voice.glideSemis  = 0.0f;
+                            voice.glideActive = false;
+                        }
+                        else
+                        {
+                            const float travelled =
+                                Betel::AHDSREnvelope::fallAmount (voice.glidePhase,
+                                                                 voice.glideShapeK);
+                            voice.glideSemis = voice.glideDepth * (1.0f - travelled);
+                        }
+                    }
+
                     double pitchSemitones = voice.currentPitchSemitones;
+                    if (voice.glideActive)                            pitchSemitones += (double) voice.glideSemis;
                     if (std::abs(bendValue) > 0.001f)                  pitchSemitones += (double) bendValue * (double) bendRange;
                     if (! chainBypass && std::abs(pEnvDepth) > 0.01f)  pitchSemitones += (double) pitchEnvLevel * (double) pEnvDepth;
                     if (! chainBypass && pLfoDepth > 0.001f)           pitchSemitones += (double) pLfo * (double) pLfoDepth;
 
                     float sL = 0.0f, sR = 0.0f;
+
+                    if (synthVoice)
+
+                    {
+
+                        sL = sR = synthScratch[(size_t) i];   // EDM KIT: mono, like a mono sample
+
+                    }
+
+                    else if (oscP != nullptr)
+                    {
+                        // SOUND ENGINE: the oscillators at the voice's live pitch - glide,
+                        // bend, the pitch envelope and LFO are all in pitchSemitones.  The
+                        // ladder envelope lets go when the voice's amp envelope does,
+                        // whichever way the note ended.
+                        if (voice.ampEnv.stage == Betel::AHDSREnvelope::Release)
+                            oscengine::release (voice.osc);
+                        const double hz = 440.0 * std::exp2 ((pitchSemitones + voice.oscOffset - 69.0) / 12.0);
+                        sL = sR = oscengine::render (voice.osc, *oscP, hz, voice.note, currentSampleRate);
+                    }
+                    else
 
                     {
                         const double effectivePitch =
@@ -2526,19 +3534,18 @@ namespace Betel
                     // voiceGainMult (drum per-key override) are intrinsic to
                     // the instrument and survive.
                     const float velGain  = chainBypass ? 1.0f : voice.velocityGain;
+
+                    // CC 11, interpolated across the block - see kExpSmoothMs.
+                    const float expNow   = expStart + expInc * (float) i;
+
                     const float gain     = velGain * voice.regionGain * voiceGainMult
-                                         * voice.kickMixGain * ampLevel * chVol * ampMod
-                                         * voice.xfadeGain;
+                                         * voice.kickMixGain * ampLevel * chVol * expNow
+                                         * ampMod * voice.xfadeGain;
 
                     // Filter modulation uses voiceFCutoff so the drum per-key
                     // override (if set) participates in keytrack + env + LFO.
                     float modCutoff = voiceFCutoff;
-                    if (std::abs(fKeytrack) > 0.1f)
-                    {
-                        const float semiFromC4 = (float)(voice.note - 60);
-                        const float trackRatio = std::pow(2.0f, semiFromC4 * fKeytrack / 1200.0f);
-                        modCutoff *= trackRatio;
-                    }
+                    if (keytrackOn) modCutoff *= keytrackMul;   // hoisted above
                     if (std::abs(fAmount) > 0.001f)
                         modCutoff += filtLevel * fAmount * 10000.0f;
                     if (fLfoDepth > 0.001f)
@@ -2566,16 +3573,19 @@ namespace Betel
                             // an identical output — run one and copy.
                             if (bandHpHz > 20.01f)   // low-cut engaged
                             {
-                                sL = voice.hpFilterL.process (sL, bandHpHz, 0.0f, HighPass, currentSampleRate);
+                                // Butterworth, not 0.0f - see kSvfButterworthReso
+                                // in SynthCommon.h.  0.0f is Q = 0.5 here, which
+                                // droops the passband an octave below the dial.
+                                sL = voice.hpFilterL.process (sL, bandHpHz, kSvfButterworthReso, HighPass, currentSampleRate);
                                 sR = dualPath
-                                       ? voice.hpFilterR.process (sR, bandHpHz, 0.0f, HighPass, currentSampleRate)
+                                       ? voice.hpFilterR.process (sR, bandHpHz, kSvfButterworthReso, HighPass, currentSampleRate)
                                        : sL;
                             }
                             if (bandLpHz < 19999.0f) // high-cut engaged
                             {
-                                sL = voice.filterL.process (sL, bandLpHz, 0.0f, LowPass, currentSampleRate);
+                                sL = voice.filterL.process (sL, bandLpHz, kSvfButterworthReso, LowPass, currentSampleRate);
                                 sR = dualPath
-                                       ? voice.filterR.process (sR, bandLpHz, 0.0f, LowPass, currentSampleRate)
+                                       ? voice.filterR.process (sR, bandLpHz, kSvfButterworthReso, LowPass, currentSampleRate)
                                        : sL;
                             }
                         }
@@ -2604,16 +3614,19 @@ namespace Betel
                         {
                             if (voiceHpHz > 20.01f)
                             {
-                                sL = voice.hpFilterL.process (sL, voiceHpHz, 0.0f, HighPass, currentSampleRate);
+                                // Butterworth - same reason as the per-key band
+                                // path above; both stages must match or the two
+                                // surfaces would disagree at the same setting.
+                                sL = voice.hpFilterL.process (sL, voiceHpHz, kSvfButterworthReso, HighPass, currentSampleRate);
                                 sR = dualPath
-                                       ? voice.hpFilterR.process (sR, voiceHpHz, 0.0f, HighPass, currentSampleRate)
+                                       ? voice.hpFilterR.process (sR, voiceHpHz, kSvfButterworthReso, HighPass, currentSampleRate)
                                        : sL;
                             }
                             if (voiceLpHz < 19999.0f)
                             {
-                                sL = voice.filterL.process (sL, voiceLpHz, 0.0f, LowPass, currentSampleRate);
+                                sL = voice.filterL.process (sL, voiceLpHz, kSvfButterworthReso, LowPass, currentSampleRate);
                                 sR = dualPath
-                                       ? voice.filterR.process (sR, voiceLpHz, 0.0f, LowPass, currentSampleRate)
+                                       ? voice.filterR.process (sR, voiceLpHz, kSvfButterworthReso, LowPass, currentSampleRate)
                                        : sL;
                             }
                         }
@@ -2641,20 +3654,59 @@ namespace Betel
                     // the rack after the voice loop, then blended back via the
                     // master wet/dry.  Melodic slots (and any drum slot with the
                     // chain bypassed) write straight to the dry mix as before.
+                    // Mid/side stereo pan — see the note above panAngle.
+                    const float mid  = (sL + sR) * 0.5f;
+                    const float side = (sL - sR) * 0.5f;
+                    const float outL = mid * panLEff + side * panSideEff;
+                    const float outR = mid * panREff - side * panSideEff;
+
                     if (drumMode && ! chainBypass)
                     {
-                        drumFxScratch.addSample (0, i, sL * panLEff);
-                        drumFxScratch.addSample (1, i, sR * panREff);
+                        voiceDest->addSample (0, i, outL);
+                        voiceDest->addSample (1, i, outR);
                     }
                     else
                     {
-                        tempBuffer.addSample (0, i, sL * panLEff);
-                        tempBuffer.addSample (1, i, sR * panREff);
+                        tempBuffer.addSample (0, i, outL);
+                        tempBuffer.addSample (1, i, outR);
                     }
                 }
             }
-
         }
+
+        // -- EDM KIT: EACH FAMILY'S RACK --------------------------------------
+        // The families with a rack of their own run it now, then join the kit
+        // mix; their sends go straight to the section's chorus / reverb / delay.
+        if (drumMode && edmKitNow != nullptr && ! chainBypassed.load())
+            for (int f = 0; f < edm::kNumFamilies; ++f)
+                if (edmFamOn[(size_t) f])
+                    processEdmFamily (f, edmKitNow->fx[(size_t) f], numSamples, hostBPM, sectionFx);
+
+        // ── IS THIS CHANNEL WORTH PROCESSING AT ALL? ─────────────────────────
+        //
+        // Sixteen style channels and eight solo channels exist at all times, and
+        // on a typical arrangement most of them are silent: eight style parts
+        // sound, a couple of solo slots, and the rest run funkey wah, funkey
+        // phaser, sweetener, EQ, wah, phaser and the mid/side pan maths over a
+        // buffer of zeroes, every block, forever.
+        //
+        // WHY A COUNTER AND NOT A PLAIN "no voices -> skip".  The phaser has
+        // FEEDBACK and the wah has filter state, so a chain cut the instant the
+        // last voice ends would chop its own tail off - audibly, on every note
+        // release.  So the chain keeps running for kChainTailBlocks after the
+        // channel falls silent and only then stops.
+        //
+        // GENEROUS ON PURPOSE.  ~1 second at 44.1 kHz / 512, far longer than any
+        // of these inserts rings, because the cost of being wrong is an audible
+        // truncation and the cost of being generous is a second of DSP on a
+        // channel that was about to stop anyway.
+        //
+        // The SECTION reverb and delay are NOT affected: they live on the two
+        // send buses, which always run, so their tails are untouched by this.
+        if (activeVoiceCount() > 0) silentBlocks = 0;
+        else if (silentBlocks < kChainTailBlocks) ++silentBlocks;
+
+        const bool chainIdle = (silentBlocks >= kChainTailBlocks);
 
         // ── Drum FX rack (insert) ───────────────────────────────────────────
         // drumFxScratch holds the whole kit mix.  Blend the dry mix with the
@@ -2662,17 +3714,19 @@ namespace Betel
         // Skipped when not in drum mode and when chainBypass is on (the bypass
         // toggle covers drums as well as melodic slots).
         const bool chainBypassPostMix = chainBypassed.load();
-        if (drumMode && ! chainBypassPostMix)
+        if (drumMode && ! chainBypassPostMix && ! chainIdle)
         {
             const float wet = juce::jlimit (0.0f, 1.0f, drumFxBus.fxWet.load());
 
             // SWEETEN THE KIT FIRST, OUTSIDE THE RACK ENTIRELY.
             //
-            // Above the wet/dry test on purpose.  It used to sit inside the
-            // else-branch, which meant pulling the rack's WET fader to zero
-            // silently took the sweetener with it - the exact opposite of the
-            // intent, since the rack is the advanced page and defaults off
-            // while the sweetener has to work whether or not it was opened.
+            // Above the wet/dry test on purpose: pulling the rack's WET fader to
+            // zero must not take the sweetener with it, since the rack is the
+            // advanced page and defaults off while the sweetener has to work
+            // whether or not it was ever opened.
+            //
+            // Per-kit, like the melodic slots' own — a sweetener is a shaper and
+            // cannot be shared through a send.
             if (sweetEnabled.load())
             {
                 float* sL = drumFxScratch.getWritePointer (0);
@@ -2697,6 +3751,18 @@ namespace Betel
                 sweetenerFx.process (sL, sR, numSamples, sp);
             }
 
+            // THE EQ RUNS ON THE WHOLE KIT, BEFORE THE WET/DRY SPLIT.
+            //
+            // It used to sit inside the rack, so the WET fader blended the
+            // untouched kit back over every cut: at 50% WET no slider could
+            // take more than 6 dB off, and "silence" was unreachable below
+            // 100%.  WET now blends only what it was meant to - saturation and
+            // compression.
+            drumFxBus.processEq (drumFxScratch.getWritePointer (0),
+                                 drumFxScratch.getNumChannels() > 1
+                                     ? drumFxScratch.getWritePointer (1) : nullptr,
+                                 numSamples);
+
             if (wet < 1.0e-4f)
             {
                 // Rack fully bypassed — sum the dry kit mix straight in.
@@ -2711,7 +3777,7 @@ namespace Betel
                 drumFxDry.copyFrom (0, 0, drumFxScratch, 0, 0, numSamples);
                 drumFxDry.copyFrom (1, 0, drumFxScratch, 1, 0, numSamples);
 
-                drumFxBus.process (drumFxScratch, numSamples, hostBPM);
+                drumFxBus.processRack (drumFxScratch, numSamples, hostBPM);
 
                 const float dry = 1.0f - wet;
                 tempBuffer.addFrom (0, 0, drumFxDry,     0, 0, numSamples, dry);
@@ -2720,28 +3786,95 @@ namespace Betel
                 tempBuffer.addFrom (1, 0, drumFxScratch, 1, 0, numSamples, wet);
             }
         }
-        else if (! drumMode && ! chainBypassPostMix)
+        else if (! drumMode && ! chainBypassPostMix && ! chainIdle)
         {
             // Channel-level post-mix only runs for melodic slots; drum slots
             // use the FX bus above instead.
-            // Chain order: SWEETEN → EQ → Chorus → Wah → Phaser → Delay → Reverb
+            // Chain order: SWEETEN → EQ → Wah → Phaser → the section sends
             //
             // The sweetener goes FIRST and the time-based stages come after it,
             // so the dynamics treat the raw instrument and the reverb / delay
             // tails are never pumped by it.  EQ then shapes what the sweetener
             // handed over rather than fighting it for the same peaks.
+            // ── THE INSERT CHAIN, AND WHY THESE FOUR ARE STILL HERE ─────────
+            //
+            // Chorus, reverb and delay are on the section bus, fed by the sends
+            // below.  These are not, and cannot be:
+            //
+            //   EQ         corrective and per-instrument — a shared EQ means
+            //              tilting one voice tilts all sixteen
+            //   SWEETENER  a dynamics stage: its output REPLACES the signal, so
+            //              in parallel it doubles the level rather than
+            //              controlling it
+            //   WAH        a sweeping bandpass; in parallel you hear the dry
+            //              with a bump on it, not a wah
+            //   PHASER     its notches only exist against its OWN dry, so in
+            //              parallel it is an allpass and spectrally flat
+            //
+            // They also need per-instrument SETTINGS — one wah rate for a whole
+            // hand is not a wah control — which a shared rack cannot give at
+            // any price.
+            //
+            // ORDER MATTERS: all four run BEFORE the send tap at the end of this
+            // function, so what reaches the reverb is the instrument as the
+            // player hears it, shaped and filtered, rather than a raw copy.
+            // FUNKEY FIRST — STYLE INSTRUMENT -> FUNKEY -> CHANNEL EFFECTS.
+            // It is not part of this chain, it feeds it: what the sweetener, EQ
+            // and the slot's own wah and phaser receive is already wet.
+            applyFunkeyInPlace      (tempBuffer, numSamples);
+
             applySweetenerInPlace   (tempBuffer, numSamples);
             if (eqEnabled.load())     applyEqInPlace     (tempBuffer, numSamples);
-            applyChorusInPlace      (tempBuffer, numSamples);
             applyWahInPlace         (tempBuffer, numSamples);
             applyPhaserInPlace      (tempBuffer, numSamples);
-            if (delayEnabled.load())  applyDelayInPlace  (tempBuffer, numSamples, hostBPM);
-            if (reverbEnabled.load()) applyReverbInPlace (tempBuffer, numSamples);
+
+            // DELAY AND REVERB ARE NOT HERE ANY MORE.  They were the last two
+            // stages of this chain, per channel, twenty-four times over — and
+            // neither has any idle detection, so once enabled each ran an FDN or
+            // a delay line every block forever regardless of whether anything
+            // had fed it.  That was the bulk of the plugin's idle CPU.
+            //
+            // They are now ONE of each per section, fed by the sends below.
+            // applyDelayInPlace and applyReverbInPlace still exist and still
+            // work; nothing calls them on this path.
         }
 
         const int outChannels = juce::jmin (2, outBuffer.getNumChannels());
+
+        // The whole dry, always.  The three shapers that used to take a share of
+        // it are inserts again and have already had their say on tempBuffer.
         for (int c = 0; c < outChannels; ++c)
             outBuffer.addFrom (c, 0, tempBuffer, c, 0, numSamples);
+
+        // ── SECTION SENDS ────────────────────────────────────────────────────
+        //
+        // HERE, and not one line earlier or later.  tempBuffer at this point is
+        // exactly what the channel contributes to the mix: EQ applied, pan and
+        // gain included, drum bus already blended for a kit.  Tapping anywhere
+        // upstream would send a signal the player never hears, and the send
+        // would stop tracking the fader.
+        //
+        // ADDITIVE, and the dry above is untouched: a send only ever puts MORE
+        // signal into the room.
+        //
+        // Skipped at zero, which is the default and the common case, so a dry
+        // instrument costs six compares rather than six buffer adds.
+        if (sectionFx != nullptr)
+        {
+            const int nch = juce::jmin (2, outChannels);
+
+            for (int slot = 0; slot < SectionSendFx::kNumSlots; ++slot)
+            {
+                const float amount = sendAmount[(size_t) slot].load();
+                if (amount <= 1.0e-4f) continue;
+
+                auto& dest = sectionFx->sendBuffer (slot);
+                const int n = juce::jmin (dest.getNumChannels(), nch);
+
+                for (int c = 0; c < n; ++c)
+                    dest.addFrom (c, 0, tempBuffer, c, 0, numSamples, amount);
+            }
+        }
 
         // ── Publish the notes the channel is PLAYING (editor's piano strip) ──
         // Straight from the MIDI note events (keyDownCount, maintained in
@@ -2773,6 +3906,17 @@ namespace Betel
 
             for (int i = 0; i < 4; ++i)
                 soundingMask[(size_t) i].store (m[i], std::memory_order_relaxed);
+
+            // EDM KIT pad LEDs: MIDI truth - lit from note-on to note-off, from
+            // the key-down tallies alone.  No latch (it would stretch every
+            // note-off) and no ringing voice (the sound's tail is not the note).
+            // Hits shorter than a UI frame flash once via padHitMask.
+            uint32_t pa[4] = { 0u, 0u, 0u, 0u };
+            for (int n = 0; n < 128; ++n)
+                if (keyDownCount[(size_t) n] > 0 || editorKeyDown[(size_t) n] > 0)
+                    pa[(size_t) (n >> 5)] |= (1u << (n & 31));
+            for (int i = 0; i < 4; ++i)
+                padActivityMask[(size_t) i].store (pa[i], std::memory_order_relaxed);
         }
     }
 
@@ -2797,27 +3941,54 @@ namespace Betel
                                    eqR[i].setHighShelf (f, g,        currentSampleRate); }
                 else             { eqL[i].setPeaking   (f, g, 1.0f,  currentSampleRate);
                                    eqR[i].setPeaking   (f, g, 1.0f,  currentSampleRate); }
+                eqListDirty = true;
             }
             if (std::abs (cachedEqGain[i]) > 0.05f) anyActive = true;
         }
 
-        if (! anyActive) return;
+        if (! anyActive) { eqActiveCount = 0; return; }
+
+        // ── ONLY THE BANDS THAT ARE ACTUALLY SET ─────────────────────────────
+        //
+        // The five stages used to be written out straight-line, so all five ran
+        // whether or not they were flat.  A typical EQ move touches one or two,
+        // which left three or four biquads doing identity arithmetic on every
+        // sample of every one of the 24 channels.
+        //
+        // The list is rebuilt inside the coefficient loop above only when
+        // something actually changed, so a settled EQ costs nothing extra.
+        //
+        // A FLAT BAND IS SKIPPED, NOT BYPASSED, and that is safe: a peaking or
+        // shelving biquad at 0 dB is mathematically an identity, so there is no
+        // state worth preserving in it and nothing to click when it leaves the
+        // chain.
+        if (eqListDirty)
+        {
+            eqListDirty   = false;
+            eqActiveCount = 0;
+            for (int i = 0; i < 5; ++i)
+                if (std::abs (cachedEqGain[i]) > 0.05f)
+                    eqActiveIdx[eqActiveCount++] = i;
+        }
+
+        if (eqActiveCount <= 0) return;
 
         float* L = buf.getWritePointer (0);
         float* R = buf.getNumChannels() > 1 ? buf.getWritePointer (1) : L;
         const bool stereo = (R != L);
 
+        const int  nb = eqActiveCount;
+        const int* ix = eqActiveIdx;
+
         for (int i = 0; i < numSamples; ++i)
         {
             float l = L[i];
-            l = eqL[0].process (l); l = eqL[1].process (l); l = eqL[2].process (l);
-            l = eqL[3].process (l); l = eqL[4].process (l);
+            for (int b = 0; b < nb; ++b) l = eqL[ix[b]].process (l);
             L[i] = l;
             if (stereo)
             {
                 float r = R[i];
-                r = eqR[0].process (r); r = eqR[1].process (r); r = eqR[2].process (r);
-                r = eqR[3].process (r); r = eqR[4].process (r);
+                for (int b = 0; b < nb; ++b) r = eqR[ix[b]].process (r);
                 R[i] = r;
             }
         }
@@ -2856,8 +4027,10 @@ namespace Betel
         float* L = buf.getWritePointer (0);
         float* R = buf.getNumChannels() > 1 ? buf.getWritePointer (1) : L;
 
-        // StereoDelayFx is a ping-pong delay that does its own dry/wet mix.
-        delayFx.process (L, R, numSamples, delaySamples, fb, wet, currentSampleRate, dry);
+        // Cross-coupled stereo delay - each side hears its own input delayed
+        // with the other side's tail folded in - doing its own dry/wet mix.
+        delayFx.process (L, R, numSamples, delaySamples, fb, wet, currentSampleRate, dry,
+                         delayDampHz.load(), delayHpHz.load(), delaySmoothMs.load());
     }
 
     //==========================================================================
@@ -2891,6 +4064,81 @@ namespace Betel
     // bypasses cheaply when disabled or fully dry, and edits the stereo buffer
     // in place via the engine in SoundsFx.h.
     //==========================================================================
+    //==========================================================================
+    // THE FUNKEY STAGE.  Wah then phaser, in that order, from the family preset,
+    // then the global FUNKEY MIX against the dry instrument.
+    //
+    // Runs BEFORE every other insert on this channel - see the call site.  Both
+    // halves bypass independently, so a family that uses only a phaser costs one
+    // atomic load for the wah it does not use.
+    //==========================================================================
+    void Channel::applyFunkeyInPlace (juce::AudioBuffer<float>& buf, int numSamples)
+    {
+        if (buf.getNumChannels() < 1 || numSamples <= 0) return;
+
+        const bool wahOn = fkWahEnabled.load()    && fkWahMix.load()    > 0.0001f;
+        const bool phOn  = fkPhaserEnabled.load() && fkPhaserMix.load() > 0.0001f;
+        if (! wahOn && ! phOn) return;        // this channel is not funkeyed: nothing to do
+
+        // ── THE FUNKEY MIX ───────────────────────────────────────────────────
+        //
+        //   STYLE INSTRUMENT -> FUNKEY (wah, phaser) -> MIX -> CHANNEL EFFECTS
+        //
+        // One slider for every funkeyed instrument (the "E" on the FUNKEY
+        // button), saved with the SET so each style keeps its own blend.  It
+        // mixes the dry instrument with Funkey's FINISHED output, after both
+        // halves - so it scales whatever the family presets' own wah and
+        // phaser mixes give.
+        // At 1 the stage sounds exactly as it did before the slider existed.
+        //
+        // The dry copy is taken only while the blend is in use, and the value
+        // glides across the block so moving the slider never clicks.  No
+        // latency: the wah and phaser are zero-delay, so dry and wet line up.
+        const float mixFrom = funkeyMixNow;
+        const float mixTo   = funkeyMix.load();
+        funkeyMixNow = mixTo;
+        const bool  blend   = (mixFrom < 0.9999f || mixTo < 0.9999f);
+
+        const int nCh = juce::jmin (2, buf.getNumChannels());
+        if (blend)
+        {
+            if (funkeyDry.getNumSamples() < numSamples)            // a host block over prepare's size
+                funkeyDry.setSize (2, numSamples, false, false, true);
+            for (int c = 0; c < nCh; ++c)
+                funkeyDry.copyFrom (c, 0, buf, c, 0, numSamples);
+        }
+
+        float* L = buf.getWritePointer (0);
+        float* R = buf.getNumChannels() > 1 ? buf.getWritePointer (1) : L;
+
+        if (wahOn)
+            funkeyWahFx.process (L, R, numSamples,
+                                 fkWahSensitivity.load(), fkWahRate.load(),
+                                 fkWahLfoDepth.load(), fkWahBaseHz.load(),
+                                 fkWahQ.load(), fkWahMix.load(), currentSampleRate);
+
+        if (phOn)
+            funkeyPhaserFx.process (L, R, numSamples,
+                                    fkPhaserRate.load(), fkPhaserDepth.load(),
+                                    fkPhaserFeedback.load(), fkPhaserMix.load(), currentSampleRate);
+
+        if (blend)
+        {
+            const float inc = (mixTo - mixFrom) / (float) numSamples;
+            for (int c = 0; c < nCh; ++c)
+            {
+                float*       w = buf.getWritePointer (c);
+                const float* d = funkeyDry.getReadPointer (c);
+                float m = mixFrom;
+                for (int n = 0; n < numSamples; ++n)
+                {
+                    m += inc;                                       // lands on mixTo at the last sample
+                    w[n] = d[n] + (w[n] - d[n]) * m;
+                }
+            }
+        }
+    }
+
     void Channel::applyWahInPlace (juce::AudioBuffer<float>& buf, int numSamples)
     {
         if (! wahEnabled.load()) return;
@@ -2931,24 +4179,96 @@ namespace Betel
     }
 
     //==========================================================================
+    //==========================================================================
+    //  EDM KIT: ONE FAMILY'S RACK - the six pages of a sampled kit's rack, per
+    //  family: SWEET first (a shaper, like the kit-wide one), then the rack's
+    //  EQ -> SAT -> COMP, then PAN, then the SENDS, then into the kit mix.
+    //  Audio thread; the family's settings come from the kit the block plays.
+    //==========================================================================
+    void Channel::processEdmFamily (int f, const edm::FamilyFx& fx, int numSamples, double bpm,
+                                    SectionSendFx* sectionFx)
+    {
+        auto& buf = edmFamBuf[(size_t) f];
+        float* L = buf.getWritePointer (0);
+        float* R = buf.getWritePointer (1);
+
+        if (fx.sweetOn)
+        {
+            Betel::SweetenerFx::Params sp;
+            sp.enabled     = true;
+            sp.mix         = juce::jlimit (0.0f, 1.0f, fx.sweetMix);
+            sp.softenOn    = true;   sp.softenDepth = juce::jlimit (-1.0f, 1.0f, fx.softenDepth);
+            sp.softenMs    = juce::jlimit (1.0f, 150.0f, fx.softenMs);
+            sp.peakOn      = true;   sp.peakCeilDb  = juce::jlimit (3.0f, 24.0f, fx.peakCeilDb);
+            sp.peakRatio   = juce::jlimit (1.0f, 20.0f, fx.peakRatio);
+            sp.tameOn      = true;   sp.tameDepthDb = juce::jlimit (0.0f, 12.0f, fx.tameDepthDb);
+            sp.tameFreqHz  = juce::jlimit (1500.0f, 8000.0f, fx.tameFreqHz);
+            sp.roundOn     = true;   sp.roundDrive  = juce::jlimit (0.0f, 1.0f, fx.roundDrive);
+            sp.roundMix    = juce::jlimit (0.0f, 1.0f, fx.roundMix);
+            edmFamSweet[(size_t) f].process (L, R, numSamples, sp);
+        }
+
+        if (fx.eqOn || fx.satOn || fx.compOn)
+        {
+            auto& bus = edmFamBus[(size_t) f];
+            bus.eqEnabled .store (fx.eqOn);
+            bus.satEnabled.store (fx.satOn);
+            bus.compEnabled.store (fx.compOn);
+            bus.revEnabled.store (false);
+            bus.delEnabled.store (false);
+            for (int i = 0; i < DrumSplitEq::kBands; ++i)
+                bus.eqGainDb[i].store (fx.eqOn ? juce::jlimit (DrumSplitEq::kSilenceDb, DrumSplitEq::kMaxDb,
+                                                               fx.eqGainDb[i])
+                                               : 0.0f);
+            bus.satDrive     .store (juce::jlimit (0.0f, 1.0f,     fx.satDrive));
+            bus.satMix       .store (juce::jlimit (0.0f, 1.0f,     fx.satMix));
+            bus.compThreshDb .store (juce::jlimit (-60.0f, 0.0f,   fx.compThreshDb));
+            bus.compRatio    .store (juce::jlimit (1.0f, 20.0f,    fx.compRatio));
+            bus.compAttackMs .store (juce::jlimit (0.1f, 200.0f,   fx.compAttackMs));
+            bus.compReleaseMs.store (juce::jlimit (5.0f, 2000.0f,  fx.compReleaseMs));
+            bus.compMakeupDb .store (juce::jlimit (0.0f, 24.0f,    fx.compMakeupDb));
+            bus.process (buf, numSamples, bpm);
+        }
+
+        if (fx.pan != 0.0f)                          // balance: the centre stays at unity
+        {
+            const float p  = juce::jlimit (-1.0f, 1.0f, fx.pan);
+            const float gl = juce::jmin (1.0f, 1.0f - p), gr = juce::jmin (1.0f, 1.0f + p);
+            juce::FloatVectorOperations::multiply (L, gl, numSamples);
+            juce::FloatVectorOperations::multiply (R, gr, numSamples);
+        }
+
+        if (sectionFx != nullptr)
+        {
+            const std::pair<int, float> sends[] = { { SectionSendFx::kChorus, fx.chorusSend },
+                                                    { SectionSendFx::kReverb, fx.reverbSend },
+                                                    { SectionSendFx::kDelay,  fx.delaySend } };
+            for (const auto& [slot, amount] : sends)
+            {
+                if (amount <= 1.0e-4f) continue;
+                auto& dest = sectionFx->sendBuffer (slot);
+                const int n = juce::jmin (dest.getNumChannels(), 2);
+                for (int c = 0; c < n; ++c)
+                    dest.addFrom (c, 0, buf, c, 0, numSamples, juce::jlimit (0.0f, 1.0f, amount));
+            }
+        }
+
+        drumFxScratch.addFrom (0, 0, buf, 0, 0, numSamples);
+        drumFxScratch.addFrom (1, 0, buf, 1, 0, numSamples);
+    }
+
     // DrumFxBus implementation
     //
-    // The signal flow inside process() is fixed at EQ → Sat → Comp → Reverb →
-    // Delay.  Each stage is bypassed when its key parameter sits at neutral
-    // (e.g. EQ skips when every band is within 0.05 dB of unity, Saturation
-    // skips when drive < 1e-4, etc.) so an empty FX configuration costs only
-    // a handful of atomic loads per block.
+    // The signal flow is fixed: EQ (processEq), then the rack (processRack:
+    // Sat → Comp - the reverb and delay live on the section bus now).  Each
+    // stage is bypassed when its key parameter sits at neutral (the EQ is not
+    // run while every band is at unity, Saturation skips when drive < 1e-4,
+    // etc.) so an empty FX configuration costs only a handful of atomic loads
+    // per block.
     //==========================================================================
     void Channel::DrumFxBus::prepare (double sr, int blockSize)
     {
-        sampleRate = sr;
-
-        for (int i = 0; i < 10; ++i)
-        {
-            eqL[i].reset();
-            eqR[i].reset();
-            cachedEqGain[i] = 0.0f;
-        }
+        prepareEq (sr);
 
         compEnv = 0.0f;
 
@@ -2959,12 +4279,35 @@ namespace Betel
         delayFx .prepare (sr);
     }
 
+    void Channel::DrumFxBus::prepareEq (double sr)
+    {
+        sampleRate = sr;
+        eq.design (sr);
+        eq.reset();
+    }
+
     void Channel::DrumFxBus::reset()
     {
-        for (int i = 0; i < 10; ++i) { eqL[i].reset(); eqR[i].reset(); }
+        eq.reset();
         compEnv = 0.0f;
         reverbFx.reset();
         delayFx .reset();
+    }
+
+    // ── 1. THE EQ: the 10-band split (DrumSplitEq.h) ─────────────────────────
+    //
+    // Each slider is the volume of its own band.  While every band sits at
+    // unity the split is not run at all, so an untouched EQ costs nothing;
+    // stepping it in or out crossfades over one block, and gains glide.
+    void Channel::DrumFxBus::processEq (float* L, float* R, int numSamples)
+    {
+        if (L == nullptr || numSamples <= 0) return;
+
+        float db [DrumSplitEq::kBands];
+        for (int i = 0; i < DrumSplitEq::kBands; ++i)
+            db[i] = eqGainDb[i].load();
+
+        eq.process (L, R, numSamples, db, eqEnabled.load());
     }
 
     void Channel::DrumFxBus::process (juce::AudioBuffer<float>& buf, int numSamples,
@@ -2972,41 +4315,21 @@ namespace Betel
     {
         if (buf.getNumChannels() < 1 || numSamples <= 0) return;
 
+        processEq (buf.getWritePointer (0),
+                   buf.getNumChannels() > 1 ? buf.getWritePointer (1) : nullptr,
+                   numSamples);
+        processRack (buf, numSamples, hostBPM);
+    }
+
+    void Channel::DrumFxBus::processRack (juce::AudioBuffer<float>& buf, int numSamples,
+                                          double hostBPM)
+    {
+        if (buf.getNumChannels() < 1 || numSamples <= 0) return;
+        juce::ignoreUnused (hostBPM);
+
         const bool stereo = buf.getNumChannels() > 1;
         float* L = buf.getWritePointer (0);
         float* R = stereo ? buf.getWritePointer (1) : L;
-
-        // ── 1. 10-band EQ (peaking biquads at fixed ISO frequencies) ─────────
-        {
-            bool anyActive = false;
-            for (int i = 0; i < 10; ++i)
-            {
-                const float g = eqGainDb[i].load();
-                if (std::abs (g - cachedEqGain[i]) > 1e-3f)
-                {
-                    cachedEqGain[i] = g;
-                    // Q ~ 1.4 → roughly one-octave bandwidth per band.
-                    eqL[i].setPeaking (kEqFreqs[i], g, 1.4f, sampleRate);
-                    eqR[i].setPeaking (kEqFreqs[i], g, 1.4f, sampleRate);
-                }
-                if (std::abs (cachedEqGain[i]) > 0.05f) anyActive = true;
-            }
-            if (eqEnabled.load() && anyActive)
-            {
-                for (int n = 0; n < numSamples; ++n)
-                {
-                    float l = L[n];
-                    for (int i = 0; i < 10; ++i) l = eqL[i].process (l);
-                    L[n] = l;
-                    if (stereo)
-                    {
-                        float r = R[n];
-                        for (int i = 0; i < 10; ++i) r = eqR[i].process (r);
-                        R[n] = r;
-                    }
-                }
-            }
-        }
 
         // ── 2. Saturation (tanh soft-clip, gain-compensated) ─────────────────
         {
@@ -3071,82 +4394,19 @@ namespace Betel
             }
         }
 
-        // ── 4. Reverb — Betel::ReverbFx, identical to the melodic channels ───
+        // ── 4 AND 5: THE RACK'S OWN REVERB AND DELAY ARE GONE ────────────────
         //
-        // Was juce::Reverb into a scratch buffer, then a manual dry gain and an
-        // addFrom to sum the wet back.  ReverbFx does the whole dry/wet sum in
-        // place, so all of that goes: copy, process, attenuate, add becomes one
-        // call on the buffer itself.
-        {
-            // Slider x base, exactly as on the melodic side.
-            const float wet = juce::jlimit (0.0f, 1.0f, revWet.load() * revWetBase.load());
-            const float dry = revDry.load();
-
-            // DRY IS PART OF THE TEST.  Pulling DRY down with WET at zero is a
-            // real request; the old block could ignore it because its dry gain
-            // was applied inside the wet branch.
-            if (revEnabled.load() && (wet > 1e-4f || dry < 0.9999f))
-            {
-                float* rL = buf.getWritePointer (0);
-                float* rR = stereo ? buf.getWritePointer (1) : rL;
-
-                // ReverbFx swaps engines on the audio thread and cross-fades the
-                // outgoing tail itself, so setting this every block is safe.
-                reverbFx.setAlgorithm (revAlgo.load());
-
-                reverbFx.process (rL, rR, numSamples,
-                                  revSize.load(), revDamp.load(), wet,
-                                  revPreDelay.load(), sampleRate,
-                                  dry, revTail.load(),
-                                  revHpNorm.load(), revLpNorm.load());
-            }
-        }
-
-        // ── 5. Delay — Betel::StereoDelayFx, identical to the melodic channels ─
+        // Both used to run here, per drum channel, on top of whatever the rest
+        // of the mix was doing.  Drums now feed the LEFT section bus like every
+        // other channel, so keeping a private pair would put the kit in two
+        // different rooms at once and pay for a second FDN to do it.
         //
-        // Was a hand-rolled ring buffer with a single tap and shared feedback.
-        // StereoDelayFx is the ping-pong the melodic slots run, so a 1/8 on a
-        // kit and a 1/8 on a guitar are now the same effect and not merely the
-        // same number.
+        // revWet / delWet are still read — Channel::applyDrumKitFx turns them
+        // into the kit's SENDS — so a kit that had reverb still has reverb, in
+        // the room the whole hand shares.  Nothing in the .drm format changed.
         //
-        // BOTH TIME SOURCES KEPT.  The engine takes a length in samples, so
-        // free-ms versus musical division is decided here, before the DSP - the
-        // swap costs nothing that already worked.
-        {
-            const float wet = juce::jlimit (0.0f, 1.0f, delWet.load() * delWetBase.load());
-            const float dry = delDry.load();
-            const float fb  = delFb.load();
-
-            if (delEnabled.load() && (wet > 1e-4f || fb > 1e-4f || dry < 0.9999f))
-            {
-                // Same division tables as Channel::applyDelayInPlace.
-                static constexpr float kBeats44 [5] = { 4.0f, 2.0f, 1.0f, 0.5f, 0.25f };
-                static constexpr float kBeats34 [4] = { 3.0f, 1.0f, 0.5f, 0.25f };
-
-                float tSec;
-                if (delSync.load())
-                {
-                    const int   ts  = delTimeSig.load();
-                    const int   div = delDiv.load();
-                    const float beats = (ts == 0)
-                        ? kBeats44[(size_t) juce::jlimit (0, 4, div)]
-                        : kBeats34[(size_t) juce::jlimit (0, 3, div)];
-                    const float bpm = (float) juce::jmax (20.0, hostBPM);
-                    tSec = beats * (60.0f / bpm);
-                }
-                else
-                {
-                    tSec = delTimeMs.load() * 0.001f;
-                }
-
-                float* dL = buf.getWritePointer (0);
-                float* dR = stereo ? buf.getWritePointer (1) : dL;
-
-                delayFx.process (dL, dR, numSamples,
-                                 tSec * (float) sampleRate,
-                                 fb, wet, sampleRate, dry);
-            }
-        }
+        // What stays in this rack is what is genuinely per-kit: EQ, saturation,
+        // compression and pan.
     }
 
     //==========================================================================
@@ -3165,6 +4425,7 @@ namespace Betel
         for (auto& v : voices) v.reset();
         heldNotes.clear();
         std::atomic_store (&active, std::shared_ptr<PresetVoice>{});
+        std::atomic_store (&synthKit, std::shared_ptr<const edm::Kit>{});   // EDM KIT off
         presetName.clear();
         loadedDrumKitName.clear();
         currentInstrumentFlag.store (-1);
@@ -3185,17 +4446,23 @@ namespace Betel
         if (presetIndex < 0) return;
         if (presetPool.find (presetIndex) != presetPool.end()) return;   // already pooled
 
+        // ── THE SHARED CACHE FIRST: someone may have unpacked this already ───
+        //
+        // A hit costs a pointer copy. This is what makes the same sound
+        // instant on a second slot, and instant again after a style change -
+        // the per-channel pool is emptied by clearInstrument, the cache is not.
+        if (sharedPresets != nullptr)
+        {
+            if (auto cached = sharedPresets->get (presetIndex))
+            {
+                presetPool[presetIndex] = std::move (cached);
+                return;
+            }
+        }
+
         const auto& presets = reader.getPresets();
         if (presetIndex >= (int) presets.size()) return;
         const auto& preset = presets[(size_t) presetIndex];
-
-        // Spike diagnostics: decoding a preset is the single heaviest
-        // message-thread operation in the plugin, and the one most likely to
-        // stall the process.  Timed and byte-counted so a log line can be lined
-        // up against an audio spike in the same second.
-        Betel::PerfMonitor::Scoped perfScope ("DECODE",
-            "preset " + juce::String (presetIndex) + " ch" + juce::String (channelIndex));
-        int64_t decodedBytes = 0;
 
         auto pv = std::make_shared<PresetVoice>();
         for (const auto& blobRegion : preset.regions)
@@ -3220,15 +4487,25 @@ namespace Betel
 
             SampleData sd;
             fillSampleData (sd, fs.data.data(), fs.channels, fs.numFrames, fs.sampleRate);
-            decodedBytes += (int64_t) sd.buffer.getNumChannels()
-                          * (int64_t) sd.buffer.getNumSamples() * (int64_t) sizeof (float);
 
             pv->regions.push_back(reg);
             pv->samples.push_back(std::move(sd));
         }
 
+        // Into the shared cache as well as this channel's pool, so the next
+        // channel - and the next style - gets it for free. Sized by the decoded
+        // audio it actually holds, which is what the ceiling is measured in.
+        if (sharedPresets != nullptr)
+        {
+            size_t bytes = 0;
+            for (const auto& sd : pv->samples)
+                bytes += (size_t) sd.buffer.getNumChannels()
+                       * (size_t) sd.buffer.getNumSamples() * sizeof (float);
+
+            sharedPresets->put (presetIndex, pv, bytes);
+        }
+
         presetPool[presetIndex] = std::move (pv);
-        Betel::PerfMonitor::get().addSampleBytes (decodedBytes, 1);
     }
 
     void Channel::loadPreset(BlobReader& reader, int presetIndex)
@@ -3252,6 +4529,42 @@ namespace Betel
     // it was never preloaded this does nothing (it must NEVER decode here).
     void Channel::selectPooledPreset(int presetIndex)
     {
+        //----------------------------------------------------------------------
+        // A PROGRAM CHANGE TO THE SOUND ALREADY PLAYING CHANGES NOTHING.
+        //
+        // This early return is the fix for "set slider values only commit after
+        // I open the sound editor", and the mechanism deserves spelling out
+        // because every push in the restore path was correct and the values
+        // STILL died:
+        //
+        //   1. A set load selects the instrument, which stashes the flag's
+        //      SAVED voice (.ins / .sins, else neutral) for later PCs - the
+        //      stash NEVER sees the live channel.
+        //   2. The set then commits its params onto the live channel.  Engine
+        //      correct, stash still holding the pre-set voice.
+        //   3. PLAY starts.  The style re-sends its setup program changes -
+        //      the SAME flags that are already loaded - and the restore below
+        //      dutifully swapped the stashed voice back in.  Everything the
+        //      set (or a live slider edit) had put on the channel was gone.
+        //   4. And because the flag did not CHANGE, the 30 Hz mirror saw no
+        //      voice change, so reassertStyleSlotVoicing - built for exactly
+        //      this wipe on DIFFERENT-flag PCs - never fired.
+        //
+        // Opening the editor "fixed" it only because its commit re-wrote the
+        // live channel after the last wipe.  A latency on the preset change
+        // (considered first) just re-times the race: the wipe recurs on every
+        // section boundary, so any delay loses eventually.
+        //
+        // Same flag + published means the samples below are the samples
+        // already playing and the voice restore is pure destruction, so the
+        // whole call is a no-op.  A cleared channel can never take this exit:
+        // clearPreset stores flag -1 and ready false.  A DIFFERENT flag still
+        // runs the full path - stash restore included - which is the actual
+        // job of this function.
+        //----------------------------------------------------------------------
+        if (presetIndex == currentInstrumentFlag.load() && ready.load())
+            return;
+
         auto it = presetPool.find (presetIndex);
         if (it == presetPool.end()) return;
 
@@ -3297,8 +4610,22 @@ namespace Betel
         if (ignorePresetParams.load())
             return;
 
+        // THE RT TWIN OF THE SAME GUARD.  On a set-owned channel a missing
+        // stash means "the SET said what this sounds like", so the neutral
+        // stamp is pure destruction - exactly what applyParams(ChannelParams{})
+        // does to ADSR, filter, EQ, LFOs and FX while the band filter, living
+        // outside ChannelParams, sails through untouched.  That contrast is
+        // what identified this: one value stored elsewhere was the one value
+        // that worked.
+        //
+        // The gain goes with it.  instrumentGain is the per-SOUND trim, and on
+        // a style slot the set owns that too (it arrives as gainPercent x
+        // baseUnityDb through onSlotGainChanged); resetting it here would leave
+        // the level jumping on every section boundary even once the voice held.
         const auto applyNeutralVoice = [this]
         {
+            if (voiceOwnedBySet.load()) return;
+
             applyParams (ChannelParams{});
             instrumentGain.store (1.0f);
         };
@@ -3319,14 +4646,21 @@ namespace Betel
         // One load of the flag, one branch: a gain-only stash means the voice is
         // neutral, a full stash means it is the saved one.  Reading the atomic
         // twice would let the message thread change the answer between them.
+        //
+        // AND THE SAME OWNERSHIP RULE APPLIES TO THE STASH ITSELF.  Since the
+        // .ins cut, a style channel's stash is ALWAYS the gain-only / neutral
+        // one - there is no preset left to build a full stash from - so this
+        // else-branch was the last door the neutral stamp came through, and it
+        // opens on every runtime program change through CASM routing.  A
+        // set-owned channel keeps what the set gave it; a full stash still
+        // applies, because that only exists where a preset really does govern.
         if (pooledHasParams[i].load (std::memory_order_acquire))
             applyParams (pooledParams[i]);
-        else
+        else if (! voiceOwnedBySet.load())
             applyParams (ChannelParams{});
 
-        instrumentGain.store (pooledGain[i].load (std::memory_order_relaxed));
+        // The trim follows the same rule as the voice above it.
+        if (! voiceOwnedBySet.load())
+            instrumentGain.store (pooledGain[i].load (std::memory_order_relaxed));
     }
 } // namespace Betel
-
-
-

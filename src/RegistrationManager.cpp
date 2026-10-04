@@ -1,5 +1,10 @@
+
+
 #include "RegistrationManager.h"
 #include "GlobalMacros.h"   // Betel::GrexPaths - one root for every file we own
+#include "HmacSha256.h"      // Betel::serialForMachineId - the new serial
+#include "LicenceCarrier.h"
+#include <cstring>       // std::memset - clearing the cached carrier key  // Betel::LicenceCarrier - the secret, out of the binary
 
 #if JUCE_WINDOWS
  #include <windows.h>
@@ -28,52 +33,83 @@ namespace
     // Grex VSTI folder, and nesting a second one inside it was a mistake in the
     // first draft of this file.
     //
-    // MIRROR: AppData.  The plugin folder is user-relocatable (see the folder
-    // locator) and users clean, move and reinstall it; losing a paid
-    // registration to a tidy-up is a support call that should never happen.
-    // AppData survives all of that, and survives an uninstall.
+    // THERE IS ONLY ONE LICENCE FILE, and it lives in Documents\Fanan.
     //
-    // Writing both costs nothing and neither copy weakens the scheme, because
-    // NEITHER IS TRUSTED: checkRegistration re-derives the expected serial from
-    // this machine's ID and compares, so a licence file copied anywhere - the
-    // other folder, another drive, another computer - is inert unless the
-    // machine agrees.  The file travels; the authority does not.
+    // NOT in the Grex VSTI folder: that one is user-relocatable (see the folder
+    // locator) and people move, clean and reinstall it, which would take a paid
+    // registration with it.  NOT in AppData either - it is hidden, users cannot
+    // find it to back it up or clear it, and an uninstaller can wipe it.
+    // Documents is visible, stable across a reinstall, and somewhere a customer
+    // can actually be pointed at over email.
+    //
+    // The folder is shared across Fanan products on purpose - each writes its
+    // own filename, so a second product cannot unlock this one from its key.
+    //
+    // Note none of this weakens anything, because THE FILE IS NEVER TRUSTED:
+    // checkRegistration re-derives the expected serial from this machine's ID
+    // and compares, so a licence file copied anywhere - another folder, another
+    // drive, another computer - is inert unless the machine agrees.  The file
+    // travels; the authority does not.
     juce::File grexLicencePrimary()
     {
-        return Betel::GrexPaths::root().getChildFile ("grex_license.key");
-    }
-
-    juce::File grexLicenceMirror()
-    {
-        return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                   .getChildFile ("Fanan Team")
-                   .getChildFile ("Grex")
+        return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                   .getChildFile ("Fanan")
                    .getChildFile ("grex_license.key");
     }
+
+    // ── THE CARRIER KEY CACHE ────────────────────────────────────────────────
+    //
+    // File scope rather than a function-local static, so forgetCarrierKey() can
+    // clear it.  It HAS to be clearable: the carrier lives under
+    // GrexPaths::root(), and the root MOVES when the user picks a folder with
+    // LOCATE SYSTEM FOLDER.
+    //
+    // Without that, a clean install dead-ends.  The constructor rescans before
+    // the root exists, checkRegistration then finds no carrier, `carrierValid`
+    // latches false - and after the user locates the folder the carrier is
+    // sitting right there while registration keeps failing, until the plugin is
+    // reloaded.  Exactly the shape of the style-library bug that
+    // rescanFromFolderManager had.
+    //
+    // Message thread only: checkRegistration runs from the processor
+    // constructor and tryRegister from a button press.
+    bool    carrierLoaded = false;
+    bool    carrierValid  = false;
+    uint8_t carrierKey[Betel::LicenceCarrier::kKeyBytes] = {};
+
 }
 
 //==============================================================================
 void RegistrationManager::checkRegistration()
 {
-    // Either copy will do, and each is re-VALIDATED rather than trusted: the
-    // stored serial is checked against this machine's own ID exactly as a typed
-    // one is.  So a licence file copied to another computer does nothing there,
-    // and reading from two locations adds no exposure at all.
-    for (const auto& f : { grexLicencePrimary(), grexLicenceMirror() })
-    {
-        if (! f.existsAsFile())
-            continue;
+    // The stored serial is re-VALIDATED, never trusted: it is checked against
+    // this machine's own ID exactly as a typed one is.  So a licence file copied
+    // to another computer does nothing there.
+    const auto f = grexLicencePrimary();
 
+    if (f.existsAsFile())
+    {
         const juce::String savedSerial = f.loadFileAsString().trim();
 
         if (savedSerial.isNotEmpty() && tryRegister (savedSerial))
         {
             registered.store (true);
-            return;   // tryRegister has already re-written BOTH copies
+            return;   // tryRegister has already re-written the file
         }
     }
 
     registered.store (false);
+}
+
+//==============================================================================
+void RegistrationManager::forgetCarrierKey()
+{
+    // Called whenever the root folder moves, so the next verification re-reads
+    // the carrier from the NEW location instead of trusting an answer derived
+    // from the old one - including a "there is no carrier" answer.
+    carrierLoaded = false;
+    carrierValid  = false;
+    std::memset (carrierKey, 0, sizeof (carrierKey));
 }
 
 //==============================================================================
@@ -93,7 +129,7 @@ bool RegistrationManager::tryRegister (const juce::String& serialInput)
         // Tabs and non-breaking spaces go too: a paste from a web page or a
         // spreadsheet cell carries them, and the user cannot see any of it.
         // The check that actually protects anything is the comparison against
-        // calculateExpectedSerial() below; this stage exists only to reject
+        // hmacSerialMatches() below; this stage exists only to reject
         // obvious rubbish early, so it should not be the thing that rejects a
         // correct key.
         juce::String cleanInput = serialInput.trim()
@@ -104,20 +140,23 @@ bool RegistrationManager::tryRegister (const juce::String& serialInput)
         if (cleanInput.isEmpty() || ! cleanInput.containsOnly ("0123456789-"))
             return false;
 
-        const long long inputNum = cleanInput.getLargeIntValue();
-        const long long expected = calculateExpectedSerial();
-
-        if (inputNum != expected)
+        // HMAC ONLY.  The legacy linear formula - 6*ID + 34977, which two known
+        // (id, serial) pairs solve with a pencil - is gone, along with the
+        // dual-accept path that briefly kept it alive.  Removed at Rob's request
+        // while he is the only user, which is the one moment it costs nothing:
+        // every serial issued from here on is an HMAC serial, and there is no
+        // second door to leave open.
+        if (! hmacSerialMatches (cleanInput))
             return false;
 
-        // Written to BOTH, and a failure on either is not fatal: if the plugin
-        // folder happens to be read-only on this install, the AppData copy
-        // still carries the registration, and vice versa.  Failing the whole
-        // registration because one of two redundant writes did not land would
-        // be the redundancy working against the user.
-        for (const auto& f : { grexLicencePrimary(), grexLicenceMirror() })
+        // A write failure is deliberately NOT fatal.  The serial has already
+        // been verified against this machine, so the session is legitimately
+        // registered whether or not the file lands; failing here would refuse a
+        // valid customer because a folder happened to be read-only.  The only
+        // cost of a failed write is that they retype the serial next launch.
         {
-            auto folder = f.getParentDirectory();
+            const auto f = grexLicencePrimary();
+            auto folder  = f.getParentDirectory();
 
             if (! folder.exists())
                 folder.createDirectory();
@@ -149,8 +188,8 @@ int RegistrationManager::getMachineIDNumber()
     // The Windows path is a single GetVolumeInformationW call and costs nothing.
     // The macOS path SHELLS OUT: popen() forks a process, runs ioreg, pipes it
     // through awk and tr, and waits.  That is tens of milliseconds, and it was
-    // being paid several times over - calculateExpectedSerial calls this,
-    // tryRegister calls calculateExpectedSerial, and checkRegistration calls
+    // being paid several times over - hmacSerialMatches calls this,
+    // tryRegister calls hmacSerialMatches, and checkRegistration calls
     // tryRegister once per licence location.
     //
     // It matters more now than it did: checkRegistration has moved into the
@@ -214,54 +253,73 @@ int RegistrationManager::getMachineIDNumber()
 }
 
 //==============================================================================
-long long RegistrationManager::calculateExpectedSerial()
+//==============================================================================
+// THE HMAC SERIAL — what every NEW licence uses.
+//
+//     serial = HMAC-SHA256 (secret, machineID as ASCII) -> first 8 bytes
+//              -> big-endian uint64 -> mod 1e9 -> 9 digits
+//
+// Two known (id, serial) pairs now reveal NOTHING, because reversing it means
+// breaking SHA-256.  That is the whole point of the change; everything else -
+// the typed nine digits, the instant reissue after a reformat, no database, no
+// internet - is deliberately identical to before.
+//
+// THE SECRET IS NOT IN THIS BINARY.  It is read from the carrier audio file,
+// which ships as an ordinary asset.  That is obfuscation and not cryptography
+// (see LicenceCarrier.h), but it is the same trade OnStage's MIDI carrier made
+// and it keeps the key out of `strings` and out of a build diff.
+//
+// FAILS CLOSED.  If the carrier is missing or damaged, this returns false and
+// nothing verifies.  A silently wrong key would mean "every serial rejected"
+// with nothing to point at - which is why the carrier carries an integrity tag
+// and why this does not fall back to anything.
+//==============================================================================
+bool RegistrationManager::hmacSerialMatches (const juce::String& cleanInput)
 {
-    const long long id = getMachineIDNumber();
+    // The carrier is read ONCE and the key cached: checkRegistration runs from
+    // the processor constructor, and a plugin instantiated per track would
+    // otherwise re-read a megabyte of WAV for every one of them.  The cache is
+    // cleared by forgetCarrierKey() whenever the root folder moves.
+    if (! carrierLoaded)
+    {
+        carrierLoaded = true;
 
-    // GREX SERIAL FORMULA:  (((((ID + 6868) * 3) + 1880) * 2) - 9991)
-    //
-    // Deliberately DIFFERENT from OnStage's (((((ID+8401)*2)+1289)*2)-9090) and
-    // from Colosseum's: sharing a formula between products would mean one
-    // leaked key generator opens all of them.
-    //
-    // ── WHY THE CONSTANTS ARE MASKED ────────────────────────────────────────
-    //
-    // Written plainly, 6868 / 1880 / 9991 appear verbatim in the binary, so
-    // `strings` on the DLL - or a scan for the numbers a single leaked key
-    // implies - finds the formula without a debugger.  XOR-masking removes
-    // that, which is the cheapest real improvement available here.
-    //
-    // TWO THINGS DIFFER FROM COLOSSEUM'S VERSION, AND BOTH MATTER:
-    //
-    //   * a different mask.  Colosseum uses 0xA5B7; reusing it would mean one
-    //     leaked source file explains both products.
-    //
-    //   * `volatile`, so the decode happens at RUNTIME.  Colosseum's array is
-    //     constexpr, which lets the compiler fold the XOR away and put the
-    //     DECODED values straight into the instruction stream - hidden from
-    //     `strings`, plainly visible to any disassembler.  Reading the mask
-    //     through a volatile forbids that fold, so the plain constants exist
-    //     nowhere in the file and only briefly in a register.
-    //
-    // None of this makes the maths stronger - see the header.  It raises the
-    // cost of the LAZY attack, which is the attack that actually happens.
-    static volatile long long maskCell = 0x5C31D7LL;
-    const long long k = maskCell;
+        // GrexPaths::root() IS the "Grex VSTI" folder - sounds_gm, sfz and the
+        // licence key all sit directly inside it, and the folder manager
+        // defaults it to ~/Documents/Grex VSTI.  So the carrier is a plain
+        // top-level file there, beside the library it ships with.
+        const auto carrier = Betel::GrexPaths::root()
+                                 .getChildFile ("grex_ambience.wav");
 
-    const long long c0 = 6040323LL ^ k;   // 6868
-    const long long c1 = 6042068LL ^ k;   // 3
-    const long long c2 = 6043279LL ^ k;   // 1880
-    const long long c3 = 6042069LL ^ k;   // 2
-    const long long c4 = 6035152LL ^ k;   // 9991
+        juce::MemoryBlock mb;
+        if (carrier.existsAsFile() && carrier.loadFileAsData (mb) && mb.getSize() > 44)
+            carrierValid = Betel::LicenceCarrier::extractKey (
+                               static_cast<const uint8_t*> (mb.getData()),
+                               mb.getSize(), carrierKey);
+    }
 
-    long long result = id + c0;
-    result = result * c1;
-    result = result + c2;
-    result = result * c3;
-    result = result - c4;
-    return result;
+    if (! carrierValid)
+        return false;
+
+    // The message bytes must match the website generator EXACTLY: trimmed plain
+    // ASCII decimal, no zero padding, no whitespace, no newline.  A single stray
+    // byte here produces a completely different serial and every issued key is
+    // rejected, with the numbers looking equally random either way.
+    const juce::String machineId = getMachineIDString().trim();
+    const std::string  msg (machineId.toRawUTF8());
+
+    const uint64_t expected =
+        Betel::serialForMachineId (carrierKey, Betel::LicenceCarrier::kKeyBytes, msg);
+
+    // Compare as TEXT, zero-padded to nine digits, so a serial the user typed
+    // with its leading zero intact ("012345678") matches.  Comparing numerically
+    // would work too, but only by accident of the leading zero being dropped on
+    // both sides - and it would break the moment the digit count changed.
+    const juce::String expectedText =
+        juce::String (expected).paddedLeft ('0', kSerialDigits);
+
+    return cleanInput == expectedText;
 }
-
 //==============================================================================
 juce::String RegistrationManager::getSystemVolumeSerial()
 {
@@ -362,6 +420,7 @@ void RegistrationManager::updateDemoMode()
         }
     }
 }
+
 
 
 

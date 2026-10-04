@@ -1,3 +1,6 @@
+
+
+
 #pragma once
 //==============================================================================
 // Finisher.h  —  master-bus "finisher" for Betelgeuse / Grex.
@@ -22,7 +25,9 @@
 //                harmonics the ear reads as WEIGHT without extra peak level)
 //        high -> M/S stereo width (bass stays mono, so the mix survives a
 //                mono PA — a real concern live, not a theoretical one)
-//   4. Glue compressor     — slow attack, DUAL-STAGE release, soft knee, ~2:1.
+//   4. Glue compressor     — peak detector, HARD knee, single release.
+//      All four values (threshold / ratio / attack / release) are SLIDERS;
+//      the factory numbers are what used to be compiled in.
 //   5. Auto-level          — see "density adaptation" below.
 //   6. Saturation          — tanh drive.  Harmonics raise PERCEIVED loudness
 //                            without raising peaks; this is what actually makes
@@ -72,18 +77,68 @@ namespace Betel
 class Finisher
 {
 public:
-    // kCustom is not a preset — it is what the CHARACTER selector shows once a
-    // slider has been touched, so the user always knows the preset is no longer
-    // being followed verbatim.  loadCharacter() never loads it.
-    enum Character { kClean = 0, kWarm, kBright, kFat, kLive, kCustom, kNumCharacters };
+    //==========================================================================
+    // THE CHARACTER SELECTOR IS GONE — five presets and a CUSTOM slot, removed.
+    //
+    // It was a preset LOADER, not a mode: picking one wrote nine numbers into
+    // the sliders and then stood back.  So it added a second owner for values
+    // the sliders already owned, and a state ("CUSTOM") whose only meaning was
+    // "those numbers are no longer the ones I wrote".  Two things to reason
+    // about where one would do.
+    //
+    // What it sounded like is kept exactly: `loadFactoryDefaults()` below
+    // writes what CLEAN used to write, and the auto-level target is fixed at
+    // the value every preset but LIVE used.  Nothing about the shipping sound
+    // changes - only the selector is gone.
+    //==========================================================================
 
     /** Stages that can be individually bypassed from the window. */
     enum Stage { kStageHpf = 0, kStageEq, kStageBass, kStageWidth,
                  kStageGlue, kStageAuto, kStageDrive, kNumStages };
 
     /** Editable parameters, one per slider. */
+    //  *** THE STRIPPED CHAIN — PUSH -> COMP -> CEILING -> OUTPUT ***
+    //
+    //  Everything else is GONE FROM THE DSP AND FROM THE WINDOW, but NOT from
+    //  these two enums, and that distinction is the whole reason this was safe
+    //  to do.  Main.cpp saves the Finisher as finParam<i> / finStage<i>, KEYED
+    //  BY INDEX.  Deleting pEqLow would shift every parameter above it down one
+    //  and every .bset on disk would restore the wrong number into the wrong
+    //  control - the same trap as renumbering a RemoteId.
+    //
+    //  So the dead entries stay exactly where they are.  resolve() below pins
+    //  each one to its neutral value regardless of what a set restores, the
+    //  window skips them, and old sets keep loading without migration.
+    //
+    //  pPush is APPENDED, never inserted.  Old sets carry no finParam11, the
+    //  loader's hasProperty() check leaves it alone, and it defaults to 0 dB -
+    //  so no existing set changes how it sounds.
+    //  THE FOUR COMP CONTROLS ARE APPENDED TOO, for the same reason pPush was:
+    //  a set written before they existed carries no finParam12..15, the loader's
+    //  hasProperty() check leaves them alone, and they fall back to the factory
+    //  numbers - which are exactly the constants that used to be compiled in.
+    //  So no existing set changes how it sounds.
     enum ParamId { pHpfHz = 0, pEqLow, pEqAir, pXoverHz, pBassWeight, pWidth,
-                   pGlue, pAutoDepth, pDrive, pCeilingDb, pOutTrimDb, kNumParams };
+                   pGlue, pAutoDepth, pDrive, pCeilingDb, pOutTrimDb,
+                   pPush,
+                   pGlueThreshDb, pGlueRatio, pGlueAttackMs, pGlueReleaseMs,
+                   kNumParams };
+
+    /** Which parameters still exist as controls.  The window builds its rows
+        from this, so the panel and the DSP cannot disagree about what is real. */
+    static bool paramIsLive (int id) noexcept
+    {
+        return id == pPush || id == pCeilingDb || id == pOutTrimDb || id == pGlue
+            || id == pGlueThreshDb || id == pGlueRatio
+            || id == pGlueAttackMs || id == pGlueReleaseMs;
+    }
+
+    /** pGlue is the RETIRED 0-100 amount: it keeps the stage's on/off tick and
+        has no slider.  The four real controls beside it do. */
+    static bool paramHasSlider (int id) noexcept
+    {
+        return paramIsLive (id) && id != pGlue;
+    }
 
     //==========================================================================
     // Parameter metadata.  The WINDOW builds its rows from these, so a range can
@@ -100,11 +155,18 @@ public:
             case pXoverHz:    return "BASS - xover";
             case pBassWeight: return "BASS - weight";
             case pWidth:      return "WIDTH";
-            case pGlue:       return "GLUE";
+            case pGlue:       return "COMP";
             case pAutoDepth:  return "AUTO LEVEL";
             case pDrive:      return "DRIVE";
             case pCeilingDb:  return "CEILING";
             case pOutTrimDb:  return "OUTPUT";
+            case pPush:          return "PUSH";
+            // The ids keep their pGlue* spelling - they are persistence keys,
+            // and renaming one re-points every finParam<i> in every saved set.
+            case pGlueThreshDb:  return "COMP - thresh";
+            case pGlueRatio:     return "COMP - ratio";
+            case pGlueAttackMs:  return "COMP - attack";
+            case pGlueReleaseMs: return "COMP - release";
             default:          return "?";
         }
     }
@@ -115,7 +177,10 @@ public:
         {
             case pHpfHz: case pXoverHz:                 return " Hz";
             case pEqLow: case pEqAir:
-            case pCeilingDb: case pOutTrimDb:           return " dB";
+            case pCeilingDb: case pOutTrimDb:
+            case pPush: case pGlueThreshDb:             return " dB";
+            case pGlueAttackMs: case pGlueReleaseMs:    return " ms";
+            case pGlueRatio:                            return ":1";
             case pBassWeight: case pWidth:
             case pGlue: case pAutoDepth:                return " %";
             default:                                     return "";
@@ -139,6 +204,21 @@ public:
             // it is the guarantee the whole zero-latency design rests on.
             case pCeilingDb:  lo = -3.0f;  hi = -0.1f;  step = 0.1f;   break;
             case pOutTrimDb:  lo = -12.0f; hi = 12.0f;  step = 0.1f;   break;
+            // PUSH is gain INTO the ceiling: the one loudness control.  It
+            // cannot go negative - OUTPUT is the control for coming down.
+            case pPush:       lo =   0.0f; hi = 12.0f;  step = 0.1f;   break;
+
+            // ── THE COMP CONTROLS ────────────────────────────────────────────
+            // Factory values are the constants that used to be compiled in:
+            // -14.9 dB (0.18 linear), 2:1, 15 ms, 80 ms.
+            //
+            // RELEASE TOPS OUT AT 300 ms, not the 400 the dead kGlueReleaseSlowMs
+            // suggested: 400 was judged too slow for anything here, and a range
+            // that reaches a setting nobody wants is a range that invites it.
+            case pGlueThreshDb:  lo = -40.0f; hi =   0.0f; step = 0.5f; break;
+            case pGlueRatio:     lo =   1.0f; hi =  10.0f; step = 0.1f; break;
+            case pGlueAttackMs:  lo =   0.5f; hi = 100.0f; step = 0.5f; break;
+            case pGlueReleaseMs: lo =   5.0f; hi = 300.0f; step = 5.0f; break;
             default:          lo = 0.0f;   hi = 1.0f;   step = 0.01f;  break;
         }
     }
@@ -153,6 +233,9 @@ public:
             case pXoverHz: case pBassWeight:return kStageBass;
             case pWidth:                    return kStageWidth;
             case pGlue:                     return kStageGlue;
+            case pGlueThreshDb: case pGlueRatio:
+            case pGlueAttackMs: case pGlueReleaseMs:
+                                            return kStageGlue;
             case pAutoDepth:                return kStageAuto;
             case pDrive:                    return kStageDrive;
             default:                        return -1;   // ceiling / output
@@ -167,14 +250,14 @@ public:
             case kStageEq:    return "EQ";
             case kStageBass:  return "BASS";
             case kStageWidth: return "WIDTH";
-            case kStageGlue:  return "GLUE";
+            case kStageGlue:  return "COMP";
             case kStageAuto:  return "AUTO LEVEL";
             case kStageDrive: return "DRIVE";
             default:          return "?";
         }
     }
 
-    Finisher() { loadCharacter (kClean); }
+    Finisher() { loadFactoryDefaults(); }
 
     //==========================================================================
     // Message thread
@@ -187,10 +270,12 @@ public:
         rmsCoeff        = coeffFor (kRmsTimeMs);
         autoLevelCoeff  = coeffFor (kAutoLevelTimeMs);
         primeCoeff      = coeffFor (kAutoLevelPrimeMs);
-        attackCoeff     = coeffFor (kGlueAttackMs);
-        relFastCoeff    = coeffFor (kGlueReleaseFastMs);
-        relSlowCoeff    = coeffFor (kGlueReleaseSlowMs);
-        peakRelCoeff    = coeffFor (kPeakReleaseMs);
+        // COMP's attack/release coefficients are NOT set here: those times are
+        // sliders, and resolve() computes their coefficients once per block so a
+        // knob move takes effect without a re-prepare.
+        //
+        // peakRelCoeff is dead with the old fixed-release limiter - the follower
+        // takes p.compRelease now.
         paramCoeff      = coeffFor (kParamSmoothMs);
 
         reset();
@@ -211,18 +296,13 @@ public:
         autoLevelPrimed        = false;
         autoLevelSilentSamples = 0;
         autoLevelPrimeSamples  = 0;
-        glueEnv       = 0.0f;
         peakEnv       = 0.0f;
         grDb.store (0.0f);
 
         const Resolved r = resolve();
         rmsEst      = r.targetRms * r.targetRms;   // neutral opening target
-        smDrive     = r.drive;
-        smWidth     = r.width;
-        smSubWeight = r.bassWeight;
-        smGlue      = r.glue;
         smOutGain   = r.outGain;
-        smMix       = r.mix;
+        smPush      = r.push;
     }
 
     void setEnabled   (bool b)   noexcept { enabled.store (b); }
@@ -236,17 +316,6 @@ public:
     }
     float getAmount   () const   noexcept { return amount.load(); }
 
-    /** Selecting a character LOADS its values into the sliders (so the window
-        shows exactly what is running).  kCustom is never loaded — it is only
-        ever set as a side effect of touching a slider. */
-    void setCharacter (int c) noexcept
-    {
-        c = juce::jlimit (0, (int) kNumCharacters - 1, c);
-        character.store (c);
-        if (c != kCustom) loadCharacter (c);
-        dirty.store (true);
-    }
-    int  getCharacter () const noexcept { return character.load(); }
 
     void  setParam (int id, float v) noexcept
     {
@@ -273,21 +342,29 @@ public:
         return stageOn[(size_t) stage].load();
     }
 
-    /** Write a character preset into the parameter set.  Message thread. */
-    void loadCharacter (int c) noexcept
+    /** THE FACTORY SOUND — literally the numbers CLEAN used to write.
+        Kept verbatim so removing the selector could not change what anyone
+        already has. Also what RESET restores. */
+    void loadFactoryDefaults() noexcept
     {
-        const Preset p = presetFor (c);
-        setParamRaw (pHpfHz,      p.hpfHz);
-        setParamRaw (pEqLow,      p.eqLow);
-        setParamRaw (pEqAir,      p.eqAir);
-        setParamRaw (pXoverHz,    p.xoverHz);
-        setParamRaw (pBassWeight, p.bassWeight);
-        setParamRaw (pWidth,      p.width);
-        setParamRaw (pGlue,       p.glue);
-        setParamRaw (pAutoDepth,  p.autoDepth);
-        setParamRaw (pDrive,      p.drive);
+        //                          was: Preset{ hpf, low, air, xover, weight, width, glue, auto, drive }
+        setParamRaw (pHpfHz,       25.0f);
+        setParamRaw (pEqLow,        0.5f);
+        setParamRaw (pEqAir,        1.5f);
+        setParamRaw (pXoverHz,    120.0f);
+        setParamRaw (pBassWeight,  10.0f);
+        setParamRaw (pWidth,      112.0f);
+        setParamRaw (pGlue,        40.0f);
+        setParamRaw (pAutoDepth,   60.0f);
+        setParamRaw (pDrive,        1.5f);
         setParamRaw (pCeilingDb,  kCeilingDb);
-        setParamRaw (pOutTrimDb,  0.0f);
+        setParamRaw (pOutTrimDb,    0.0f);
+        setParamRaw (pPush,         0.0f);   // neutral: no gain into the ceiling
+        // The four COMP controls open on exactly what the glue used to use.
+        setParamRaw (pGlueThreshDb, kGlueThresholdDb);
+        setParamRaw (pGlueRatio,    kGlueRatio);
+        setParamRaw (pGlueAttackMs, kGlueAttackMs);
+        setParamRaw (pGlueReleaseMs, kGlueReleaseMs);
         for (int i = 0; i < kNumStages; ++i) stageOn[(size_t) i].store (true);
         dirty.store (true);
     }
@@ -323,203 +400,81 @@ public:
 
         for (int i = 0; i < n; ++i)
         {
-            // Smooth the macro-driven parameters so a knob move never zippers.
-            smDrive     += paramCoeff * (p.drive      - smDrive);
-            smWidth     += paramCoeff * (p.width      - smWidth);
-            smSubWeight += paramCoeff * (p.bassWeight - smSubWeight);
-            smGlue      += paramCoeff * (p.glue       - smGlue);
-            smOutGain   += paramCoeff * (p.outGain    - smOutGain);
-            smMix       += paramCoeff * (p.mix        - smMix);
+            smPush    += paramCoeff * (p.push    - smPush);
+            smOutGain += paramCoeff * (p.outGain - smOutGain);
 
-            // Keep the untouched input for the AMOUNT blend below.
-            const float dryL = L[i];
-            const float dryR = (R != nullptr) ? R[i] : dryL;
+            float l = L[i];
+            float r = (R != nullptr) ? R[i] : l;
 
-            float l = dryL;
-            float r = dryR;
-
-            // ── 1. Rumble HPF ────────────────────────────────────────────────
-            l = biquad (hpfCoef, hpfState[0], l);
-            r = biquad (hpfCoef, hpfState[1], r);
-
-            // ── 2. Tilt / Air EQ ─────────────────────────────────────────────
-            l = biquad (loShelfCoef, lowShelfState[0], l);
-            r = biquad (loShelfCoef, lowShelfState[1], r);
-            l = biquad (hiShelfCoef, hiShelfState[0], l);
-            r = biquad (hiShelfCoef, hiShelfState[1], r);
-
-            // ── 3. Crossover: low band (mono + weight), high band (width) ────
-            // The high band is derived by SUBTRACTION, not by a second filter.
-            // Summing a 2nd-order Butterworth LP and HP produces a complete NULL
-            // at the crossover frequency (LP+HP = (1+s^2)/(s^2+sqrt2 s+1), which
-            // is zero at s=j) — it would have punched a hole at 120 Hz.
-            // low + (input - low) reconstructs the input exactly, at any order.
-            const float lLow = biquad (lpCoef, lpState[0], l);
-            const float rLow = biquad (lpCoef, lpState[1], r);
-            const float lHi  = l - lLow;
-            const float rHi  = r - rLow;
-
-            // Low band -> mono, then soft-saturate for weight.
-            float lowMono = 0.5f * (lLow + rLow);
-            if (smSubWeight > 1.0e-4f)
-            {
-                const float d = 1.0f + smSubWeight * kSubDriveRange;
-                lowMono = std::tanh (lowMono * d) / d;
-            }
-
-            // High band -> M/S width.  Bass is already mono and untouched.
-            float mid  = 0.5f * (lHi + rHi);
-            float side = 0.5f * (lHi - rHi);
-            side *= smWidth;
-
-            l = lowMono + (mid + side);
-            r = lowMono + (mid - side);
-
-            // ── 4. Glue compressor (peak/RMS hybrid, dual-stage release) ─────
-            const float det = juce::jmax (std::abs (l), std::abs (r));
-
-            if (det > glueEnv) glueEnv += attackCoeff * (det - glueEnv);
-            else
-            {
-                // Release speed is program dependent: the further BELOW the
-                // envelope the signal has fallen, the slower we let go — this
-                // is what stops fills and crashes making the mix breathe.
-                const float depth = (glueEnv > 1.0e-6f) ? (glueEnv - det) / glueEnv : 0.0f;
-                const float c     = relFastCoeff + (relSlowCoeff - relFastCoeff)
-                                                     * juce::jlimit (0.0f, 1.0f, depth);
-                glueEnv += c * (det - glueEnv);
-            }
-
-            float glueGain = 1.0f;
-            if (smGlue > 1.0e-4f)
-            {
-                const float thr = kGlueThreshold;
-                if (glueEnv > thr)
-                {
-                    // Soft-knee 2:1 above the threshold, scaled by the macro.
-                    const float over  = glueEnv / thr;                 // > 1
-                    const float ratio = 1.0f + smGlue;                 // 1..2
-                    glueGain = std::pow (over, (1.0f / ratio) - 1.0f);
-                }
-            }
-            l *= glueGain;
-            r *= glueGain;
-
-            // ── 5. Auto-level (density adaptation) ───────────────────────────
-            const float sq = 0.5f * (l * l + r * r);
-            rmsEst += (autoLevelPrimed ? rmsCoeff : primeCoeff) * (sq - rmsEst);
-            const float rms = std::sqrt (juce::jmax (rmsEst, 1.0e-12f));
-
-            // Adapt only while there IS signal.  On silence the ratio
-            // target/rms runs away to the clamp, and the first note after a
-            // pause would then arrive up to +12 dB hot before the smoother
-            // caught up.  Below the floor we HOLD the current gain instead.
-            if (rms > kAutoLevelFloor)
-            {
-                const float wanted = juce::jlimit (kAutoLevelMinGain, kAutoLevelMaxGain,
-                                                   p.targetRms / juce::jmax (rms, 1.0e-5f));
-                // Only engage as far as the macro asks for.
-                const float wantedMix = 1.0f + (wanted - 1.0f) * p.autoDepth;
-
-                // PRIMING WINDOW — the fix for "the first notes of the style are
-                // very loud, then it settles".
-                //
-                // reset() leaves the gain at 1.0 (no attenuation) and the normal
-                // constants are deliberately slow: a 400 ms detector feeding a
-                // 250 ms smoother.  On a loud style the eventual target is the
-                // -6 dB clamp, so the opening ~580 ms played more than 1 dB hot,
-                // peaking around +6.
-                //
-                // NOT fixed by snapping straight to wantedMix: at the first
-                // sample the DETECTOR has not converged either — rmsEst is still
-                // its seed, which reads as near-silence and asks for +12 dB.  A
-                // naive snap therefore makes the burst WORSE, not better
-                // (measured: +18 dB instead of +6).
-                //
-                // So prime BOTH: seed rmsEst to targetRms^2 (below, in reset)
-                // so the opening target is exactly neutral whatever autoDepth
-                // is, then run detector and gain on a fast constant until the
-                // level is actually known, and only then hand over to the slow
-                // pair.  Measured on a loud style: time spent >1 dB above the
-                // settled level drops from 580 ms to 54 ms, with no change to
-                // the steady state and no burst at all on a quiet style.
-                if (! autoLevelPrimed)
-                {
-                    autoLevelGain += primeCoeff * (wantedMix - autoLevelGain);
-                    if (++autoLevelPrimeSamples
-                          >= (int) (kAutoLevelPrimeWindowMs * 0.001 * sampleRate))
-                        autoLevelPrimed = true;
-                }
-                else
-                {
-                    autoLevelGain += autoLevelCoeff * (wantedMix - autoLevelGain);
-                }
-                autoLevelSilentSamples = 0;
-            }
-            else if (autoLevelPrimed)
-            {
-                // Re-arm the priming window only after SUSTAINED silence, so a
-                // gap between notes can't restart it.  The floor is ~-50 dBFS
-                // and the detector runs at 400 ms, so nothing musical gets
-                // there — only a real stop does.  rmsEst is re-seeded with it so
-                // the next start begins from the same neutral target.
-                if (++autoLevelSilentSamples
-                      >= (int) (kAutoLevelRearmMs * 0.001 * sampleRate))
-                {
-                    autoLevelPrimed       = false;
-                    autoLevelPrimeSamples = 0;
-                    rmsEst                = p.targetRms * p.targetRms;
-                }
-            }
-
-            l *= autoLevelGain;
-            r *= autoLevelGain;
-
-            // ── 6. Saturation ────────────────────────────────────────────────
-            if (smDrive > 1.0f + 1.0e-4f)
-            {
-                const float inv = 1.0f / std::tanh (smDrive);
-                l = std::tanh (l * smDrive) * inv;
-                r = std::tanh (r * smDrive) * inv;
-            }
-
-            // ── 6b. AMOUNT = DRY / WET, AND IT SITS HERE ON PURPOSE ──────────
+            // ── 1. PUSH — gain into the ceiling ──────────────────────────────
             //
-            // Everything above is the tone-and-dynamics section; everything
-            // below is the safety net.  Blending here means AMOUNT controls how
-            // much of the CHAIN you hear, while the ceiling and the output trim
-            // still run on whatever comes out of the blend.
-            //
-            // Blending AFTER the limiter would have been the obvious place and
-            // it is wrong: the dry path has never been limited, so any mix below
-            // 100% could push the output past the ceiling - and that ceiling is
-            // the guarantee the whole zero-latency design rests on (its range
-            // cannot even reach 0 dB, see paramRange).
-            //
-            // Consequence worth knowing: AMOUNT at 0 is not "Finisher off", it
-            // is the limiter alone, which is a genuinely useful setting.  The
-            // enable switch is what turns the whole thing off.
-            //
-            // The usual parallel-processing caveat applies - the HPF and the
-            // shelves are minimum-phase, so blending them against dry shifts
-            // their effective curve slightly rather than simply scaling it.
-            // That is inherent to any wet/dry across an EQ, and it is why the
-            // sliders are absolute now: what you set is what the WET path does.
-            l = dryL + (l - dryL) * smMix;
-            r = dryR + (r - dryR) * smMix;
+            // The whole loudness control, and it is deliberately the FIRST
+            // thing: everything after it is a safety net, so pushing harder can
+            // only ever mean "ask the limiter for more", never "colour it more".
+            l *= smPush;
+            r *= smPush;
 
-            // ── 7. Ceiling: fast feedback peak-follower + soft clip ──────────
-            // No lookahead, so the follower can overshoot on a sharp transient;
-            // the soft clipper below is what guarantees the ceiling is never
-            // exceeded.  Follower first = the clipper only ever sees small
-            // overshoots, which keeps it clean.
+            // ── 2. COMP — the one dynamics stage, and it is the limiter ──────
+            //
+            // THE GLUE COMPRESSOR IS GONE.  It sat here as its own stage with
+            // its own envelope, and it was the wrong processor for this
+            // instrument: a 2:1 bus compressor on the MASTER makes the style and
+            // the player's right hand share one gain, so every melody note
+            // pulled the band down.  That is not ducking and no setting fixed
+            // it - it is what a bus compressor does once the two buses have been
+            // summed, and the only cure was to stop using one.
+            //
+            // WHAT REPLACES IT IS THE LIMITER THAT WAS ALREADY HERE, given the
+            // four controls the glue used to own.  It behaves differently in the
+            // way that matters: a FEEDBACK peak follower acting only on what
+            // passes its threshold, rather than a feed-forward envelope riding
+            // the whole programme continuously.  It reaches for a peak and lets
+            // go instead of leaning on everything all the time.
+            //
+            // STILL ZERO LATENCY.  No lookahead, so the follower can overshoot,
+            // and the soft clip below is what guarantees the ceiling holds.
+            //
+            // ATTACK IS A SLIDER NOW, where it used to be instant.  Instant is
+            // still reachable - the minimum is 0.5 ms - but it is no longer
+            // compulsory, and a slower attack is what lets a transient through
+            // and keeps the band from flinching on every note.
+            //
+            // THE FOLLOWER RUNS WHETHER OR NOT THE STAGE IS ON.  An envelope
+            // that stops being fed goes stale, and re-ticking COMP mid-song
+            // would land a full-depth grab on the first note while it caught up.
+            // Only the GAIN is gated.
             const float pk = juce::jmax (std::abs (l), std::abs (r));
-            if (pk > peakEnv) peakEnv = pk;                        // instant attack
-            else              peakEnv += peakRelCoeff * (pk - peakEnv);
 
+            if (pk > peakEnv) peakEnv += p.compAttack  * (pk - peakEnv);
+            else              peakEnv += p.compRelease * (pk - peakEnv);
+
+            float compGain = 1.0f;
+            if (p.compOn && peakEnv > p.compThresh)
+            {
+                // HARD KNEE: smooth ABOVE the threshold, slope changing abruptly
+                // AT it.  Worth knowing when setting a low threshold by ear.
+                //
+                // At ratio 1:1 the exponent is 0 and pow() returns 1, so the
+                // slider reaching 1.0 is a genuine bypass rather than a special
+                // case somebody has to remember.
+                const float over = peakEnv / p.compThresh;
+                compGain = std::pow (over, p.compExp);
+            }
+
+            l *= compGain;
+            r *= compGain;
+
+            // ── 3. Ceiling: the backstop, and nothing else ───────────────────
+            //
+            // NOT A SECOND COMPRESSOR.  No threshold, ratio or times of its own -
+            // a hard divide down to the ceiling plus a soft clip, and with COMP
+            // set sensibly above it this should almost never engage.  It is here
+            // so a transient the follower overshot cannot leave the plugin above
+            // the ceiling.
             float limGain = 1.0f;
-            if (peakEnv > p.ceiling)
-                limGain = p.ceiling / peakEnv;
+            const float post = juce::jmax (std::abs (l), std::abs (r));
+            if (post > p.ceiling)
+                limGain = p.ceiling / post;
 
             l *= limGain;
             r *= limGain;
@@ -527,17 +482,16 @@ public:
             l = softClip (l, p.ceiling);
             r = softClip (r, p.ceiling);
 
-            // ── 8. Output trim ───────────────────────────────────────────────
+            // ── 4. Output trim ───────────────────────────────────────────────
             l *= smOutGain;
             r *= smOutGain;
 
             L[i] = l;
             if (R != nullptr) R[i] = r;
 
-            // Glue reduction happens inside the wet path, so at a low mix most
-            // of it never reaches the output - report what is actually heard.
-            const float glueHeard = 1.0f + (glueGain - 1.0f) * smMix;
-            const float grLin = glueHeard * limGain;
+            // No AMOUNT blend any more, so what the meter reports is simply what
+            // the two remaining gain stages did.
+            const float grLin = compGain * limGain;
             maxGr = juce::jmax (maxGr, 1.0f - grLin);
         }
 
@@ -561,8 +515,19 @@ private:
     static constexpr float kRmsTimeMs          = 400.0f;  // density estimate
     static constexpr float kAutoLevelTimeMs    = 250.0f;
     static constexpr float kGlueAttackMs       = 15.0f;
-    static constexpr float kGlueReleaseFastMs  = 80.0f;
-    static constexpr float kGlueReleaseSlowMs  = 400.0f;
+    // ONE release, replacing the old fast/slow pair (~23 ms / ~113 ms).  80 ms
+    // lets go inside a bar at ballad tempo, so a phrase cannot leave the band
+    // sitting reduced after it ends.
+    static constexpr float kGlueReleaseMs      = 80.0f;
+    // Factory values for COMP, kept as the numbers the glue was tuned to -
+    // whether it runs, nothing decides how hard.
+    static constexpr float kGlueRatio          = 2.0f;
+    static constexpr float kGlueFixedAmount    = 1.0f;   // retired amount, unread
+
+    // THE DUAL-STAGE RELEASE kGlueReleaseFastMs / kGlueReleaseSlowMs DESCRIBED
+    // WAS NEVER IMPLEMENTED - only one release time ever reached the detector.
+    // Both are removed rather than left describing machinery that is not there;
+    // the release is a slider now, which is the honest version of the same idea.
     static constexpr float kPeakReleaseMs      = 40.0f;
     static constexpr float kParamSmoothMs      = 30.0f;
 
@@ -570,7 +535,9 @@ private:
     // glue stage sat idle and the GR meter never moved — "the effect isn't
     // hearable".  Low enough to engage on normal material, high enough that it
     // still lets quiet passages breathe.
-    static constexpr float kGlueThreshold      = 0.18f;
+    // FACTORY THRESHOLD, stated in dB so it reads as what it is: 0.18 linear
+    // was the compiled-in value, and -14.9 dB is the same number.
+    static constexpr float kGlueThresholdDb    = -14.9f;
     static constexpr float kSubDriveRange      = 2.5f;
     static constexpr float kClipKnee           = 0.80f;  // clipper is linear below 80% of ceiling
     static constexpr float kAutoLevelMinGain   = 0.5f;    // -6 dB
@@ -579,32 +546,6 @@ private:
     static constexpr float kAutoLevelRearmMs   = 250.0f;  // silence before priming re-arms
     static constexpr float kAutoLevelPrimeMs   = 25.0f;   // fast constant while priming
     static constexpr float kAutoLevelPrimeWindowMs = 80.0f;   // how long priming lasts
-
-    //==========================================================================
-    // A character preset — the values loadCharacter() writes into the sliders.
-    // These are the FULL-STRENGTH settings; the AMOUNT macro decides how far
-    // toward them the chain actually goes (see resolve()).
-    //==========================================================================
-    struct Preset
-    {
-        float hpfHz, eqLow, eqAir, xoverHz, bassWeight, width, glue, autoDepth, drive;
-    };
-
-    static Preset presetFor (int c) noexcept
-    {
-        switch (c)
-        {
-            //          hpf   low   air  xover  weight  width  glue  auto  drive
-            case kWarm:   return {  25.f,  3.0f, -1.0f, 120.f,  45.f, 108.f, 60.f, 75.f, 2.4f };
-            case kBright: return {  25.f, -1.0f,  4.0f, 120.f,   0.f, 140.f, 45.f, 70.f, 1.7f };
-            case kFat:    return {  25.f,  4.0f,  1.0f, 140.f,  80.f, 118.f, 80.f, 85.f, 2.2f };
-            // LIVE: mono-safe width, higher HPF for stage rumble, heaviest glue
-            // so the level stays put across sections.
-            case kLive:   return {  40.f,  1.5f,  2.5f, 120.f,  35.f, 100.f, 90.f, 95.f, 2.0f };
-            case kClean:
-            default:      return {  25.f,  0.5f,  1.5f, 120.f,  10.f, 112.f, 40.f, 60.f, 1.5f };
-        }
-    }
 
     /** Resolved, ready-to-use values for one block: the slider settings with
         every bypassed stage neutralised.
@@ -624,37 +565,66 @@ private:
         in process(), across the whole tone-and-dynamics section. */
     struct Resolved
     {
+        // hpfHz/eqLow/eqAir/xoverHz/bassWeight/width/autoDepth/drive/targetRms/mix
+        // are RETIRED.  The fields are kept so nothing that reads Resolved has to
+        // change, and resolve() pins each to its neutral value.
         float hpfHz, eqLow, eqAir, xoverHz;
         float bassWeight, width, glue, autoDepth, drive;
         float ceiling, outGain, targetRms, mix;
+        float push;          // linear gain into the ceiling
+        bool  compOn;        // the stage tick
+
+        // ── THE COMP CONTROLS, RESOLVED ──────────────────────────────────────
+        // The two TIME values arrive as coefficients rather than milliseconds,
+        // because coeffFor() is an exp() and the audio loop must not pay for one
+        // per sample.  resolve() runs once per block, which is exactly the right
+        // place for it.
+        float compThresh;    // linear, from dB
+        float compExp;       // (1/ratio) - 1, the exponent used per sample
+        float compAttack;    // one-pole coefficient
+        float compRelease;   // one-pole coefficient
     };
 
     Resolved resolve() const noexcept
     {
-        const bool  onHpf   = stageOn[kStageHpf]  .load();
-        const bool  onEq    = stageOn[kStageEq]   .load();
-        const bool  onBass  = stageOn[kStageBass] .load();
-        const bool  onWidth = stageOn[kStageWidth].load();
-        const bool  onGlue  = stageOn[kStageGlue] .load();
-        const bool  onAuto  = stageOn[kStageAuto] .load();
-        const bool  onDrive = stageOn[kStageDrive].load();
-
         Resolved r {};
-        // A bypassed HPF still needs a corner: park it where it does nothing.
-        r.hpfHz      = onHpf ? params[pHpfHz].load() : 5.0f;
-        r.eqLow      = onEq  ? params[pEqLow].load() : 0.0f;
-        r.eqAir      = onEq  ? params[pEqAir].load() : 0.0f;
-        r.xoverHz    = params[pXoverHz].load();
-        r.bassWeight = onBass  ? params[pBassWeight].load() * 0.01f : 0.0f;
-        r.width      = onWidth ? params[pWidth].load() * 0.01f : 1.0f;
-        r.glue       = onGlue  ? params[pGlue].load() * 0.01f : 0.0f;
-        r.autoDepth  = onAuto  ? params[pAutoDepth].load() * 0.01f : 0.0f;
-        r.drive      = onDrive ? params[pDrive].load() : 1.0f;
 
-        r.ceiling    = juce::Decibels::decibelsToGain (params[pCeilingDb].load());
-        r.outGain    = juce::Decibels::decibelsToGain (params[pOutTrimDb].load());
-        r.targetRms  = (character.load() == kLive) ? 0.14f : 0.12f;
-        r.mix        = juce::jlimit (0.0f, 1.0f, amount.load() * 0.01f);
+        // ── EVERY RETIRED STAGE IS PINNED NEUTRAL, UNCONDITIONALLY ───────────
+        //
+        // Not read from params[], not gated on stageOn[].  All 90 sets on disk
+        // carry values for these - a width of 112%, an auto-level depth of 60% -
+        // and if resolve() still honoured them, stripping the DSP would have
+        // done nothing for anyone who ever saved a set.  Pinning here is what
+        // makes the removal actually take effect, on old and new sets alike.
+        r.hpfHz      = 5.0f;    // parked below audio: the biquad runs, does nothing
+        r.eqLow      = 0.0f;
+        r.eqAir      = 0.0f;
+        r.xoverHz    = 120.0f;
+        r.bassWeight = 0.0f;
+        r.width      = 1.0f;
+        r.autoDepth  = 0.0f;
+        r.drive      = 1.0f;
+        r.targetRms  = 0.12f;
+        r.mix        = 1.0f;    // AMOUNT is gone; the chain is always fully wet
+
+        // ── WHAT IS LEFT ─────────────────────────────────────────────────────
+        //
+        // pGlue is the retired 0-100 amount and is read by nothing.
+        // slow pumping be dialled in without anyone meaning to.
+        r.compOn  = stageOn[kStageGlue].load();
+        r.glue    = kGlueFixedAmount;          // retired amount, unread
+
+        // COMP's four controls.  These constants were the glue's fixed settings
+        // and are now the factory defaults of four sliders - see paramRange.
+        r.compThresh  = juce::Decibels::decibelsToGain (params[pGlueThreshDb].load());
+        const float ratio = juce::jmax (1.0f, params[pGlueRatio].load());
+        r.compExp     = (1.0f / ratio) - 1.0f;   // 1:1 -> 0 -> unity gain
+        r.compAttack  = coeffFor (params[pGlueAttackMs].load());
+        r.compRelease = coeffFor (params[pGlueReleaseMs].load());
+
+        r.push    = juce::Decibels::decibelsToGain (params[pPush].load());
+        r.ceiling = juce::Decibels::decibelsToGain (params[pCeilingDb].load());
+        r.outGain = juce::Decibels::decibelsToGain (params[pOutTrimDb].load());
         return r;
     }
 
@@ -785,7 +755,6 @@ private:
     // ON to match).  process() still returns immediately when switched off.
     std::atomic<bool>  enabled   { true };
     std::atomic<float> amount    { 50.0f };
-    std::atomic<int>   character { kClean };
     std::atomic<bool>  dirty     { true };
 
     std::array<std::atomic<float>, kNumParams> params {};
@@ -796,22 +765,30 @@ private:
     State hpfState[2], lowShelfState[2], hiShelfState[2], lpState[2];
 
     float rmsCoeff = 0.001f, autoLevelCoeff = 0.001f, primeCoeff = 0.01f;
-    float attackCoeff = 0.01f, relFastCoeff = 0.001f, relSlowCoeff = 0.0002f;
-    float peakRelCoeff = 0.001f, paramCoeff = 0.01f;
+    // ONE release, not the old dual-stage pair.  The program-dependent slow leg
+    // ran at ~113 ms and held reduction on after a phrase - that is the tail
+    // heard as "the band ducks and recovers slowly".  A single moderate release
+    // is predictable, which matters more here than being clever.
+    // peakRelCoeff is retired: the follower's release is p.compRelease now.
+    float paramCoeff = 0.01f;
 
     float rmsEst = 1.0e-4f, autoLevelGain = 1.0f;
     // Auto-level snap state — see the "FIRST signal after silence" block.
     bool  autoLevelPrimed        = false;
     int   autoLevelSilentSamples = 0;
     int   autoLevelPrimeSamples  = 0;
-    float glueEnv = 0.0f, peakEnv = 0.0f;
+    // glueEnv went with the glue stage; peakEnv is the one follower left.
+    float peakEnv = 0.0f;
 
-    float smDrive = 1.0f, smWidth = 1.0f;
-    float smSubWeight = 0.0f, smGlue = 0.0f, smOutGain = 1.0f;
+    float smOutGain = 1.0f;
     // AMOUNT as a dry/wet blend — see the note in resolve().
-    float smMix       = 0.5f;
+    float smPush      = 1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Finisher)
 };
 
 } // namespace Betel
+
+
+
+

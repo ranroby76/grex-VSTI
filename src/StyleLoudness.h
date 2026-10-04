@@ -70,6 +70,30 @@ namespace Betel
         // Tuning.  Deliberately conservative — this is meant to be auditioned
         // and adjusted, not trusted blind.
         //----------------------------------------------------------------------
+        //----------------------------------------------------------------------
+        //  ***  THE MASTER SWITCH.  THIS IS THE LINE TO CHANGE.  ***
+        //
+        //  FALSE = the whole loudness system is OFF.  No trim is applied, no
+        //  audio is measured, grex_loudness.xml is never read and never written.
+        //  The style bus carries exactly what the samples, the faders and
+        //  balance.grexv produce - nothing normalises anything.
+        //
+        //  WHY IT IS OFF RIGHT NOW: Grex's cache holds 16 measured sections
+        //  where Ballada's holds 380, so the two installs were being compared
+        //  with one of them corrected and the other raw.  Turning it off makes
+        //  them comparable - both raw - which is the only way to hear whether
+        //  the difference is the correction or something else.
+        //
+        //  THE CACHE FILE IS LEFT ALONE, NOT DELETED.  Flipping this back to
+        //  true restores every measurement that was already in it; nothing has
+        //  to be re-measured to undo this.
+        //
+        //  BALANCE.GREXV IS UNAFFECTED.  That is the hand-written per-instrument
+        //  style trim and it is identical in both installs, so it was never a
+        //  variable here - see StyleBalanceFile.h.
+        //----------------------------------------------------------------------
+        static constexpr bool  kApplyLoudnessCorrection = false;
+
         static constexpr float kDefaultTargetLufs =  -20.0f;  // style-bus target
         static constexpr float kDeadBandLU        =    3.0f;  // untouched window
         static constexpr float kMaxTrimDb         =   12.0f;  // clamp either way
@@ -143,6 +167,12 @@ namespace Betel
         void process (const float* left, const float* right,
                       int numSamples, bool measurable, float referenceDb) noexcept
         {
+            // OFF MEANS OFF, INCLUDING THE METER.  Returning here also removes
+            // the K-weighting filters and the peak tracker from the audio
+            // thread, so the switch costs nothing rather than measuring into a
+            // result nobody reads.
+            if (! kApplyLoudnessCorrection) return;
+
             if (! measurable || currentSection < 0 || numSamples <= 0) return;
 
             // Everything applied downstream of the thing being normalised —
@@ -201,9 +231,14 @@ namespace Betel
             }
         }
 
-        /** The multiplier the style bus should carry right now. */
+        /** The multiplier the style bus should carry right now.
+
+            UNITY while kApplyLoudnessCorrection is false.  Gated here rather
+            than at the call site so there is exactly one place that decides,
+            and the style bus keeps asking the same question either way. */
         float currentTrim() const noexcept
         {
+            if (! kApplyLoudnessCorrection) return 1.0f;
             return juce::Decibels::decibelsToGain (trimDbFor (currentSection));
         }
 
@@ -273,6 +308,12 @@ namespace Betel
         /** Write the cache if anything changed.  Message thread. */
         void save()
         {
+            // NOTHING IS WRITTEN WHILE THE SYSTEM IS OFF.  Important: with the
+            // meter disabled every section reads as unmeasured, so a save here
+            // would overwrite a populated grex_loudness.xml with empty entries
+            // and destroy the very measurements the switch is meant to preserve.
+            if (! kApplyLoudnessCorrection) return;
+
             if (! dirty.load() || stylePath.isEmpty()) return;
 
             const auto file = cacheFile();
@@ -459,6 +500,8 @@ namespace Betel
 
         void loadCacheForCurrentStyle()
         {
+            if (! kApplyLoudnessCorrection) return;
+
             const auto file = cacheFile();
             if (! file.existsAsFile()) return;
 

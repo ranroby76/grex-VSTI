@@ -8,6 +8,8 @@
 //==============================================================================
 
 #include "SamplePlayerEngine.h"
+#include "Levels.h"              // Betel::Levels - EVERY level constant lives there
+#include "GlobalMacros.h"        // Betel::prettyName - underscores off display names
 #include "SfzLoader.h"
 #include "SlotParamConvert.h"   // slotParamsToChannelParams (apply .ins settings)
 #include <cmath>
@@ -16,9 +18,46 @@ namespace Betel
 {
     SamplePlayerEngine::SamplePlayerEngine()
     {
-        // Assign stable channel indices so each Channel knows where it sits.
+        // Assign stable channel indices so each Channel knows where it sits,
+        // and point every one at the ONE shared decoded-preset cache.
         for (int i = 0; i < kNumChannels; ++i)
+        {
             channels[(size_t) i].setIndex(i);
+
+            // WHICH SIDE THIS CHANNEL IS ON, decided here and nowhere else.
+            // Channel cannot ask - SamplePlayerEngine.h includes Channel.h, so
+            // kNumStyleChannels is not visible from inside it - and a feature
+            // that is "solo only" needs a gate the engine actually enforces
+            // rather than one that lives only in a panel someone can bypass.
+            channels[(size_t) i].setSoloChannel (i >= kNumStyleChannels);
+            channels[(size_t) i].setSharedPresetCache (&presetCache);
+        }
+
+        // THE FOLLOW ANCHOR STARTS AT UNITY, NOT AT ZERO.  std::atomic<float>
+        // is NOT value-initialised by the array's default constructor, so
+        // leaving this out gives every slot an anchor of whatever was in that
+        // memory - and an anchor of 0.0 would have FOLLOW blend every style
+        // slot away from SILENCE.  Unity matches Channel::channelVolume's own
+        // default, so before the user touches anything the two agree.
+        for (int i = 0; i < kNumChannels; ++i)
+            chUserVolume[(size_t) i].store (1.0f);
+
+        // BOTH GAIN FACTORS START AT UNITY.  std::atomic<float> in a std::array
+        // is NOT value-initialised, so without this the product is whatever was
+        // in that memory - and a style factor of 0.0 is silence on every channel.
+        for (int i = 0; i < kNumChannels; ++i)
+        {
+            chStyleVolume[(size_t) i].store (1.0f);
+            chUserBaseDb [(size_t) i].store (0.0f);   // 0 dB = no trim
+            chBalanceGain[(size_t) i].store (1.0f);   // balance.grexv, unity
+        }
+
+        // THE STYLE BLOCK'S VOICE BELONGS TO THE SET - see the note on
+        // Channel::setVoiceOwnedBySet.  Channels 0..15 are the style side; the
+        // right hand at 16..23 keeps the neutral stamp, because its .ins is its
+        // authority and the stamp is what stops one sound inheriting another's.
+        for (int i = 0; i < kNumStyleChannels; ++i)
+            channels[(size_t) i].setVoiceOwnedBySet (true);
 
         // Style BASS (engine channel 2) plays at its AUTHORED register — no
         // hidden octave bias.  The old +1 bias here silently transposed every
@@ -42,7 +81,13 @@ namespace Betel
         currentSampleRate = sampleRate;
         currentBlockSize  = blockSize;
         for (auto& ch : channels) ch.prepare(sampleRate, blockSize);
-        styleScratch.setSize (2, blockSize, false, true, true);
+        styleBus    .setSize (2, blockSize, false, true, true);
+        soloBus     .setSize (2, blockSize, false, true, true);
+
+        leftSendFx .prepare (sampleRate, blockSize);
+        rightSendFx.prepare (sampleRate, blockSize);
+
+        ducker.prepare (sampleRate);
     }
 
     void SamplePlayerEngine::releaseResources()
@@ -65,46 +110,99 @@ namespace Betel
         // (a flat loop, identical to before).  Otherwise the group renders
         // through the scratch buffer so it can be scaled before summing.  The
         // scratch is reused sequentially per group.
-        auto renderGroup = [&] (int first, int last, float busGain)
+        // ── RENDER EACH BUS INTO ITS OWN BUFFER ──────────────────────────
+        //
+        // This used to sum as it went: each group was scaled and addFrom'd
+        // straight into outBuffer, and at unity gain the channels rendered
+        // INTO outBuffer directly with no intermediate at all.  That was the
+        // cheapest possible arrangement and it is exactly what a sidechain
+        // cannot work with - the ducker has to see the style as one signal and
+        // the solo as another, at the same instant, before either has been
+        // mixed with the other.
+        //
+        // So both buses now render into their own buffer and are summed at the
+        // end.  The unity-gain fast path is gone; the cost is one extra buffer
+        // add per bus per block, which is a handful of microseconds and does
+        // not scale with voice count.
+        auto renderBus = [&] (juce::AudioBuffer<float>& dest,
+                              int first, int last, float busGain,
+                              Betel::SectionSendFx& fx)
         {
+            if (dest.getNumSamples() < numSamples)
+                dest.setSize (2, numSamples, false, false, true);
+
+            dest.clear (0, 0, numSamples);
+            dest.clear (1, 0, numSamples);
+
+            // The rack owns its six send buffers; clearing them is one call.
+            fx.clearSends (numSamples);
+
+            for (int i = first; i < last; ++i)
+                channels[(size_t) i].renderBlock (dest, numSamples, hostBPM, &fx);
+
+            // ── THE SECTION FX, AND WHY THEY RUN HERE ────────────────────────
+            //
+            // AFTER the channels, so the sends are complete — the rack cannot
+            // process a signal it has not been given yet.
+            //
+            // BEFORE the bus gain below, so every wet return is scaled by the
+            // section fader along with the dry it belongs to.  Processing after
+            // the gain would leave the reverb at full level while the fader
+            // pulled the source away from it, which is not what a fader means.
+            //
+            // And before the ducker, which is downstream of this lambda: the
+            // duck has to see each section as one signal, and a section's
+            // effects are part of that signal.
+            fx.process (dest, numSamples, hostBPM);
+
             if (std::abs (busGain - 1.0f) > 0.0001f)
-            {
-                if (styleScratch.getNumSamples() < numSamples)
-                    styleScratch.setSize (2, numSamples, false, false, true);
-                styleScratch.clear (0, 0, numSamples);
-                styleScratch.clear (1, 0, numSamples);
-
-                for (int i = first; i < last; ++i)
-                    channels[(size_t) i].renderBlock (styleScratch, numSamples, hostBPM);
-
-                const int numCh = outBuffer.getNumChannels();
-                for (int c = 0; c < numCh; ++c)
-                    outBuffer.addFrom (c, 0, styleScratch,
-                                       juce::jmin (c, styleScratch.getNumChannels() - 1),
-                                       0, numSamples, busGain);
-            }
-            else
-            {
-                for (int i = first; i < last; ++i)
-                    channels[(size_t) i].renderBlock (outBuffer, numSamples, hostBPM);
-            }
+                dest.applyGain (0, numSamples, busGain);
         };
 
         // Spike diagnostics: time the two buses separately so a spike can be
         // attributed to the style parts or the right hand rather than just "the
-        // audio thread".  Two tick reads per block — see PerfMonitor.h.
+        // audio thread".  Two tick reads per block.
         const int64_t tA = juce::Time::getHighResolutionTicks();
-        renderGroup (0,                 kNumActiveStyleChannels,
-                     styleBusGain.load() * styleMakeupGain.load()
-                                         * styleSectionTrim.load());            // style bus
+        renderBus (styleBus, 0, kNumActiveStyleChannels,
+                   styleBusGain.load() * styleBusBaseUnity.load()
+                                       * styleMakeupGain.load()
+                                       * styleSectionTrim.load()
+                                       * Betel::Levels::styleBusGain(),          // ...x Levels.h
+                   leftSendFx);                                                  // LEFT section FX
         const int64_t tB = juce::Time::getHighResolutionTicks();
         // Right-hand bus: fader x base unity.  The base is what makes the solo
         // detent mean the same loudness as the style detent -- the style bus has
-        // BOOST and MAKEUP behind it and this one has nothing, so without a base
-        // the two unities are simply not the same level.
-        renderGroup (kNumStyleChannels, kNumChannels,
-                     soloBusGain.load() * soloBusBaseUnity.load());              // right-hand bus
+        // BOOST behind it and this one has nothing, so without a base the two
+        // unities are simply not the same level.
+        renderBus (soloBus, kNumStyleChannels, kNumChannels,
+                   soloBusGain.load() * soloBusBaseUnity.load()      // right-hand bus
+                                      * Betel::Levels::soloBusGain(), // ...x Levels.h
+                   rightSendFx);                                                 // RIGHT section FX
         const int64_t tC = juce::Time::getHighResolutionTicks();
+
+        // ── THE DUCKER: style ducked BY solo, before the sum ──────────────
+        //
+        // Here and nowhere else.  Downstream of this point the two are one
+        // signal and the question "how loud is the right hand" has no answer;
+        // upstream of it the bus gains have not been applied yet, so a duck
+        // aimed at what the player HEARS would be aimed at the wrong level.
+        //
+        // Post-gain, pre-sum is the only place both facts are true at once.
+        ducker.process (styleBus, soloBus);
+
+        // ── SUM ───────────────────────────────────────────────────────────
+        {
+            const int numCh = outBuffer.getNumChannels();
+            for (int c = 0; c < numCh; ++c)
+            {
+                outBuffer.addFrom (c, 0, styleBus,
+                                   juce::jmin (c, styleBus.getNumChannels() - 1),
+                                   0, numSamples);
+                outBuffer.addFrom (c, 0, soloBus,
+                                   juce::jmin (c, soloBus.getNumChannels() - 1),
+                                   0, numSamples);
+            }
+        }
 
         lastStyleTicks = tB - tA;
         lastSoloTicks  = tC - tB;
@@ -116,7 +214,8 @@ namespace Betel
         // No knee, no asymptotic clip; the signal is left exactly as the buses
         // produced it (× masterVolume).  Unity is the common case, so the
         // per-sample pass is skipped entirely when mv == 1.0.
-        const float mv = masterVolume.load();
+        // x Levels::kMasterDb - see Levels.h, the one place every level lives.
+        const float mv = masterVolume.load() * Betel::Levels::masterGain();
         if (std::abs (mv - 1.0f) > 1.0e-6f)
             outBuffer.applyGain (0, numSamples, mv);
     }
@@ -173,6 +272,13 @@ namespace Betel
         // Tear down everything first — opening a new blob invalidates the
         // memory mapping that channels read from during loadPreset().
         for (auto& ch : channels) ch.clearPreset();
+
+        // AND THE SHARED CACHE, which is the ONLY place it is ever cleared.
+        // A style change deliberately keeps it - that is the whole point - but a
+        // NEW BLOB renumbers the presets, so every voice in here would answer to
+        // an index that now means different audio.
+        presetCache.clear();
+
         blobLoaded.store(false);
 
         if (!blob.open(file.getFullPathName().toStdString(),
@@ -369,7 +475,30 @@ namespace Betel
             // carried across on purpose, and resetting it to unity would leave
             // exactly one thing to re-tweak after every sound change - which is
             // the tweaking the freeze exists to remove.
-            if (! channels[(size_t) channelIndex].getIgnorePresetParams())
+            // ── AND THE SET OWNS THE TRIM ON A STYLE SLOT ────────────────────
+            //
+            // THIS LINE WAS THE BUG.  The probe caught it exactly: at set-load
+            // the engine read `2: 100% 9.0dB, 3: 21% -3.0dB`, matching the tab;
+            // two commits later those two slots read `100% 0.0dB` while the tab
+            // still held the set's numbers.  100% / 0 dB is precisely what this
+            // call writes - the two-argument form defaults baseUnityDb to 0.
+            //
+            // The reset is correct for the RIGHT HAND: a trim calibrated for the
+            // outgoing sound must not bury the incoming one, and the .ins on the
+            // next line re-establishes the new sound's own trim.
+            //
+            // For a style slot there IS no next line any more.  The .ins cut
+            // means melodicPresetFor returns nullptr here, so nothing ever
+            // restores the trim - the reset became permanent, and every program
+            // change the style sent silently flattened the set's gain to unity.
+            // That is why only re-opening the sound editor "fixed" it, and why
+            // the band filter never broke: it has no reset of its own.
+            //
+            // Same ownership rule as the neutral voice stamp guarded in
+            // Channel.cpp - the set said what this slot's level is, so a sound
+            // swap does not get to overrule it.
+            if (! channels[(size_t) channelIndex].getIgnorePresetParams()
+                && ! channels[(size_t) channelIndex].getVoiceOwnedBySet())
                 setChannelInstrumentGainPercent (channelIndex, 100.0f);
 
             // Default-preset override: if the user saved this flag with "Save as
@@ -419,8 +548,17 @@ namespace Betel
                 const auto* preset = melodicPresetFor (channelIndex, flag);
                 const bool  hasVoice = (preset != nullptr && ! preset->gainOnly);
 
+                // NO NEUTRAL STAMP ON A SET-OWNED CHANNEL.  For a style slot
+                // "no saved voice" means the SET is the authority, not that the
+                // channel should go back to factory defaults - and since the
+                // .ins cut, hasVoice is ALWAYS false here for a style channel,
+                // so this line ran on every single program change and erased
+                // whatever the set had just committed.
                 if (! hasVoice)
-                    applyChannelParams (channelIndex, Channel::ChannelParams{});
+                {
+                    if (! channels[(size_t) channelIndex].getVoiceOwnedBySet())
+                        applyChannelParams (channelIndex, Channel::ChannelParams{});
+                }
                 else
                     applyChannelParams (channelIndex, slotParamsToChannelParams (preset->params));
 
@@ -461,6 +599,11 @@ namespace Betel
     //==========================================================================
     // SCAN THE THREE PACKS.
     //
+    // A LOOP over kNumSoundPacks, because the scan report, the collision
+    // detector and the category tables all index by pack.  Ballada runs the same
+    // loop once; nothing here changes shape between the two products, only the
+    // length of the roots array.
+    //
     // RECURSIVE now, and that is the point: every pack sorts its sounds into
     // category subfolders, and the old scan passed `false` for recursion so a
     // sound one level down was invisible.  A pack installed today would have
@@ -489,14 +632,15 @@ namespace Betel
         for (auto& c : packCategories) c.clear();
         libraryCollisions.clear();
 
-        // GM's folder stays the "the" library folder for anything that still
-        // asks for one (preset resolution, relative lookups): it is the only
-        // pack guaranteed to be installed.
+        // GM's folder is "the" library folder for anything that asks for one
+        // (preset resolution, relative lookups).  The optional packs never take
+        // that role: GM is the one pack guaranteed to be installed.
         soundLibraryFolder = gmFolder;
         libraryAccessCode  = accessCode;
 
         const juce::File roots[kNumSoundPacks] = { gmFolder, worldFolder, orientalFolder };
-        const char* const packNames[kNumSoundPacks] = { "gm sounds", "world", "oriental" };
+        const char* const packNames[kNumSoundPacks] = { "gm sounds", "world sounds",
+                                                        "oriental sounds" };
 
         juce::StringArray clashes;
         juce::StringArray unnumbered;
@@ -551,9 +695,14 @@ namespace Betel
 
                 soundLibrary[flag] = f;
 
+                // PRETTY HERE, at the ONE place a filename becomes a display
+                // name.  Safe because the IDENTITY of a sound is the FLAG - the
+                // leading digits parsed above, which a saved set stores - and
+                // never this string; soundLibraryNames is only ever drawn.
                 const int dash = base.indexOfChar ('-');
-                soundLibraryNames[flag] = (dash >= 0) ? base.substring (dash + 1).trim()
-                                                      : base.substring (i).trim();
+                soundLibraryNames[flag] = Betel::prettyName (
+                    (dash >= 0) ? base.substring (dash + 1).trim()
+                                : base.substring (i).trim());
 
                 soundLibraryPack[flag] = pack;
 
@@ -565,7 +714,7 @@ namespace Betel
                      dir.isDirectory() && dir != root;
                      dir = dir.getParentDirectory())
                 {
-                    category = dir.getFileName();
+                    category = Betel::prettyName (dir.getFileName());
                     if (dir.getParentDirectory() == root) break;
                 }
 
@@ -585,9 +734,9 @@ namespace Betel
         // THE SCAN REPORT.
         //
         // Always written when there is anything to say, not only on a collision.
-        // An empty pack has exactly two causes - the folder is not there, or its
-        // files carry no numbers - and neither is visible from the UI, which
-        // just shows a bank with no categories in it.
+        // An empty library has exactly two causes - the folder is not there, or
+        // its files carry no numbers - and neither is visible from the UI, which
+        // just shows a tab with no categories in it.
         //======================================================================
         juce::StringArray report;
 
@@ -613,7 +762,7 @@ namespace Betel
         {
             report.add ({});
             report.add ("DUPLICATE INSTRUMENT NUMBERS - the second file of each pair is");
-            report.add ("NOT loaded.  Every number must be unique across all three packs,");
+            report.add ("NOT loaded.  Every number must be unique across the library,");
             report.add ("because saved sets store the number.");
             report.add ({});
             report.addArray (clashes);

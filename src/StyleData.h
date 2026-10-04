@@ -1,3 +1,4 @@
+
 #pragma once
 //==============================================================================
 // StyleData.h
@@ -196,6 +197,9 @@ namespace Betel
         // the authored value instead of forcing unity — see StylePlayer's
         // applyVoiceSetup and its CC 11 dispatch case.
         int expression = -1;
+        // CC 74 Brightness.  Setup filter position per part (a pad parked dark,
+        // a lead opened up); the sections then sweep it.  -1 = not set (neutral).
+        int brightness = -1;
 
         bool isUsed() const noexcept { return program >= 0 || bankMsb >= 0; }
     };

@@ -8,12 +8,20 @@ on:
   workflow_dispatch:
 
 env:
+  # GREX - the full product.  Adapted from the Grex Ballada workflow, the newest
+  # proven copy of this pipeline.  PRODUCT_NAME in CMakeLists is "Grex", so the
+  # bundles are "Grex.vst3" / .component / .clap.  The CMake TARGET is still
+  # BetelgeuseArranger, so they land in BetelgeuseArranger_artefacts - which is
+  # why the bundles are FOUND by name below, never by a fixed path.
+  #
+  # Every path that reaches a bundle stays quoted: "Grex" has no space today,
+  # but the quoting costs nothing and survives a rename.
   PLUGIN_NAME: "Grex"
+  PLUGIN_FILE: "Grex"
   PLUGIN_VERSION: "1.0.0"
   # JUCE 9.0.1 - the release the Windows build already uses.  Pinned, not
   # tracking a branch: JUCE point releases have moved text-measuring and
   # GlyphArrangement APIs before now, so a version bump must be one we chose.
-  # (villain-vst pins 8.0.12 the same way; Grex is simply further forward.)
   JUCE_VERSION: "9.0.1"
 
 jobs:
@@ -45,10 +53,9 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.7
 
-      # JUCE and CLAP both land under libs/, which is the layout villain-vst
-      # uses and the layout the CMakeLists autodetects.  Because the paths match
-      # what a local Windows checkout has, no -D flags are strictly needed -
-      # they are passed anyway so the log states plainly what was used.
+      # JUCE and CLAP both land under libs/, which is the layout the CMakeLists
+      # autodetects.  The -D flags are passed anyway so the log states plainly
+      # what was used rather than leaving it to the autodetect order.
       - name: Clone JUCE
         run: |
           git clone --depth 1 --branch ${{ env.JUCE_VERSION }} https://github.com/juce-framework/JUCE.git libs/JUCE
@@ -62,11 +69,27 @@ jobs:
           git clone --recursive https://github.com/free-audio/clap-juce-extensions.git libs/CLAP_Extensions
           echo "CLAP extensions -> libs/CLAP_Extensions"
 
+      # ----------------------------------------------------------------------
+      # THIS STEP READS THE CMakeLists RATHER THAN REPEATING IT.
+      #
+      # juce_add_binary_data ABORTS THE WHOLE BUILD if it cannot open a listed
+      # source, and the error names no file.  So the value here is naming what
+      # is missing - but only if the check asks for exactly what CMake asks for.
+      #
+      # On the Grex build a hand-written copy of the list warned about two pack
+      # images on a build that had embedded them, because CMake accepted a
+      # second location the check did not know about.  That cost a round trip
+      # chasing a problem that did not exist.  The fix is not a better copy of
+      # the list - it is not keeping a copy at all: the instrument PNGs are
+      # parsed straight out of CMakeLists.txt, so the two cannot drift.
+      #
+      # GREX embeds two sound-pack pictures, SP_WORLD.png and SP_ORIENTAL.png,
+      # and CMake accepts each one in EITHER of two places - the assets root or
+      # "instrumet images".  The check below mirrors exactly that, because a
+      # check that knows only one of the two reports fiction (it did once).
+      # ----------------------------------------------------------------------
       - name: Verify Assets Are Present
         run: |
-          # juce_add_binary_data ABORTS THE WHOLE BUILD if it cannot open a
-          # listed source, and the error names no file.  Failing here instead
-          # turns "mystery build failure" into a list of what is missing.
           MISSING=0
 
           for f in "assets/back.png" "assets/icon.ico"; do
@@ -76,27 +99,64 @@ jobs:
             fi
           done
 
+          # The folder name carries a typo - "instrumet" - and it is load
+          # bearing.  macOS is case- and spelling-exact on volumes where Windows
+          # was forgiving, so this is checked on its own before anything inside.
           if [ ! -d "assets/instrumet images" ]; then
             echo "::error::missing 'assets/instrumet images' folder (note the spelling - it must match the CMakeLists exactly)"
-            MISSING=1
-          else
-            COUNT=$(find "assets/instrumet images" -maxdepth 1 -name "*.png" | wc -l | tr -d ' ')
-            echo "instrument/kit images found: $COUNT"
+            ls -la assets || true
+            exit 1
           fi
 
-          # EXISTS-checked in CMake, so these are warnings not errors: a missing
-          # one means a slot shows no picture, not a broken build.
-          for f in "assets/SP_WORLD.png" "assets/SP_ORIENTAL.png"; do
-            if [ ! -f "$f" ]; then
-              echo "::warning::$f not found - that pack will show no picture"
+          # MANDATORY: every numbered instrument PNG listed unconditionally in
+          # juce_add_binary_data.  These are NOT EXISTS-checked by CMake, so one
+          # absent file takes the whole build down.
+          EXPECTED=$(grep -o 'BETELGEUSE_INSTR_IMG}/[0-9]\{3\}\.png' CMakeLists.txt \
+                     | sed 's|.*/||' | sort -u)
+          COUNT=$(echo "$EXPECTED" | wc -l | tr -d ' ')
+          echo "CMakeLists lists $COUNT instrument images unconditionally"
+
+          for png in $EXPECTED; do
+            if [ ! -f "assets/instrumet images/$png" ]; then
+              echo "::error::missing assets/instrumet images/$png (listed unconditionally in CMakeLists.txt)"
+              MISSING=1
+            fi
+          done
+
+          # OPTIONAL: the drum-kit pictures and the shared sampled-kit picture.
+          # CMake EXISTS-checks each one, so an absent file means that kit shows
+          # no picture - a warning, never a failure.  The kit list is read from
+          # the CMakeLists' own foreach(kit ...) line, for the same no-copies
+          # reason as the instrument list above.
+          KITS=$(grep -o 'foreach(kit [0-9 ]*)' CMakeLists.txt | head -1 \
+                 | sed 's/foreach(kit //; s/)//')
+          for kit in $KITS; do
+            if [ ! -f "assets/instrumet images/D${kit}.png" ]; then
+              echo "::warning::D${kit}.png not found - that kit will show no picture"
+            fi
+          done
+          if [ ! -f "assets/instrumet images/DUNIQUE.png" ]; then
+            echo "::warning::DUNIQUE.png not found - sampled kits will show no picture"
+          fi
+
+          # OPTIONAL: the two sound-pack pictures, in either accepted place.
+          for pack in SP_WORLD SP_ORIENTAL; do
+            if [ -f "assets/${pack}.png" ]; then
+              echo "${pack}.png found in assets/"
+            elif [ -f "assets/instrumet images/${pack}.png" ]; then
+              echo "${pack}.png found in assets/instrumet images/"
+            else
+              echo "::warning::${pack}.png not found in either place - that pack will show no picture"
             fi
           done
 
           if [ "$MISSING" = "1" ]; then
             echo "Assets tree as checked out:"
-            ls -la assets || true
+            ls -la "assets/instrumet images" | head -40
             exit 1
           fi
+
+          echo "assets OK"
 
       - name: Import Signing Certificate
         if: ${{ env.SIGNING_ENABLED != '' }}
@@ -120,15 +180,14 @@ jobs:
 
           rm certificate.p12
 
-      # ONE configure, all three formats.  villain-vst splits VST3+CLAP from AU
-      # into two build trees, but it HAS to: its CMakeLists gates each format
-      # behind its own option and its AU pass deliberately turns CLAP off.
-      # Grex has no such switches - juce_add_plugin takes FORMATS VST3 AU and
-      # clap_juce_extensions_plugin adds the CLAP target beside them - so a
-      # second full configure would just compile 55k lines a second time.
+      # ONE configure, all three formats.  juce_add_plugin takes FORMATS VST3 AU
+      # and clap_juce_extensions_plugin adds the CLAP target beside them, so a
+      # second configure would just compile the tree a second time.
       #
       # ASIO is not passed: the CMakeLists wraps that whole block in if(WIN32),
-      # so a macOS configure never looks for the SDK.
+      # so a macOS configure never looks for the SDK and GREX_HAVE_ASIO stays
+      # FALSE.  AU needs no flag either - JUCE filters FORMATS through
+      # _juce_get_platform_plugin_kinds(), which only offers AU on Darwin.
       - name: Configure CMake
         run: |
           cmake -B build -G Ninja \
@@ -144,10 +203,10 @@ jobs:
       - name: Build Plugin
         run: cmake --build build --config Release --parallel
 
-      # PRODUCT_NAME is "Grex" but the CMake target is BetelgeuseArranger, so
-      # the artefacts FOLDER carries the target name while the BUNDLES carry the
-      # product name.  That mismatch is exactly what a hard-coded path gets
-      # wrong, hence the find.
+      # The CMake TARGET is BetelgeuseArranger, so the artefacts folder is
+      # BetelgeuseArranger_artefacts, while the BUNDLES carry PRODUCT_NAME and
+      # are called "Grex.vst3" and so on.  That mismatch is exactly what a
+      # hard-coded path gets wrong, hence the find.
       - name: Verify Builds
         id: find_plugins
         run: |
@@ -160,6 +219,8 @@ jobs:
           AU_PATH=$(find build -type d -name "Grex.component" | head -1)
           CLAP_PATH=$(find build -maxdepth 6 -name "Grex.clap" | head -1)
 
+          # Spaces survive GITHUB_OUTPUT fine - the format is key=value to the
+          # end of the line - but every CONSUMER below must quote them.
           echo "VST3_PATH=$VST3_PATH" >> $GITHUB_OUTPUT
           echo "AU_PATH=$AU_PATH"     >> $GITHUB_OUTPUT
           echo "CLAP_PATH=$CLAP_PATH" >> $GITHUB_OUTPUT
@@ -191,9 +252,7 @@ jobs:
 
           if [ -n "$CLAP_PATH" ]; then
             echo "CLAP found: $CLAP_PATH"
-            if [ -d "$CLAP_PATH/Contents/MacOS" ]; then
-              arch_of "$CLAP_PATH"
-            fi
+            arch_of "$CLAP_PATH"
           else
             echo "::warning::CLAP not found (non-critical)"
           fi
@@ -225,8 +284,7 @@ jobs:
       # Written out as a script so the retry action below can re-run the whole
       # sign + notarize + staple sequence.  Apple's notary service times out or
       # 500s often enough that a single-shot submission is the commonest reason
-      # one of these workflows goes red on a build that was actually fine -
-      # which is why villain-vst wraps it in a retry too.
+      # one of these workflows goes red on a build that was actually fine.
       - name: Create Notarization Script
         if: ${{ env.SIGNING_ENABLED != '' }}
         env:
@@ -235,6 +293,8 @@ jobs:
           CLAP_PATH: ${{ steps.find_plugins.outputs.CLAP_PATH }}
         run: |
           # First heredoc is UNQUOTED so the paths are baked in as literals.
+          # The assignments below are quoted in the emitted script, so a bundle
+          # name with a space in it would come through intact too.
           cat > notarize_all.sh << EOF
           #!/bin/bash
           set -e
@@ -346,8 +406,8 @@ jobs:
           fi
 
           cat > dmg_contents/README.txt << 'README'
-          Grex - Fanan Team
-          =================
+          Grex - Fanan
+          ============
 
           Drag each plugin to its install location:
 
@@ -356,15 +416,19 @@ jobs:
           CLAP  ->  /Library/Audio/Plug-Ins/CLAP/
 
           Then restart your DAW.
+
+          On first launch, use LOCATE SYSTEM FOLDER (top right, yellow) to point
+          Grex at its sounds and styles folder (by default Documents/Grex VSTI).
+          The lamp above that button turns green once the folder resolves.
           README
 
           hdiutil create \
-            -volname "Grex v${PLUGIN_VERSION}" \
+            -volname "${PLUGIN_NAME} v${PLUGIN_VERSION}" \
             -srcfolder dmg_contents \
             -ov -format UDZO \
-            "Grex_Mac_v${PLUGIN_VERSION}.dmg"
+            "${PLUGIN_FILE}_Mac_v${PLUGIN_VERSION}.dmg"
 
-          ls -lh "Grex_Mac_v${PLUGIN_VERSION}.dmg"
+          ls -lh "${PLUGIN_FILE}_Mac_v${PLUGIN_VERSION}.dmg"
 
       - name: Notarize & Staple DMG
         if: ${{ env.SIGNING_ENABLED != '' }}
@@ -375,14 +439,14 @@ jobs:
         run: |
           # The bundles inside are already stapled; notarising the DMG itself
           # as well is what stops Gatekeeper warning on the download.
-          xcrun notarytool submit "Grex_Mac_v${PLUGIN_VERSION}.dmg" \
+          xcrun notarytool submit "${PLUGIN_FILE}_Mac_v${PLUGIN_VERSION}.dmg" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" \
             --team-id "$TEAM_ID" \
             --wait
 
-          xcrun stapler staple "Grex_Mac_v${PLUGIN_VERSION}.dmg"
-          xcrun stapler validate "Grex_Mac_v${PLUGIN_VERSION}.dmg"
+          xcrun stapler staple "${PLUGIN_FILE}_Mac_v${PLUGIN_VERSION}.dmg"
+          xcrun stapler validate "${PLUGIN_FILE}_Mac_v${PLUGIN_VERSION}.dmg"
           echo "DMG is signed, notarized, and stapled"
 
       - name: Upload DMG

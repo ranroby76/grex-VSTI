@@ -1,3 +1,4 @@
+
 #include "StyleLoader.h"
 #include "ChordTransposer.h"
 #include <cstring>
@@ -5,6 +6,15 @@
 #include <vector>   // pruneDuplicateSources score table
 #include <array>    // pruneIdenticalDrumSources per-channel hit cache
 #include <cstdlib>  // std::abs on ints
+#include <climits>  // INT_MIN - pruneDuplicateSources' "worse than anything" seed
+
+// ── WHY <climits> IS SPELLED OUT HERE ────────────────────────────────────────
+//
+// INT_MIN is used below and was never included for.  MSVC compiles it anyway,
+// because its <vector> / <algorithm> drag <climits> in transitively - so this
+// has always built clean on Windows and would have failed the FIRST time the
+// macOS workflow reached this file, with an error naming a macro rather than
+// the missing header.  Portable code names the header it uses.
 
 namespace Betel
 {
@@ -280,6 +290,7 @@ namespace Betel
                             // apply and StylePlayer forced unity; a part the
                             // composer parked below its fader started too loud.
                             case 11:  vs.expression = data2; break;
+                            case 74:  vs.brightness = data2; break;
                             case 91:  vs.reverb  = data2; break;
                             case 93:  vs.chorus  = data2; break;
                             default: break;
@@ -1279,6 +1290,30 @@ namespace Betel
     // =========================================================================
     //  Public API
     // =========================================================================
+    //==========================================================================
+    //  THE POST-CASM PASSES, AS ONE PUBLIC ENTRY POINT.
+    //
+    //  parseCasm above calls these six in this order at the end of an SFF load.
+    //  The .fst loader builds the same StyleData from a converted file and has
+    //  to have them too - it ran none of them, and because every default here
+    //  is permissive that never failed, it just played wrong: every variant of
+    //  a multi-source destination sounding at once, chord parts never marked
+    //  chordal, duplicate kit sources firing twice.
+    //
+    //  ONE FUNCTION, NOT SIX PUBLIC ONES, so the ORDER stays here where the
+    //  reasons for it are written down. Two of them have hard ordering
+    //  constraints on each other and a caller has no way to know that.
+    //==========================================================================
+    void StyleLoader::finaliseCasm (StyleData& out)
+    {
+        pruneDuplicateSources (out);
+        normaliseSourceChordToCMaj7 (out);
+        computeChordalDestinations (out);
+        computeBetelgeuseMultiSrcWinners (out);
+        computeBetelgeuseFingeredPlayers (out);
+        pruneIdenticalDrumSources (out);
+    }
+
     bool StyleLoader::loadFromFile (const juce::File& file,
                                     StyleData& outStyle,
                                     juce::String& errorMsg)
@@ -1367,11 +1402,50 @@ namespace Betel
         std::vector<MarkerHit> markers;
         parseTrack (r, trackEnd, outStyle, markers, errorMsg);
 
-        // Convert "ticks within track" -> last marker tick + maximum bar count
-        // so the final section ends at the highest event tick we saw.
+        //----------------------------------------------------------------------
+        // THE LAST SECTION'S END, AND WHY IT NEEDS ROUNDING UP.
+        //
+        // Every other section ends at the NEXT MARKER, which is a musical
+        // boundary the style author chose.  The last one has no next marker, so
+        // it ends at trackEndTick - and that used to be simply "the highest
+        // event tick we saw", i.e. wherever the notes happened to stop.
+        //
+        // For an ENDING that is the last marker, the difference is audible.  An
+        // ending typically lands its final chord early and lets it ring, so its
+        // last MIDI event can sit well before the end of the final bar - and
+        // the sequencer stops the transport the moment the section length is
+        // reached (kAfterStop in StyleSequencer).  The ending was therefore cut
+        // short by exactly however much ring-out it had, and stopped off the
+        // bar line rather than on it.
+        //
+        // ROUNDING UP TO A WHOLE BAR from the last marker fixes both: the
+        // section keeps its authored musical length, and the stop lands where a
+        // player expects it.  Rounding UP can never truncate - the result is
+        // always >= the highest event tick - so a section whose notes DO run to
+        // the last beat is unchanged (Slow & Easy's final fill gains 7 ticks).
+        //
+        // The bar formula is the file's own, used for the section report below.
+        //----------------------------------------------------------------------
         int trackEndTick = 0;
         for (const auto& e : outStyle.events) trackEndTick = juce::jmax (trackEndTick, e.tick + 1);
         for (const auto& m : markers)         trackEndTick = juce::jmax (trackEndTick, m.tick);
+
+        if (! markers.empty())
+        {
+            int lastMarkerTick = 0;
+            for (const auto& m : markers) lastMarkerTick = juce::jmax (lastMarkerTick, m.tick);
+
+            const int barTicks = juce::jmax (1, outStyle.ticksPerQuarter
+                                                  * outStyle.timeSigNum * 4
+                                                  / juce::jmax (1, outStyle.timeSigDen));
+
+            if (trackEndTick > lastMarkerTick)
+            {
+                const int span = trackEndTick - lastMarkerTick;
+                const int bars = (span + barTicks - 1) / barTicks;      // ceil
+                trackEndTick   = lastMarkerTick + bars * barTicks;
+            }
+        }
 
         finaliseSectionRanges (outStyle, markers, trackEndTick);
         assignEventsToSections (outStyle);

@@ -34,6 +34,36 @@ public:
         if (!shouldAnimate && isTimerRunning()) stopTimer();
     }
 
+    //==========================================================================
+    // SUBTLE MODE - white stars only, at a fraction of their usual alpha.
+    //
+    // For the HARMONY plate on the main tab, which is 111 x 40 rather than
+    // 977 x 130. At that size the coloured orbs are the problem, not the stars:
+    // an orb's glow is 3.5x its core radius, so on a small panel a single one
+    // covers most of the plate and reads as a coloured smear behind the word
+    // rather than as a distant star.
+    //
+    // BOTH DEFAULT TO TODAY'S BEHAVIOUR. The header animation constructs one of
+    // these and never calls either setter, so it is untouched - which is the
+    // point of adding knobs rather than a second class that would drift.
+    //
+    // The star COUNT is not reduced with the size. 160 dots over a small panel
+    // is denser than over the header, and denser is what a nearly-transparent
+    // starfield needs to register at all.
+    //==========================================================================
+    void setStarAlphaScale(float scale)
+    {
+        starAlphaScale = juce::jlimit(0.0f, 1.0f, scale);
+        repaint();
+    }
+
+    void setOrbsVisible(bool shouldShow)
+    {
+        if (orbsVisible == shouldShow) return;
+        orbsVisible = shouldShow;
+        repaint();
+    }
+
     void paint(juce::Graphics& g) override
     {
         const float W = (float)getWidth();
@@ -42,7 +72,7 @@ public:
         // ── 1. Starfield (white dots, depth-layered) ──────────────────────────
         for (auto& s : stars)
         {
-            const float alpha = 0.20f + s.depth * 0.65f;
+            const float alpha = (0.20f + s.depth * 0.65f) * starAlphaScale;
             const float size  = 0.6f  + s.depth * 1.8f;
             g.setColour(juce::Colours::white.withAlpha(alpha));
             g.fillEllipse(s.x * W - size * 0.5f,
@@ -51,6 +81,8 @@ public:
         }
 
         // ── 2. Coloured star orbs (glowing circles) ───────────────────────────
+        if (! orbsVisible) return;
+
         for (auto& o : orbs)
         {
             const float pulse  = 0.55f + 0.45f * std::sin(phase * o.pulseSpeed + o.pulsePhase);
@@ -109,6 +141,10 @@ private:
     // ── Members ───────────────────────────────────────────────────────────────
     std::vector<Star> stars;
     std::vector<Orb>  orbs;
+
+    // Defaults = the header's long-standing look. See setStarAlphaScale.
+    float starAlphaScale = 1.0f;
+    bool  orbsVisible    = true;
     float             phase = 0.0f;
 
     std::mt19937                          rng { std::random_device{}() };

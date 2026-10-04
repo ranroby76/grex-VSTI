@@ -1,4 +1,6 @@
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 //==============================================================================
 // InstrEditPanel.h
 //
@@ -136,6 +138,36 @@ class VelCurveDisplay : public juce::Component
 public:
     std::function<void(float)> onChange;
 
+    //==========================================================================
+    /** The ENERGY offset currently in force on this slot's bank, 0 for none.
+
+        THE READOUT SHOWS THE SUM, THE SLOT STORES ITS OWN VALUE.  Those are two
+        different things on purpose, and conflating them was the design that got
+        rejected: writing the offset back into the slot makes a performance
+        control destructive.  velCurve is clamped, so a slot near an edge loses
+        ground on every sweep - down 40 from 30 clamps at 0, back up 40 lands at
+        40, and ten points of voicing are gone with nothing to say so.  One verse
+        is enough to start it.
+
+        So the offset stays separate and the ENGINE adds it, which it already
+        does: two velocity curves in sequence add their curve values exactly.
+        This only teaches the display to agree with the engine, so what you read
+        is what is sounding, and moving ENERGY back leaves the slot untouched.
+
+        Dragging still edits the BASE.  The drag applies to the number on screen
+        and the base is back-computed, so what you set is what you see - which is
+        the whole reason the sum is displayed rather than the base. */
+    void setEnergyOffset (float c)
+    {
+        if (std::abs (c - energyOffset) < 1.0e-4f) return;
+        energyOffset = c;
+        repaint();
+    }
+
+    /** What the engine will actually apply: the slot's own curve plus ENERGY. */
+    float effectiveCurve() const noexcept
+    { return juce::jlimit (-1.0f, 1.0f, curve + energyOffset); }
+
     void setCurve (float c, juce::NotificationType n = juce::sendNotification)
     {
         const float v = juce::jlimit (-1.0f, 1.0f, c);
@@ -169,12 +201,12 @@ public:
         for (int i = 0; i <= steps; ++i)
         {
             const float x = (float) i / (float) steps;
-            const float y = VelCurve::shape (x, curve);
+            const float y = VelCurve::shape (x, effectiveCurve());
             const float px = b.getX() + x * b.getWidth();
             const float py = b.getBottom() - y * b.getHeight();
             if (i == 0) path.startNewSubPath (px, py); else path.lineTo (px, py);
         }
-        g.setColour (juce::Colour (0xFFCC6600));
+        g.setColour (juce::Colour (Betel::Pal::kAccent));
         g.strokePath (path, juce::PathStrokeType (2.0f));
 
         g.setColour (juce::Colour (0xFFC2C2C2));
@@ -184,6 +216,7 @@ public:
     }
 
     void mouseDown (const juce::MouseEvent& e) override { dragFrom = curve; lastY = e.position.y; }
+
     void mouseDrag (const juce::MouseEvent& e) override
     {
         const float dy = lastY - e.position.y;          // up = harder
@@ -192,14 +225,27 @@ public:
     void mouseDoubleClick (const juce::MouseEvent&) override { setCurve (0.0f); }
 
 private:
+    /** Reads the EFFECTIVE curve, and says so when ENERGY is moving it - a
+        number that silently disagrees with the slot's stored value would be the
+        worst of both designs. */
     juce::String label() const
     {
-        if (std::abs (curve) < 0.02f) return "LINEAR";
-        const int pct = (int) std::lround (std::abs (curve) * 100.0f);
-        return (curve < 0.0f ? "SOFT " : "HARD ") + juce::String (pct);
+        const float e = effectiveCurve();
+        juce::String s;
+
+        if (std::abs (e) < 0.02f) s = "LINEAR";
+        else s = (e < 0.0f ? "SOFT " : "HARD ")
+               + juce::String ((int) std::lround (std::abs (e) * 100.0f));
+
+        if (std::abs (energyOffset) >= 0.005f)
+            s += " (ENERGY " + juce::String (energyOffset > 0.0f ? "+" : "")
+               + juce::String ((int) std::lround (energyOffset * 100.0f)) + ")";
+
+        return s;
     }
 
     float curve = 0.0f, dragFrom = 0.0f, lastY = 0.0f;
+    float energyOffset = 0.0f;
 };
 
 struct DrumElementParams
@@ -295,15 +341,18 @@ struct SweetenerParams
 
 // ── Kit-wide FX bus parameters ────────────────────────────────────────────────────────
 //
-// One shared FX chain per drum slot, ordered EQ → Saturation → Compressor →
-// Reverb → Delay.  The rack is an INSERT: the entire kit mix is summed and run
-// through the chain, then blended back into the dry mix via the master `fxWet`
-// (the DrumsPopup "WET" fader).  1.0 = fully wet (whole mix through the rack —
-// transparent when all stages are off), 0.0 = rack bypassed.
+// One shared FX chain per drum slot: EQ, then Saturation → Compressor (the
+// reverb and delay are sends to the section bus now).  The rack is an INSERT:
+// the entire kit mix is summed and run through it.  THE EQ SITS OUTSIDE THE
+// WET BLEND - it treats the whole kit first, and only then does the master
+// `fxWet` (the DrumsPopup "WET" fader) blend saturation and compression back
+// against the dry kit.  1.0 = fully wet (transparent when those stages are
+// off), 0.0 = rack bypassed.
 //
-// The 10-band EQ uses standard ISO frequencies; gain values are stored
-// directly in dB.  Slider mapping (UI side):  0.0 → -60 dB (silence),
-// 0.5 → 0 dB (unity), 1.0 → +20 dB (max boost).
+// The 10-band EQ is a real band SPLIT (DrumSplitEq.h): each slider is the
+// volume of its own octave band, borders halfway between the captions.  Gain
+// values are stored directly in dB.  Slider mapping (UI side, the shared
+// rule):  0.0 → silence (the band muted), 0.5 → 0 dB (unity), 1.0 → +24 dB.
 struct DrumKitFxParams
 {
     // Per-stage on/off (drum kit FX bus).  Default OFF (sound calibration) so a
@@ -314,8 +363,8 @@ struct DrumKitFxParams
     bool  compEnabled = false;
     bool  revEnabled  = false;
     bool  delEnabled  = false;
-    // 10-band EQ — peaking filters at 31 / 62 / 125 / 250 / 500 / 1k / 2k / 4k / 8k / 16k Hz.
-    // gainDb[i] in [-60..+20] dB, neutral at 0 dB.
+    // 10-band EQ — one band per slider, captions 31 / 62 / 125 / 250 / 500 / 1k / 2k / 4k / 8k / 16k Hz.
+    // gainDb[i] in [-60..+24] dB, neutral at 0 dB; -60 mutes the band.
     float eqGainDb [10] = { 0,0,0,0,0,0,0,0,0,0 };
 
     // Saturation (tanh soft clipping).
@@ -361,6 +410,19 @@ struct DrumKitFxParams
     float delDry     = 1.0f;          // 0..1   <-> delayDry
     float delWetBase = 0.5f;          // <-> delayWetBase, same 0.5 and same reason
 
+    //── SENDS TO THE GLOBAL EFFECTS ───────────────────────────────────────────
+    //
+    // Three new fields, and only three: the kit's reverb, delay and sweetener
+    // sends ride on revWet, delWet and sweet.mix, which already existed and
+    // already persisted.  These are the ones with nothing to inherit.
+    //
+    // Zero by default, so a kit that has never been dialled is dry rather than
+    // dropped into three effects nobody asked for.  An older .drm simply has no
+    // property for them and gets that default.
+    float chorusSend = 0.0f;
+    float wahSend    = 0.0f;
+    float phaserSend = 0.0f;
+
     // Drum channel stereo pan, -1..+1 (0 = centre).  Set in the DrumsPopup PAN
     // tab; carried on the kit-FX bus so it persists and applies with the kit.
     float pan = 0.0f;
@@ -387,6 +449,10 @@ struct DrumKitFxParams
 struct DrumKitParams
 {
     juce::String                                 lastLoadedKit;   // "" = custom hybrid
+    // EDM KIT: the synth kit's cells, saved by edm::serializeKit (SynthKits.h).
+    // Empty = the factory kit named by lastLoadedKit.  Only read when
+    // lastLoadedKit starts with "EDM "; every sampled kit ignores it.
+    juce::String                                 edmKit;
     std::array<DrumElementParams, 128>           keys {};
     DrumKitFxParams                              fx;              // shared FX bus for this kit
 
@@ -402,13 +468,42 @@ struct DrumKitParams
 };
 
 // ── Per-slot instrument params ────────────────────────────────────────────────────────
+//==============================================================================
+// ADDING A FIELD HERE IS FOUR EDITS, NOT ONE.
+//
+//   1. here
+//   2. BetelStateXml::saveSlot        - or it will not survive a save
+//   3. BetelStateXml::loadSlot        - or it will not come back
+//   4. slotParamsToChannelParams      - or it will NEVER REACH THE AUDIO
+//
+// Step 4 is the one that gets missed, and it is the only one that fails
+// silently: the value saves, loads and displays correctly, and the control just
+// does nothing.  delayDry, delayWetBase and reverbWetBase sat in that state -
+// fully wired everywhere a person looks, connected to nothing that makes sound.
+//
+// If the engine is NOT the owner - the allowed-notes window belongs to
+// StylePlayer, the band filter has its own per-channel route - then step 4
+// becomes "give it an explicit push beside the bulk one in MainComponent's
+// onSlotParamsChanged handler", where both of those already live.
+//==============================================================================
 struct SlotParams
 {
     // Amp envelope (ADSR, ms / 0..1)
     // A 0 · D 7 s (slider 100, REAL time-to-silence) · S 0 · R 0.45 s (slider
     // 15 — generic; GM picks override per family, see SoundsTab).
     float attack  = 0.0f, decay  = 7.0f, sustain = 0.0f, release = 0.45f;
-    int   ampCurve = 0;   // amp decay/release shape: 0=Exp 1=Lin 2=Log
+    // AMP DECAY/RELEASE SHAPE.
+    //
+    // `ampCurve` is the legacy three-way selector, kept so every existing .ins,
+    // .sins, .drm and set still loads and still means what it meant.
+    //
+    // `ampCurveK` is what the engine actually uses: the signed exponent of
+    // AHDSREnvelope::fallAmount, continuous rather than three fixed points.
+    // -20 swells, 0 is linear, +20 is very tight.  The old three land on it
+    // exactly — Exp +6, Lin 0, Log -4 — so nothing is approximated on the way
+    // in.  A file with no ampCurveK gets it derived from ampCurve.
+    int   ampCurve  = 0;
+    float ampCurveK = 6.0f;
 
     // Stereo pan, -1 (full left) .. +1 (full right), 0 = centre.  User-set in
     // the sound editor's PAN tab; the style never touches it.
@@ -464,6 +559,23 @@ struct SlotParams
     //==========================================================================
     float baseUnityDb = 0.0f;
 
+    //==========================================================================
+    // PSEUDO ROUND ROBIN for a MELODIC slot.  0..100, 0 = off.
+    //
+    // Drums have had this per key for a while (DrumElementParams::
+    // roundRobinAmount); this is the melodic twin, one value for the whole
+    // slot.  It drives TWO deviations, both latched once per voice at note-on:
+    // a pitch offset up to +/-4 cents and a filter-cutoff offset up to +/-150
+    // cents.  Deliberately not the drum recipe: a start offset skips into the
+    // body of a sustained sample, and the kit's +/-14 cents would be plainly
+    // out of tune on pitched material.
+    //
+    // 0 BY DEFAULT, AND THE ENGINE BRANCH IS SKIPPED ENTIRELY AT 0 - every
+    // existing patch, set and project renders bit-identically until somebody
+    // moves this slider.
+    //==========================================================================
+    int   variationAmount = 0;
+
     // Filter — encoding now matches the engine: 0=LP, 1=HP, 2=BP, 3=Notch
     float filterCutoff   = 1.0f;
     float filterReson    = 0.0f;
@@ -480,6 +592,30 @@ struct SlotParams
     // Filter envelope (extended with amount)
     float fEnvA = 0.01f, fEnvD = 0.2f, fEnvS = 0.5f, fEnvR = 0.3f;
     float fEnvAmount = 0.0f;       // 0..1 (scaled to ~10 kHz at the engine)
+
+    //==========================================================================
+    // ATTACK GLIDE — the note arrives flat and rises into pitch.
+    //
+    // SOLO SLOTS ONLY, and that is a musical decision rather than a technical
+    // one: a style's melodic parts carry their own authored articulation and
+    // already send their own bends where the composer wanted them, so a second
+    // glide layered underneath would fight writing that is already correct.
+    // ModulationPanel hides the whole block for a style slot.
+    //
+    // NOT TEMPO-SYNCED, and that was considered and rejected.  A string going
+    // sharp under the pick and settling is string physics: the same string
+    // settles in the same ~40 ms at 60 BPM as at 140.
+    //
+    // The mode decides how often it fires.  RANDOM is seeded from a per-channel
+    // xorshift advanced at note-on, not from rand(), so a phrase renders the
+    // same way twice and a bounce matches what was heard.
+    int   glideMode    = 0;      // 0 OFF, 1 EVERY note, 2 EVERY Nth, 3 RANDOM, 4 VELOCITY
+    float glideDepth   = 3.0f;   // semitones BELOW the note to start from, 0..12
+    float glideTimeMs  = 60.0f;  // time to reach true pitch, 0..500 ms
+    float glideShapeK  = 6.0f;   // signed exponent, same law as ampCurveK
+    int   glideEveryN  = 4;      // mode 2: fire on exactly every Nth note, 2..16
+    int   glideOdds    = 5;      // mode 3: fire on AVERAGE 1 note in N, 2..16
+    int   glideVelMin  = 100;    // mode 4: fire at this played velocity and above, 1..127
 
     // Mono / portamento  (from the shared sampler — drum channels ignore these)
     int   playMode       = 0;      // 0=Poly, 1=Mono
@@ -560,6 +696,14 @@ struct SlotParams
     // independent, so every reverb ever saved was voiced against a wet that
     // means what it says.  Halving it here would quietly re-voice all of them.
     float delayWetBase  = 0.5f;
+
+    // ── DELAY TONE, all three previously hidden or absent ───────────────────
+    // Defaults reproduce exactly what the delay always did, so no existing
+    // preset, set or style changes when these arrive.
+    float delayDampHz   = 5000.0f;   // feedback low-pass; was hard-coded
+    float delayHpHz     = 20.0f;     // feedback high-pass; new, open = no-op
+    float delaySmoothMs = 40.0f;     // time slew; new, stops the jump on a change
+
     float reverbWetBase = 1.0f;
 
     // Velocity curve for the whole slot - see the VelCurve namespace.
@@ -574,6 +718,7 @@ struct SlotParams
     float        clickVolume   = 0.5f;     // 0..1
     float        clickDecayMs  = 150.0f;   // 0..1500
     juce::String clickFilePath;            // absolute path; empty = no sample loaded
+    juce::String engineSpec;            // SOUND ENGINE: oscengine text, EMPTY = factory (OscEngine.h)
 
     // NOTE: the per-slot Arabic scale tuning was REMOVED.  The oriental scale
     // is a GLOBAL feature (left panel), applied to the sounding solo channels
@@ -655,6 +800,10 @@ public:
         2.0f * kOuterRadius + 2.0f * kHandleClearance;
 
     std::function<void(float)> onChange;
+
+    /** Optional readout override — takes the raw slider value and returns what
+        to print.  See valueText. */
+    std::function<juce::String(float)> displayFn;
 
     GoldSlider(const juce::String& lbl, float minV, float maxV, float defV,
                const juce::String& unitStr_ = "")
@@ -795,9 +944,9 @@ private:
         g.saveState();
         g.reduceClipRegion(pillPath);
 
-        juce::ColourGradient bronzeGrad(juce::Colour(0xFFF0B265), trkX - 1.0f, 0.0f,
-                                        juce::Colour(0xFF6E4419), trkX + kTrackWidth + 1.0f, 0.0f, false);
-        bronzeGrad.addColour(0.5, juce::Colour(0xFFB87A36));
+        juce::ColourGradient bronzeGrad(juce::Colour(Betel::Pal::kAccentLight), trkX - 1.0f, 0.0f,
+                                        juce::Colour(Betel::Pal::kAccentDark), trkX + kTrackWidth + 1.0f, 0.0f, false);
+        bronzeGrad.addColour(0.5, juce::Colour(Betel::Pal::kAccent));
         g.setGradientFill(bronzeGrad);
         g.fillRect(juce::Rectangle<float>(trkX, thumbY, kTrackWidth, trkB - thumbY));
         g.restoreState();
@@ -825,13 +974,13 @@ private:
                       kOuterRadius * 2.0f - 0.4f, kOuterRadius * 2.0f - 0.4f, 0.8f);
 
         // ── Inner BRONZE circle (the "dot") ───────────────────────────────────
-        juce::ColourGradient innerGrad(juce::Colour(0xFFF8C078),
+        juce::ColourGradient innerGrad(juce::Colour(Betel::Pal::kAccentLight),
                                        cx - kInnerRadius * 0.35f,
                                        thumbY - kInnerRadius * 0.35f,
-                                       juce::Colour(0xFF7A4A1E),
+                                       juce::Colour(Betel::Pal::kAccentGradDk),
                                        cx + kInnerRadius,
                                        thumbY + kInnerRadius, true);
-        innerGrad.addColour(0.5, juce::Colour(0xFFC4843D));
+        innerGrad.addColour(0.5, juce::Colour(Betel::Pal::kAccentGrad));
         g.setGradientFill(innerGrad);
         g.fillEllipse(cx - kInnerRadius, thumbY - kInnerRadius,
                       kInnerRadius * 2.0f, kInnerRadius * 2.0f);
@@ -911,9 +1060,9 @@ private:
         g.saveState();
         g.reduceClipRegion(pillPath);
 
-        juce::ColourGradient bronzeGrad(juce::Colour(0xFFF0B265), 0.0f, trkY - 1.0f,
-                                        juce::Colour(0xFF6E4419), 0.0f, trkY + kTrackWidth + 1.0f, false);
-        bronzeGrad.addColour(0.5, juce::Colour(0xFFB87A36));
+        juce::ColourGradient bronzeGrad(juce::Colour(Betel::Pal::kAccentLight), 0.0f, trkY - 1.0f,
+                                        juce::Colour(Betel::Pal::kAccentDark), 0.0f, trkY + kTrackWidth + 1.0f, false);
+        bronzeGrad.addColour(0.5, juce::Colour(Betel::Pal::kAccent));
         g.setGradientFill(bronzeGrad);
         g.fillRect(juce::Rectangle<float>(trkL, trkY, thumbX - trkL, kTrackWidth));
         g.restoreState();
@@ -939,13 +1088,13 @@ private:
                       kOuterRadius * 2.0f - 0.4f, kOuterRadius * 2.0f - 0.4f, 0.8f);
 
         // Inner BRONZE dot
-        juce::ColourGradient innerGrad(juce::Colour(0xFFF8C078),
+        juce::ColourGradient innerGrad(juce::Colour(Betel::Pal::kAccentLight),
                                        thumbX - kInnerRadius * 0.35f,
                                        cy     - kInnerRadius * 0.35f,
-                                       juce::Colour(0xFF7A4A1E),
+                                       juce::Colour(Betel::Pal::kAccentGradDk),
                                        thumbX + kInnerRadius,
                                        cy     + kInnerRadius, true);
-        innerGrad.addColour(0.5, juce::Colour(0xFFC4843D));
+        innerGrad.addColour(0.5, juce::Colour(Betel::Pal::kAccentGrad));
         g.setGradientFill(innerGrad);
         g.fillEllipse(thumbX - kInnerRadius, cy - kInnerRadius,
                       kInnerRadius * 2.0f, kInnerRadius * 2.0f);
@@ -972,6 +1121,15 @@ private:
         // for the 0..100 normalised sliders in DrumsPopup.
         if (step >= 1.0f && unit.isEmpty())
             return juce::String((int) std::round(value));
+
+        // A knob whose VALUE is not what it MEANS supplies its own readout.
+        //
+        // A/D/R carry 0..100 because the drag is linear between min and max
+        // while their real scale is exponential, so the number under the knob
+        // would otherwise be a POSITION, not a time.  That is exactly how a
+        // release of "70" changed from 2.1 s to 629 ms in a rebuild with
+        // nothing on screen disagreeing.  Show the time and it cannot recur.
+        if (displayFn) return displayFn (value);
 
         if (unit == "s")   return value < 1.0f ? juce::String((int)(value*1000)) + "ms"
                                                : juce::String(value, 1) + "s";
@@ -1091,9 +1249,9 @@ public:
             clip.addRoundedRectangle(trkX, trkT, kTrackWidth, trkH, kTrackWidth * 0.5f);
             g.saveState();
             g.reduceClipRegion(clip);
-            juce::ColourGradient bronze(juce::Colour(0xFFF0B265), trkX - 1.0f, 0.0f,
-                                        juce::Colour(0xFF6E4419), trkX + kTrackWidth + 1.0f, 0.0f, false);
-            bronze.addColour(0.5, juce::Colour(0xFFB87A36));
+            juce::ColourGradient bronze(juce::Colour(Betel::Pal::kAccentLight), trkX - 1.0f, 0.0f,
+                                        juce::Colour(Betel::Pal::kAccentDark), trkX + kTrackWidth + 1.0f, 0.0f, false);
+            bronze.addColour(0.5, juce::Colour(Betel::Pal::kAccent));
             g.setGradientFill(bronze);
             g.fillRect(juce::Rectangle<float>(trkX, yHi, kTrackWidth, juce::jmax(0.0f, yLo - yHi)));
             g.restoreState();
@@ -1281,7 +1439,7 @@ namespace InstrEditStyle
 
         if (title.isNotEmpty())
         {
-            g.setColour(juce::Colour(0xFFCC6600));
+            g.setColour(juce::Colour(Betel::Pal::kAccent));
             g.setFont(juce::Font(15.0f, juce::Font::bold));
             g.drawFittedText(title,
                              bounds.getX() + 12, bounds.getY() + kFrameTopPad,
@@ -1301,7 +1459,7 @@ namespace InstrEditStyle
 
     inline void styleSquareButton(juce::TextButton& b, bool active)
     {
-        const auto fill = active ? juce::Colour(0xFFCC6600) : juce::Colour(0xFF2A2A2A);
+        const auto fill = active ? juce::Colour(Betel::Pal::kAccent) : juce::Colour(0xFF2A2A2A);
 
         // BOTH ids, and that is the whole fix for "my toggles never go orange".
         // LookAndFeel_V4::drawButtonBackground looks up buttonOnColourId when the
@@ -1321,7 +1479,7 @@ namespace InstrEditStyle
     inline void drawSectionHeader(juce::Graphics& g, const juce::String& label,
                                   int x, int y, int w, int h = 14)
     {
-        g.setColour(juce::Colour(0xFFCC6600));
+        g.setColour(juce::Colour(Betel::Pal::kAccent));
         g.setFont(juce::Font((float) juce::jmin(h - 2, 11), juce::Font::bold));
         g.drawText(label, x, y, w, h, juce::Justification::centred, false);
     }
@@ -1392,8 +1550,16 @@ public:
     {
         g.fillAll(juce::Colour(0xFF0E0E0E));
 
-        const juce::Colour litWhite(0xFFE02020);   // playing — white key
-        const juce::Colour litBlack(0xFFB01818);   // playing — black key
+        // PLAYING = THE PRODUCT'S COLOUR, not red.  These are highlights saying
+        // "this note is sounding", exactly like the selector lamps - not
+        // warnings.  Red here was Grex's gold-plate scheme, where a blue-ish
+        // lamp would have clashed; on the pool-blue plate it is the red that
+        // looks imported from another product.
+        //
+        // Two levels, because a white key and a black key start from different
+        // brightnesses and one tint cannot read on both.
+        const juce::Colour litWhite(Betel::Pal::kLedOn);                            // white key
+        const juce::Colour litBlack(juce::Colour (Betel::Pal::kLedOn).darker (0.35f)); // black key
 
         for (const auto& k : whiteKeys)
         {
@@ -1532,6 +1698,3 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PianoStrip)
 };
-
-
-

@@ -1,4 +1,7 @@
+
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the gold accent scheme
 #include <JuceHeader.h>
 #include <vector>
 #include <cmath>
@@ -9,8 +12,8 @@
 //
 //  Layout:
 //     +-------------------------------------------------------------------+
-//     |  [WELCOME][QUICK START][KEYBOARD][TEMPO][SECTIONS][STYLES]         |
-//     |  [SOUNDS ][MIXER      ][JUMPS   ][CRASH][SETS    ][SETTINGS]       |
+//     |  [WELCOME][QUICK START][KEYBOARD][TEMPO][SECTIONS][STYLES][SOUNDS] |
+//     |  [MIXER  ][FINISHER   ][JUMPS   ][CRASH][SETS    ][SETTINGS]       |
 //     |  +-------------------------------------------------------------+  |
 //     |  |  <chapter title>                                            |  |
 //     |  |  scrolling body text                                        |  |
@@ -48,7 +51,7 @@ public:
             b->setButtonText (kChapters[(size_t) c].title);
             b->setClickingTogglesState (false);
             b->setColour (juce::TextButton::buttonColourId,   juce::Colour (0xFF1A1A1A));
-            b->setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xFFCC6600));
+            b->setColour (juce::TextButton::buttonOnColourId, juce::Colour (Betel::Pal::kAccent));
             b->setColour (juce::TextButton::textColourOffId,  juce::Colours::white.withAlpha (0.75f));
             b->setColour (juce::TextButton::textColourOnId,   juce::Colours::black);
             b->onClick = [this, c] { selectChapter (c); };
@@ -72,9 +75,9 @@ public:
     {
         auto r = getLocalBounds().reduced (8);
 
-        // Chapter selector: two rows of six.  Six across keeps every caption on
-        // one line at the smallest window scale, which a single row of twelve
-        // would not -- and a wrapped caption in a selector reads as two buttons.
+        // Chapter selector: two rows of seven.  Seven across keeps every caption
+        // on one line at the smallest window scale, which a single row of
+        // fourteen would not -- and a wrapped caption reads as two buttons.
         const int rowH = juce::jlimit (22, 34, r.getHeight() / 13);
         auto selArea = r.removeFromTop (rowH * kSelectorRows + kSelectorRowGap);
 
@@ -185,7 +188,7 @@ private:
                 as.append (ln.text,
                            juce::Font (isHead ? headFont : bodyFont,
                                        isHead ? juce::Font::bold : juce::Font::plain),
-                           isHead ? juce::Colour (0xFFCC6600)
+                           isHead ? juce::Colour (Betel::Pal::kAccent)
                                   : juce::Colour (0xFFC2C2C2));
 
                 if (isHead) y += headTopPad;
@@ -222,7 +225,7 @@ private:
 
                 if (e.kind == Line::Kind::Bullet)
                 {
-                    g.setColour (juce::Colour (0xFFCC6600));
+                    g.setColour (juce::Colour (Betel::Pal::kAccent));
                     g.fillEllipse (e.indent * 0.35f,
                                    e.y + 6.0f * scale,
                                    bulletR * 2.0f, bulletR * 2.0f);
@@ -347,7 +350,13 @@ private:
     static const std::vector<Chapter> kChapters;
 
     static constexpr int kSelectorRows   = 2;
-    static constexpr int kSelectorCols   = 6;
+    // SEVEN, not six.  The grid is kSelectorRows x kSelectorCols and the layout
+    // loop simply BREAKS when it runs out of buttons - so a chapter past the
+    // last slot is not squeezed or wrapped, it silently never gets a button.
+    // Adding the FINISHER chapter took the count to 13 against 12 slots, which
+    // would have made SETTINGS unreachable with nothing on screen to say why.
+    // 2 x 7 = 14 leaves a slot spare for the next one.
+    static constexpr int kSelectorCols   = 7;
     static constexpr int kSelectorRowGap = 4;
 
     juce::OwnedArray<juce::TextButton> chapterButtons;
@@ -368,25 +377,31 @@ inline const std::vector<TutorialTab::Chapter> TutorialTab::kChapters =
     { "WELCOME", TutorialTab::parse (R"TXT(
 # What Grex is
 
-Grex is an arranger. You play a chord with your left hand and a whole band
-plays with you: drums, percussion, bass, chords, pad and two lead parts, all
-following the chord you are holding, in the style you picked.
+Grex is an arranger. You play a chord with your left hand and a whole band plays
+with you: drums, percussion, bass, chords, pad and two lead parts, all following
+the chord you are holding, in the style you picked.
 
 Your right hand stays free to play the melody on your own sounds.
 
+The style library is filed into folders by genre, and the STYLES tab shows you
+exactly the folders you have. Add one, drop styles into it, and it appears.
+
 # The screen, in two halves
 
-- LEFT PANEL is the performance side: tempo, transpose, the chord readout, the
+- LEFT PANEL is the performance side: tempo, the global semitone stepper, the
+  chord readout, ENERGY, the harmony and split features, the MIDI link box, the
   set manager, and at the very bottom the keyboard with its split point.
 - RIGHT PANEL is the work side: the tab row and the page it opens. Everything
   you set up ahead of a gig lives here.
 
+The tab row is MAIN, STYLES, SOUNDS, MIXER, JUMPS, CRASH, SETTINGS and TUTORIAL.
+
 # The one rule worth learning first
 
-The keyboard is split in two by the SPLIT point. Everything BELOW the split
-is the chord zone, and it drives the band. Everything ABOVE the split is
-yours, and it plays your solo sounds. The rest of this manual is detail on
-top of that single idea.
+The keyboard is split in two by the SPLIT point. Everything BELOW the split is
+the chord zone, and it drives the band. Everything ABOVE the split is yours, and
+it plays your solo sounds. The rest of this manual is detail on top of that
+single idea.
 
 # How to use this tutorial
 
@@ -397,19 +412,18 @@ enough to perform with. The rest can wait until you want to change something.
 
     //--------------------------------------------------------------------------
     { "QUICK START", TutorialTab::parse (R"TXT(
-# Six steps to your first sound
+# Five steps to your first sound
 
-- 1. Open the STYLES tab. Pick a genre from the grid at the top, then pick a
-  style from the grid below it. Press LOAD.
-- 2. The style name appears on the left panel. Its own set loads with it, so
-  the sounds, the mixer and the levels are already set up for that style.
-- 3. Hold a chord in the LEFT half of the keyboard. The chord you played is
-  shown on the left panel, so you can always check that Grex heard what you
-  meant.
-- 4. Open the MAIN tab and press PLAY. The band starts on the variation that
-  is lit -- VAR 1 unless you changed it.
-- 5. Change chords with your left hand. The band follows immediately, in key.
-- 6. Play the melody with your right hand.
+- 1. Open the STYLES tab. Pick a genre from the row of folder buttons, then
+  click a style in the grid. That one click loads it -- there is no separate
+  LOAD button to press afterwards.
+- 2. The style name appears on the left panel. Its own set loads with it, so the
+  sounds, the mixer and the levels are already set up for that style.
+- 3. Hold a chord in the LEFT half of the keyboard. The chord is shown on the
+  left panel, so you can always check that Grex heard what you meant.
+- 4. Open the MAIN tab and press PLAY. The band starts on the section whose lamp
+  is lit.
+- 5. Change chords with your left hand, and play the melody with your right.
 
 # The next two things to try
 
@@ -436,6 +450,11 @@ The SPLIT knob sits next to the keyboard at the bottom right. It sets the key
 where the chord zone ends and your solo range begins. The on-screen keyboard
 draws the split, so you can see where the border is.
 
+The split is YOURS, not the song's. Where your two hands divide follows your
+reach and your habit, so it is kept in its own file and remembered for good.
+Loading somebody else's set cannot move it, and neither can anything else --
+only the knob.
+
 # ARRANGER and PIANO
 
 - ARRANGER is the normal state: the keyboard is split, the low half feeds the
@@ -451,7 +470,7 @@ draws the split, so you can see where the border is.
   9ths and 13ths are recognised as you play them.
 
 The button is on the MAIN tab, and the chord readout on the left panel always
-shows what Grex decided you played.
+shows what was decided.
 
 # HOLD
 
@@ -471,15 +490,48 @@ zone to reach a control and come straight back.
 
 # SINGLE and MULTI
 
-SOLO MODE decides how many of your own sounds the right hand plays. SINGLE
-plays one solo channel. MULTI layers every solo channel you enabled on the
-MAIN tab, so you can stack, for example, a piano under a string pad.
+SOLO MODE decides how many of your own sounds the right hand plays. SINGLE plays
+one solo channel. MULTI layers every solo channel you enabled on the MAIN tab,
+so you can stack, for example, a piano under a string pad.
 
-# TRANSPOSE
+Your right hand chooses from SIX solo channels. Solo 7 and solo 8 are not
+selectable any more: they are lamps, and each belongs to one of the features
+below -- solo 8 reads HARMONY, solo 7 reads M.BASS.
 
-The TRANSPOSE knob on the left panel shifts everything in semitones -- the
-band and your solo sounds together -- so you can move a song into a singer's
-key without relearning it.
+# HARMONY
+
+HARMONY adds notes under the top note you are holding, taken from the chord the
+band is playing. Choose DUET, TRIO, BLOCK, OCTAVE or 5TH, and set how loud the
+added notes sit with the LEVEL slider.
+
+They are real notes played by a real sound, not a pitch shift, and they play on
+their own channel -- which is why they are not squashed by anything acting on
+your melody.
+
+# MULTI SPLIT
+
+MULTI SPLIT divides the keyboard into THREE zones instead of two: a bass zone at
+the bottom, the chord zone above it, and your solos on top. The BASS SPLIT
+slider sets the lower boundary, and BASS -> SOLO n chooses which of your solo
+sounds the bass zone plays.
+
+# BASS INVERSION and MANUAL BASS
+
+- BASS INVERSION is the switch a single-keyboard player can actually use. The
+  style keeps its own bass line and simply follows the lowest note you hold, so
+  nothing ever drops out.
+- MANUAL BASS hands you the bass line. Everything left of the split plays SOLO 7
+  and sends no chords, so the band holds what it had. It turns MULTI SPLIT off,
+  since the two want the same part of the keyboard.
+
+# GLOBAL SEMITONE
+
+The GLOBAL SEMITONE control on the left panel shifts everything -- the band and
+your solo sounds together -- so you can move a song into a singer's key without
+relearning it.
+
+It is a STEPPER, not a knob: one press is one semitone. Press the top half to go
+up and the bottom half to go down.
 )TXT") },
 
     //--------------------------------------------------------------------------
@@ -487,16 +539,26 @@ key without relearning it.
 # Setting the tempo
 
 - The TEMPO knob sets the beats per minute directly.
-- TAP sets it by feel: tap the button in time and Grex takes the tempo from
-  your taps.
+- TAP sets it by feel: tap the button in time and the tempo is taken from your
+  taps.
 - RESET returns to the tempo the style itself was written at. Every style
   carries its own, so this is your way back after experimenting.
 
+# What a set remembers about tempo
+
+A set does not store a bare number. It stores your OFFSET from the style's own
+tempo. If the style is written at 150 and you play it at 170, the set keeps
+"plus 20", not "170".
+
+That is deliberate: the style stays the authority on its own speed, and your
+adjustment rides on top. Change the style file later and your set still means
+what you meant.
+
 # FREE and SYNCED
 
-- FREE means Grex keeps its own tempo and ignores the host.
-- SYNCED means Grex follows your DAW's transport tempo, which is what you want
-  when Grex plays alongside other tracks in a project.
+- FREE keeps its own tempo and ignores the host.
+- SYNCED follows your DAW's transport tempo, which is what you want when the
+  band plays alongside other tracks in a project.
 
 # Half and double time
 
@@ -517,8 +579,8 @@ groove intact -- this is not the same as typing a new BPM.
 
 # DAW START
 
-The DAW START button on the left panel makes Grex start with your host's
-transport, so hitting play in the DAW starts the band with it.
+The DAW START button on the left panel starts the band with your host's
+transport, so hitting play in the DAW starts everything together.
 )TXT") },
 
     //--------------------------------------------------------------------------
@@ -538,33 +600,33 @@ The sixteen pads on the MAIN tab are exactly these sections.
 
 # How to move through a song
 
-Press a variation and Grex plays the fill that leads into it, then lands on
-the new groove. You do not have to time the change yourself: Grex waits for
-the right musical moment and gets there on the beat.
+Press a variation and the fill that leads into it plays, then it lands on the
+new groove. You do not have to time the change yourself: it waits for the right
+musical moment and gets there on the beat.
 
 Press a fill on its own and it runs, then returns you to where you were.
 
 # TRANSITIONS
 
-The TRANSITIONS selector on the left panel decides how often Grex checks for a
-press: 1/2, 1/4 or 1/8 of a bar. 1/8 feels instant and forgiving; 1/2 is
-tighter and lands on stronger beats. It is a feel setting, not a right answer.
+The TRANSITIONS selector on the left panel decides how often a press is checked
+for: 1/2, 1/4 or 1/8 of a bar. 1/8 feels instant and forgiving; 1/2 is tighter
+and lands on stronger beats. It is a feel setting, not a right answer.
 
 The grid follows the style's own meter, so it behaves the same in 3/4, 6/8 and
 7/8 as it does in 4/4.
 
 # FILL LENGTH
 
-A fill never eats more than one bar, so the cost of a transition is the same
-in every style. FILL LENGTH chooses how much of that bar you get: "1" plays
-the whole bar, "1/2" plays only its second half for a shorter, punchier lift.
+A fill never eats more than one bar, so the cost of a transition is the same in
+every style. FILL LENGTH chooses how much of that bar you get: "1" plays the
+whole bar, "1/2" plays only its second half for a shorter, punchier lift.
 
 # The eight style elements
 
 The MAIN tab's eight buttons -- DRUMS, PERC, BASS, CHORD 1, CHORD 2, PAD,
 LEAD 1, LEAD 2 -- mute and unmute the parts of the band. Dropping to drums and
 bass for a verse and bringing the rest back for a chorus is one press each way,
-and it is the fastest arranging tool in the plugin.
+and it is the fastest arranging tool here.
 
 # Playing live: a suggested shape
 
@@ -575,48 +637,102 @@ and it is the fastest arranging tool in the plugin.
   including a fill or a break, until you let go.
 - Finish with an END. Do not just press STOP -- the ending is what makes it
   sound finished.
+
+# Choosing a section before you start
+
+With the band stopped, press any section button -- INTRO, a variation, FILL,
+BREAK or ENDING -- and the next PLAY opens on exactly that section. You are not
+limited to starting on a main. Set up the intro you want, then start.
+
+# What the lamp is telling you
+
+The lamp lights the moment you PRESS, not when the change happens. That is
+deliberate, and it is how hardware arrangers behave: the button is answering
+"I have you", not "it has happened yet".
+
+So between the press and the next quantise point the lamp shows what you ASKED
+for while you are still hearing what came before. Nothing is wrong. When the
+change lands the lamp does not move -- it simply stops being a promise and
+starts being a report.
+
+Press a different button in the meantime and the lamp follows the new one, so
+you can always see which section is actually queued.
 )TXT") },
 
     //--------------------------------------------------------------------------
     { "STYLES", TutorialTab::parse (R"TXT(
 # The browser
 
-The STYLES tab has two grids. The top one is genres, taken from the folders
-inside your styles folder -- so the way you organise the folder is the way the
-browser looks. The bottom grid is the styles in the selected genre, arranged
-alphabetically across pages.
+The STYLES tab is one grid of thirty cells, six across and five down, filled
+left to right and row by row. Above it is a row of FOLDER buttons -- one per
+genre -- and above that the selected-style pill, the page arrows and SEARCH.
 
-Click a style to select it, then LOAD. RELOAD re-reads the same style from
-disk, which is what you want after editing its set.
+# The folders are your folders
+
+The buttons come from the subfolders of your styles folder, and nothing knows
+their names in advance. Make a folder called Latin, drop styles into it, rescan,
+and a LATIN button appears. A style left loose in the styles folder itself files
+under GENERAL.
+
+Choosing a folder only SHOWS you its styles. It never loads anything, and the
+lit cell stays lit wherever it is.
+
+# Turning pages
+
+Thirty cells to a page. The arrows either side of the page readout step through
+the pages of the folder you are in, and they wrap, so the last page is one press
+back from the first. A folder of twelve styles is one page and the arrows go
+quiet; a folder of two hundred is seven.
+
+A page with fewer than thirty styles simply shows fewer buttons. The grid keeps
+its shape.
+
+# Loading is one click
+
+Click a cell and that style loads. There is no LOAD button to press afterwards
+and no RELOAD button.
 
 # Search
 
-The search bar sits under the tab row and is visible on the STYLES tab. It
-looks across the whole library, not just the genre you are browsing, so you
-can find a style without remembering where you filed it.
+The SEARCH button opens a separate window. It has to be a real window rather
+than a box on the page: inside a plugin the DAW owns the keyboard, so typing
+into a box on the tab would drive the host's transport instead of entering text.
+
+The window holds the search box on top, RESULTS on the left, and LAST SEARCHES
+on the right -- your saved keywords, each with a bin to remove it. Click a
+result and that style is selected, and the grid turns to its folder and its
+page to show you where it lives.
+
+It stays open on purpose. Finding the right style usually means trying two or
+three, and a window that closed on the first click would make you re-open it and
+re-type for the second.
 
 # Favourites
 
 Every cell carries a star. Starring a style marks it as a favourite so your
-working set is quick to find in a large library.
+working set stays quick to find.
 
 # One selection, everywhere
 
-The highlighted cell is the style that is actually loaded, identified by its
-full path. Browsing other genres or turning pages never moves that highlight,
-so the grid can always be trusted to tell you what is playing.
+The lit cell is the style that is actually loaded, identified by its own
+reference. Changing folders, turning pages or searching never moves that
+highlight, so the grid can always be trusted to tell you what is playing.
+
+The count on the pill is the WHOLE library, not the folder you are looking at --
+it answers "how many styles do I have", which is a question about the library.
 
 # Loading while playing
 
-A style cannot be swapped while the band is running -- that would leave notes
-hanging and the groove mid-phrase. Stop, load, and start again.
+A style cannot be swapped while the band is running -- that would mean revoicing
+every slot and rebuilding every kit mid-bar. Stop, load, and start again. The
+pill above the grid says so rather than silently doing nothing.
 
 # Every style brings its own set
 
 Loading a style also loads the set saved with it: the sounds on all sixteen
-channels, the mixer, the jumps, the crash settings and the style levels. That
-is why a freshly loaded style already sounds finished, and why saving a set is
-how you keep any change you make.
+channels, the mixer, the jumps, the crash settings and the style levels. That is
+why a freshly loaded style already sounds finished, and why saving a set is how
+you keep any change you make.
 )TXT") },
 
     //--------------------------------------------------------------------------
@@ -630,42 +746,147 @@ The SOUNDS tab is where you choose what each of them plays and how it sounds.
 
 # Choosing a sound
 
-Pick a slot, then pick a voice. Drum slots additionally offer the sampled kits
-found in your sounds folder, alongside the built-in composed kits.
+The selector is four vertical columns, each one feeding the next: pick a SLOT,
+then PACK, then CATEGORY, then INSTRUMENT, working left to right. Drum slots
+also offer the sampled kits found in your sounds folder, alongside the built-in
+composed kits.
+
+# The three sound packs
+
+PACK chooses between GM, WORLD and ORIENTAL. GM ships with the plugin and is
+always there. WORLD and ORIENTAL are optional downloads that install by dropping
+their folder into your system folder and uninstall by deleting it -- nothing is
+merged and nothing is left behind.
+
+A pack you have not installed still shows its button. Press it and the category
+list is empty, which is the plainest way of saying "not installed".
 
 If you want a slot to keep the sound YOU chose and ignore what the style asks
 for, use IGNORE PROGRAM CHANGE on that slot. Without it, loading a style is
 allowed to replace the voice.
 
-# The sound editor
+# The sound editor: four tabs
 
-Opening a slot's editor gives you the full instrument: envelope and filter,
-then the effects chain -- EQ, chorus, wah, phaser, delay and reverb -- each
-with its own on/off.
+- SYNTHESIS -- envelopes, filter, allowed notes, and (on solo slots) GAIN.
+- MODULATION -- the LFOs, and ATTACK GLIDE.
+- EFFECT SENDS -- the five-band EQ, PAN, and three sends.
+- INSERTS -- wah, phaser and the sweetener.
 
-Two controls are worth knowing by name:
+# Where the effects actually live
 
-- GAIN is a per-sound level, 0 to 200, where 100 is unity and 200 is twice as
-  loud. This is how you calibrate one sound that is too hot or too shy without
-  touching the mixer balance.
-- ALLOWED NOTES limits the range a sound will play, which is how you stop a
-  bass patch from being dragged into an octave it was never sampled for.
+This is the one thing worth reading twice, because it changed.
+
+CHORUS, REVERB and DELAY are no longer per instrument. There is ONE of each per
+hand: one rack for the sixteen style channels and one for your eight solos. What
+each instrument owns is HOW MUCH of itself it sends there, and those are the
+three sliders on the EFFECT SENDS tab.
+
+The rack itself opens from the GLOBAL EFFECTS button under the eight slot
+selectors. Open it from any slot in a hand and you see that hand's settings,
+because there is only one rack behind them.
+
+WAH, PHASER and SWEETENER went the other way and stayed per instrument, on the
+INSERTS tab. They are shapers -- their output replaces the signal rather than
+adding to it -- so a parallel send would give you a wah you cannot hear and a
+sweetener that only doubles the level. They also want different settings on
+every instrument, which a shared rack cannot give.
+
+EQ and PAN are per instrument for the same reason: tilting one voice should not
+tilt sixteen.
+
+# The reverb's EARLY REFLECTIONS
+
+The global reverb has an ER control and an ER SIZE beside it. Early reflections
+are the first bounces off the walls -- the part that tells your ear how big the
+room is, before the tail arrives.
+
+ER starts at zero, so nothing you already saved sounds any different until you
+reach for it.
+
+# ATTACK GLIDE
+
+On the MODULATION tab, and on SOLO SLOTS ONLY: a small pitch scoop into the true
+note, the way a real player leans into a phrase. The style's own parts already
+carry that kind of articulation, which is why it is not offered there.
+
+- OFF, EVERY note, EVERY Nth note, or RANDOM.
+- DEPTH is how far it scoops, TIME is how long it takes, SHAPE is the curve.
+- EVERY sets the N; ODDS sets the odds in random mode, read as "about 1 in N".
+
+# GAIN, and where a style channel's level lives
+
+GAIN appears on SOLO slots only, 0 to 200 with 100 as unity. Your right hand is
+yours to calibrate.
+
+Style slots have no gain slider, and that is the point: the style states its own
+level and the mixer adjusts it afterwards. See the MIXER chapter -- everything
+about a style channel's loudness is decided there now, including the per-slot
+base trim for a part that arrives far too loud or far too quiet.
+
+# ALLOWED NOTES
+
+ALLOWED NOTES decides which part of the keyboard a part is folded into -- how
+you stop a bass patch from being dragged into an octave it was never sampled
+for.
+
+The one rule is a floor of twelve semitones. A window narrower than an octave
+cannot contain every note name, so a folded note could have nowhere legal to
+land. Above that floor, every channel can be given whatever window you want.
 
 # The SWEETENER
 
 The sweetener is a small dynamics block for taking the aggression out of a
-sound, especially drums from converted styles. It is three named jobs rather
-than a set of engineer's numbers:
+sound, especially drums from converted styles. It is named jobs rather than
+engineer's numbers:
 
 - SOFTEN rounds off the attack, or adds attack when you push it the other way.
+- PEAK holds the loudest moments back.
 - TAME pulls down a harsh frequency band only when it gets loud.
 - ROUND adds gentle saturation, blended in parallel so definition survives.
 
-It starts switched off on every slot, on purpose: you should hear the sound
-raw first and then decide it needs help.
+Each stage has its own button, so you can hear one at a time.
 
-The advanced rack underneath -- EQ, saturation, compressor, reverb, delay --
-is still there and unchanged if you prefer to work that way.
+# The drum rack
+
+A drum slot opens its own editor with six pages: EQ, SAT, COMP, SWEET, PAN and
+SENDS. Everything above about the global racks applies here too -- the drums
+have their own EQ, saturation, compressor, sweetener and pan, and they send to
+the same chorus, reverb and delay as the rest of the left hand.
+
+Right-click any key on the editor keyboard to hear that drum on its own.
+
+# FUNKEY MODE
+
+FUNKEY MODE is a performance switch, so it sits on the play-control row between
+ONPRESS and CRASH, and it is also reachable from Settings.
+
+It gives SIX instrument families -- chromatic percussion, organ, guitar, synth
+lead, ethnic and percussive -- their own WAH and PHASER.
+
+It is a STAGE OF ITS OWN, in front of the instrument:
+
+    STYLE INSTRUMENT  ->  FUNKEY  ->  CHANNEL EFFECTS
+
+So the family's wah and phaser run first and hand an already-wet signal to the
+instrument's own chain, which is left completely alone. A slot KEEPS its private
+wah and phaser while the macro is on, and the two run in series. Nothing else
+changes: the EQ, the sends and everything on the global racks stay as the set
+left them.
+
+STYLE CHANNELS ONLY. Your right hand is never funkeyed -- a wah opening and
+closing under the melody would be fighting the performance rather than backing
+it.
+
+It applies only to the six families named above. A piano, a string pad or a bass
+is outside them and passes through untouched.
+
+# Editing a family
+
+The window opens six family buttons, one editor each, and every editor shows two
+pages: WAH and PHASER. Nothing else, because nothing else is in this stage.
+
+There is no ON/OFF inside that window. The FUNKEY button on the play-control row
+is the only switch. To silence one effect for one family, set its MIX to zero.
 
 # Presets
 
@@ -677,12 +898,12 @@ is still there and unchanged if you prefer to work that way.
 Saving a preset re-applies it to every channel currently holding that
 instrument, so you can calibrate by ear without stopping the band.
 
-# Global sound macros
+# The set owns a style channel's voicing
 
-FUNKEY MODE and BIG DRUMS live on the left panel and in Settings. FUNKEY MODE
-gives seven instrument families their own global effects chain; BIG DRUMS does
-the same for the kit. While a macro is on it replaces the instrument's private
-chain; switch it off and the style's own sound returns.
+Everything you set on a style channel -- envelopes, filter, EQ, sends, inserts --
+belongs to the SET, not to the instrument that happens to be loaded. So when a
+style swaps an instrument mid-song, your voicing stays. The new sound arrives
+already shaped the way you shaped that channel.
 )TXT") },
 
     //--------------------------------------------------------------------------
@@ -693,20 +914,76 @@ chain; switch it off and the style's own sound returns.
   under them.
 - RIGHT HAND / SOLO: your eight solo channels, with the SOLO VOLUME bus fader
   under them.
-- MASTER: one vertical fader for everything.
+- MASTER: one vertical fader for everything. The knob at the right of the tab
+  row shows the same value, so the master is reachable without leaving the page
+  you are on.
+
+# The rule the whole mixer is built on
+
+THE STYLE DECIDES, AND YOU ADJUST AFTERWARDS.
+
+Whatever level a style writes for a part is that part's base, and nothing argues
+with it. Your fader is a separate multiplier applied on top. At the 127 detent
+you are hearing exactly what the composer asked for; below it you are trimming
+their decision rather than replacing it.
+
+That is why style channels no longer have a gain slider in the sound editor.
+There is one number for the style's opinion and one for yours, and they never
+compete over the same control.
 
 # One scale everywhere
 
 Every fader reads 0 to 254 on the same linear scale:
 
 - 0 is silence.
-- 127 is unity -- the sound at its natural level.
+- 127 is unity -- exactly what the style asked for.
 - 254 is unity doubled.
 
-The reason for the odd-looking numbers is honesty: a style writes its own
-channel volumes in MIDI, and 0 to 127 is what it writes. Grex shows you that
-number unchanged, so the fader reads exactly what the style composer asked
-for. Everything from 128 upward is headroom that only you can add.
+The odd-looking numbers are honesty: a style writes its channel volumes in MIDI,
+and 0 to 127 is what it writes. That number is shown unchanged. Everything from
+128 upward is headroom that only you can add.
+
+# Faders on a style load
+
+The faders return to 127 when a style loads, and then the style's set applies
+its own. That is on purpose: a fader left over from the last song is a level
+nobody chose for this one.
+
+# What unity is worth
+
+Double-click STYLE VOLUME or SOLO VOLUME and you can type a BASE UNITY in dB.
+That does not move the fader -- it changes what the fader's unity detent is
+WORTH. Use it when 127 is the right position musically but the wrong loudness.
+
+The two are stored differently, on purpose:
+
+- STYLE base unity is saved WITH THE SET. How loud the band should sit is a
+  property of the song.
+- SOLO base unity is saved GLOBALLY. The balance between your two hands is a
+  property of you, and no song should change it.
+
+# SLOT BASE TRIM
+
+Double-click one of the eight STYLE channel faders and you get the same box for
+that slot alone: a fixed dB trim, plus or minus 40.
+
+This is the blunt instrument for a part a style sent at 12 or at 127, where the
+fader alone cannot reach. It is applied after the style's level and after the
+fader, it never changes what the style sends, it is saved with the set, and it
+returns to 0 dB when a style loads.
+
+# ENERGY
+
+ENERGY is the tall slider on the left panel, and it is about how HARD the band
+plays rather than how loud.
+
+It reads 0 to 200, with 100 meaning "exactly as written". Below 100 the band
+plays back, above it the band digs in. It reaches every style channel at once
+and is saved with the set.
+
+Use it when a style is right in every way except its attitude -- a ballad that
+needs to sit further back behind a singer, or one that needs to lift for a last
+chorus.
 
 # Working with it
 
@@ -718,16 +995,122 @@ Mixer positions are part of the set, so SAVE SET keeps them with the style.
 )TXT") },
 
     //--------------------------------------------------------------------------
+    { "FINISHER", TutorialTab::parse (R"TXT(
+# What it is
+
+The FINISHER is the last thing the sound passes through before it leaves the
+plugin. Open it from the mixer. It has two tabs: MASTER, the chain on the
+finished mix, and DUCKER.
+
+# MASTER
+
+One chain, in order: a high-pass, a low shelf and an air shelf, a bass crossover
+with a weight control, stereo width, glue compression, auto level, drive, and a
+ceiling limiter with an output trim.
+
+AMOUNT is a dry/wet across the whole chain, so you can dial the entire thing in
+and out with one control. Each stage also has its own tick to switch it off on
+its own.
+
+GR shows how much the chain is pulling the level down at any moment.
+
+A / B BYPASS compares the finished sound with the raw one. RESET puts every
+control back to the factory values.
+
+# DUCKER -- why it exists
+
+The band and your right hand share the master bus. Anything on that bus reacts
+to the LOUDEST thing arriving at it, so pushing the style up used to pull your
+melody down with it. That is backwards. The melody is the thing that has to stay
+audible; the band is what should give way.
+
+The ducker makes the band give way, and it does it BEFORE the two are mixed,
+where the band can still be treated on its own.
+
+# How it works
+
+Two points sit on the style. Each one listens to your RIGHT HAND at its own
+frequency, and cuts the band there when you play. Play nothing and the band is
+untouched. Play a line and a window opens exactly where that line lives.
+
+Listening per point is the whole idea. A low melody note moves the low point and
+leaves the high one alone, so the band keeps its brightness while its middle
+gets out of the way. A ducker that listened to everything at once would just
+pump the whole band up and down.
+
+# Setting a point
+
+Drag a point across to choose its frequency and DOWN to say how deep it may cut.
+Down is depth: the further down, the more room it can make.
+
+Depth is a CEILING, not a fixed amount. It says how far the cut is ALLOWED to
+go; the dynamics decide how much of that gets used from one moment to the next.
+
+Each point has five more controls:
+
+- Q is how wide the cut is. Low Q takes a broad swathe, high Q takes a narrow
+  slice.
+- THRESH is how loud your right hand has to be in that band before anything
+  happens.
+- RATIO is how hard it responds once it is over the threshold.
+- ATTACK is how fast the cut arrives. Fast keeps consonants clear; slow is
+  gentler.
+- RELEASE is how fast the band comes back once you stop.
+
+Double-click a point to set its depth back to zero.
+
+# Reading the display
+
+Two marks per point, and they say different things:
+
+- The hollow RING is where you dragged it. That is your ceiling.
+- The filled DOT is the cut being applied RIGHT NOW. At rest it sits at the top
+  and the curve is flat. As you play, it falls toward the ring and the curve
+  opens under it.
+
+That movement is the ducker working. If the dot never leaves the top, nothing is
+ducking.
+
+# The KEY meter
+
+Under each point's name is a KEY bar with a bright tick on it. The bar is how
+much of your right hand that point is actually hearing at its frequency. The
+tick is its threshold.
+
+This is how you find out why a point is not moving, and there are only two
+reasons:
+
+- The bar never reaches the tick. There is not enough of your playing at that
+  frequency. Move the point to where your melody really sits, or lower its
+  THRESHOLD.
+- The bar passes the tick but nothing happens. You have not given the point any
+  depth. Drag it down.
+
+# Getting it right
+
+Start gently. A few dB of depth on one point is usually enough -- the ear
+notices a hole in the band far more readily than it notices the band being
+quieter.
+
+Work with the DUCKER tab open and watch the dots while you play the song you
+actually play. A setting that looks right on a held chord often does nothing on
+a real melody.
+
+The ducker is saved with the set, so different songs can give way in different
+places.
+)TXT") },
+
+    //--------------------------------------------------------------------------
     { "JUMPS", TutorialTab::parse (R"TXT(
 # What jumps decide
 
-Some sections are meant to end somewhere. An intro finishes and something has
-to follow it; a fill runs and then lands. The JUMPS tab is the table of those
+Some sections are meant to end somewhere. An intro finishes and something has to
+follow it; a fill runs and then lands. The JUMPS tab is the table of those
 destinations.
 
-Each row is a source -- the three intros, the four fills, and the break. Each
-column is where it can land. One destination per row, so the table always has
-exactly one answer for every section.
+Each row is a source -- the three intros, the four fills, and the break, eight
+in all. Each column is where it can land. One destination per row, so the table
+always has exactly one answer for every section.
 
 # The defaults, and why they make sense
 
@@ -751,8 +1134,8 @@ table, press SAVE SET, and that style will always arrange itself your way.
     { "CRASH", TutorialTab::parse (R"TXT(
 # Why this tab exists
 
-A crash cymbal is what makes a section change sound intentional. Style files
-do not always place them where a player would, so Grex can add them for you.
+A crash cymbal is what makes a section change sound intentional. Style files do
+not always place them where a player would, so they can be added for you.
 
 # The three triggers
 
@@ -764,16 +1147,17 @@ do not always place them where a player would, so Grex can add them for you.
   variation begins, so a fill in the middle never throws the count off.
 - CRASH NOW is a manual hit, and it works whether or not a style is playing.
 
-An ending deliberately gets no automatic crash: a cymbal there rings on past
-the final chord.
+An ending deliberately gets no automatic crash: a cymbal there rings on past the
+final chord.
 
 # Shaping the hit
 
-- VELOCITY is a fixed weight, so every crash lands the same way. It also
-  chooses which layer of the cymbal sample speaks, so it changes the character
-  of the hit as well as the loudness.
+- VELOCITY is a fixed weight, so every crash lands the same way. It also chooses
+  which layer of the cymbal sample speaks, so it changes the character of the
+  hit as well as the loudness.
 - GAIN is how loud that hit sits in the mix, on the same 0-200 scale as the
-  sound gains, with 100 as unity.
+  sound gains, with 100 as unity. Double-click its handle to set what that unity
+  is worth in dB, without moving the handle.
 - The element buttons choose WHICH cymbals fire, so you can pick a crash, a
   splash or several at once.
 
@@ -786,8 +1170,13 @@ not a property of one style.
 # What a set is
 
 A set is everything about how a style sounds in YOUR hands: the sounds on all
-sixteen channels, the mixer, the jumps table, the style levels, and the global
-options saved with a song.
+sixteen channels, the mixer and its base trims, the jumps table, the style
+levels, ENERGY, the tempo offset, the ducker, and the global options saved with
+a song.
+
+Two things are deliberately NOT in it, because they describe your rig rather
+than a song: the SPLIT POINT and the SOLO VOLUME base unity. Those follow you
+from set to set and are saved on their own.
 
 Every style ships with its own set, and loading a style loads it. This is why
 you did not have to configure anything to get a good sound in QUICK START.
@@ -798,88 +1187,135 @@ The three buttons on the left panel:
 
 - LOAD SET opens a set file.
 - SAVE SET writes the current state, and asks you where.
-- FAST SAVE overwrites the set you are on, with no dialogue. This is the one
-  you will use most: change something, hear that it is better, keep it.
+- FAST SAVE overwrites the set you are on, with no dialogue. This is the one you
+  will use most: change something, hear that it is better, keep it.
 
 The set name is shown underneath so you always know what you are editing.
 
 # COMMENTS
 
-The COMMENTS button opens a free text note saved inside the set. Use it for
-the key a song is in, which variation the chorus wants, or anything else you
-will not remember at the next gig.
+The COMMENTS button opens a free text note saved inside the set. Use it for the
+key a song is in, which variation the chorus wants, or anything else you will
+not remember at the next gig.
 
-# The SET EDITOR tab
+# The SET EDITOR
 
-This is where the loaded style's LEVELS live, and they are the controls that
-want a playing style to judge against:
+The SET EDITOR is a page inside the SETTINGS tab now, alongside CONTROL NOTE MAP
+and the rest. It used to be a tab of its own; it is maintenance rather than
+performance, so it moved in with the other maintenance.
 
-- BOOST is an overall level for the whole band.
-- MAKEUP is the target Grex normalises each section toward, so a quiet style
-  and a loud style arrive at a comparable level.
-- IGNORE STYLE VOLUMES tells Grex to disregard the volumes written inside the
-  style file and use your mixer positions instead. Converted styles are the
-  reason this exists: some of them carry a flat, meaningless mix.
+# BOOST
 
-Changes here are part of the set, so SAVE SET is what keeps them.
+BOOST is the one level control that lives there: an overall gain for the whole
+band, 0 to 100, reaching up to +24 dB on the style bus. The default is 80.
+
+It is the only slider on that panel. FOLLOW PROGRAMMED GAINS is gone, and so are
+MAKEUP and IGNORE STYLE VOLUMES before it. All three existed to referee a fight
+between the style's levels and yours, and that fight no longer happens: the
+style states the base, your fader multiplies it afterwards, and there is nothing
+left to blend between. See the MIXER chapter.
+
+# BAKE MISSING and REBUILD ALL
+
+Two buttons on the same page write the starting point for the eight STYLE SLOTS
+into style sets, worked out from what each style actually asks for.
+
+- BAKE MISSING fills only the sets that have no slot block yet, and never
+  touches one that already has one. This is the everyday button and it is safe
+  to press at any time.
+- REBUILD ALL overwrites the slot block in EVERY set, including ones you tuned
+  by hand. There is no undo.
+
+Either way only the STYLE slots are rewritten. Your solo slots, the mixer, the
+jumps, the crash settings, the style levels and the ducker are left alone. The
+INFO button on the page says all of this again at the moment of doubt.
 )TXT") },
 
     //--------------------------------------------------------------------------
     { "SETTINGS", TutorialTab::parse (R"TXT(
-# Four pages
+# Five pages
 
-The SETTINGS tab holds CONTROL NOTE MAP, MIDI CC CONTROL, REGISTRATION and
-GLOBAL SETTINGS.
+The SETTINGS tab holds CONTROL NOTE MAP, MIDI ASSIGNING, REGISTRATION, GLOBAL
+SETTINGS and SET EDITOR.
+
+# REGISTRATION
+
+The page shows your MACHINE ID -- a number belonging to this computer. Click it
+to copy it, send it to us, and type the serial that comes back into the box
+below. The lamp in the header turns green and the line under it reads
+REGISTERED.
+
+The same lamp is how you check at a glance: green and REGISTERED, or red and NOT
+REGISTERED with a note telling you where to go.
+
+Until a valid serial is entered, Grex runs in demo mode -- it plays normally but
+the audio mutes briefly every few seconds. Everything else works, so you can set
+up a whole rig before registering.
+
+A serial is tied to the machine that asked for it, so a serial from another
+computer will be refused.
 
 # CONTROL NOTE MAP
 
-Grex reserves MIDI notes 0 to 35 as remote controls, so a controller with pads
-or a second keyboard can drive the arranger without you touching the screen.
-Notes 1 to 8 mute and unmute the style elements, 9 to 14 select solo channels,
-15 to 30 fire the sixteen section pads, and 31 to 35 cover play/stop, restart,
-hold, arranger/piano and synced play.
+MIDI notes 0 to 35 are reserved as remote controls, so a controller with pads or
+a second keyboard can drive the arranger without you touching the screen. Notes
+1 to 8 mute and unmute the style elements, 9 to 14 select solo channels, 15 to
+30 fire the sixteen section pads, and 31 to 35 cover play/stop, restart, hold,
+arranger/piano and synced play.
 
 The page is a read-only reference. Print it, or leave the tab open while you
 program your controller.
 
-# MIDI CC CONTROL
+# MIDI ASSIGNING
 
-Five things can be driven by a knob or pedal: MASTER VOLUME, STYLE VOLUME,
-TEMPO, TRANSPOSE and SPLIT POINT.
+Assigning is done by DRAGGING, not by typing, and it happens on the main screen
+rather than on this page.
 
-Press LEARN on a row, move the control you want to use, and it is assigned.
-FORGET clears it. The map is saved with the plugin, not with a set, because it
-belongs to your rig rather than to a song.
+- Move a knob, press a pad, push a pedal. It appears as a chip in the MIDI LINK
+  box on the left panel, which keeps the last six sources newest first.
+- Drag that chip onto any control in the plugin -- or tap it to arm it and then
+  tap the control, which is the easier gesture on a touch screen.
+- A small window opens: PUSH, TOGGLE or KNOB, plus CLEAR and CANCEL. CANCEL puts
+  the previous assignment back, because a drop replaces whatever else owned that
+  source.
 
-# REGISTRATION
+Right double-click any assigned control to open the same window again.
 
-This page shows your MACHINE ID -- a five-digit number unique to the computer
-you are on. Click it to copy it, send it to us, and type the serial you get
-back into the box.
+A source drives exactly one control. Assigning one that is already in use frees
+the older owner rather than leaving two things fighting over it.
 
-Until Grex is registered it goes briefly silent at regular intervals, so you
-can hear everything and evaluate it properly, but not perform with it.
+This page itself holds the housekeeping: SAVE and LOAD for named map files, and
+UNLEARN ALL, which puts every assignment back to the factory control-note map
+after asking first. Maps are also saved automatically, so twenty minutes of
+mapping is never lost to a closed window.
 
 # GLOBAL SETTINGS
 
-Three trigger buttons open the global features, each in its own window:
+Two buttons and two settings.
 
-- FUNKEY MODE: one effects chain per instrument family, applied everywhere.
-- BIG DRUMS: one effects chain for the whole kit.
-- STYLE LEVELS: the level tools described in the SETS chapter.
+- FUNKEY MODE opens the macro editor -- the six instrument families, each with
+  its own wah and phaser. See the SOUNDS chapter. The button here only OPENS the
+  editor; the switch that engages the macro is on the play-control row.
+- RESET SOLO BASE GAIN sets the base gain of every solo instrument back to 0 dB
+  and saves every .ins file. It asks first, and there is no undo.
+- PITCH BEND RANGE sets how far the wheel bends your solo instruments, from 1 to
+  12 semitones.
+- LOW VELOCITY RESPONSE lifts your softest playing on the solo channels, 0 to
+  100, where 0 is off. It is a correction for a keyboard that plays light, not a
+  voicing, which is why it sits here and not in the sound editor.
 
-Also here:
-
-- PITCH BEND RANGE sets how far the wheel bends your solo instruments, from 1
-  to 12 semitones.
-- BYPASS INSTRUMENT CHAIN skips every channel's filter and post-mix effects so
-  you hear the raw instrument. It is a listening tool for calibration, not a
-  performance setting.
+Both settings apply to the RIGHT HAND only, and both belong to your rig rather
+than to a song.
 
 # Where things are saved
 
 - Set files hold everything that belongs to a SONG.
-- The CC map, the crash settings, the global macros and your registration
+- The split point, the solo base unity, the pitch bend range, the low velocity
+  response, the MIDI assignments, the crash settings and the global macros
   belong to the RIG, and are saved once for the whole plugin.
 )TXT") },
 };
+
+
+
+

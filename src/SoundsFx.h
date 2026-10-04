@@ -1,3 +1,4 @@
+
 #pragma once
 //==============================================================================
 // SoundsFx.h  —  Sounds-path insert effects for the Grex sampler.
@@ -22,6 +23,8 @@
 //==============================================================================
 
 #include <JuceHeader.h>
+#include "SweetenerFx.h"
+#include "ChorusConvolver.h"
 #include <cmath>
 #include <algorithm>
 #include <vector>
@@ -466,6 +469,236 @@ namespace Betel
     };
 
     //==========================================================================
+    //  EarlyReflectionsFx — THE ROOM, WITHOUT THE TAIL.
+    //
+    //  A fixed pattern of delay taps in the first ~30 ms, no feedback, no
+    //  recirculation.  That is the whole thing.
+    //
+    //  ── WHY AN ARRANGER WANTS THIS AND NOT MORE REVERB ───────────────────────
+    //
+    //  The FDN starts its tail immediately and has no early structure, so the
+    //  only way to make the band sound like it is IN a room is to turn the tail
+    //  up — and sixteen simultaneous parts through a rising tail is mud.  That
+    //  is why arranger reverbs tend to sound either dry or soupy with nothing
+    //  useful in between.
+    //
+    //  Early reflections are the part of "room" that carries the spatial
+    //  impression, and they cost no decay time at all.  Dial ER up with the tail
+    //  low and the kit is placed in a space rather than washed in one.
+    //
+    //  ── WHY IT IS NOT A CHEAP AMBIENT-DRUMS SUBSTITUTE, AND WHY IT IS STILL
+    //     THE RIGHT ANSWER HERE ───────────────────────────────────────────────
+    //
+    //  Yamaha's Ambient Drums are not reverb: the kits are sampled twice, close
+    //  and room, and the control blends two RECORDINGS.  No tap pattern
+    //  reconstructs the bleed between drums or the way a room answers a kick
+    //  differently from a hi-hat, because that information is not in a close-mic
+    //  sample.  Re-sampling is off the table, so this models the part that CAN
+    //  be modelled — the first 20-40 ms — and leaves the rest alone.
+    //
+    //  ── THE THREE THINGS THAT DECIDE WHETHER IT SOUNDS LIKE A ROOM ───────────
+    //
+    //  1. NON-UNIFORM SPACING.  Evenly spaced taps are a comb filter and sound
+    //     metallic.  The gaps below shrink from ~1.5 ms to ~0.8 ms across the
+    //     pattern, which is also what a real room does: reflections arrive
+    //     sparsely at first and get denser as later-order paths pile in.
+    //
+    //  2. POLARITY FLIPS.  Real boundaries invert some reflections.  Without the
+    //     sign pattern the taps sum coherently at low frequencies and the result
+    //     is a boxy resonance rather than a room.
+    //
+    //  3. DIFFERENT TAPS LEFT AND RIGHT.  The asymmetry IS the width — the two
+    //     patterns below never share a tap time.  A symmetric pattern is a mono
+    //     room played through two speakers.
+    //
+    //  ── LINEAR INTERPOLATION HERE, CUBIC IN DelayLine, AND THAT IS DELIBERATE
+    //
+    //  DelayLine::read uses 4-point Hermite because its own comment explains
+    //  what linear interpolation costs in a RECIRCULATING line: the frac-
+    //  dependent HF droop compounds on every pass around the FDN loop and is
+    //  heard as tremolo.  Nothing recirculates here — every tap is read exactly
+    //  once — so nothing compounds.  What is left is a fixed, mild HF loss on
+    //  each reflection, which is what an absorbing wall does anyway.  Forty
+    //  cubic reads per sample per section would be real CPU spent to avoid an
+    //  artefact that is physically correct.
+    //==========================================================================
+    struct EarlyReflectionsFx
+    {
+        static constexpr int kTaps = 20;
+
+        // Tap times in ms at ER SIZE = 50, scaled by kSizeMin..(kSizeMin+kSizeSpan).
+        static constexpr float kTapMsL[kTaps] = {
+             3.7f,  5.2f,  7.1f,  8.6f, 10.4f, 11.9f, 13.3f, 14.9f, 16.2f, 17.5f,
+            18.9f, 20.1f, 21.4f, 22.5f, 23.6f, 24.6f, 25.6f, 26.5f, 27.4f, 28.2f };
+
+        static constexpr float kTapMsR[kTaps] = {
+             4.4f,  6.3f,  8.2f,  9.9f, 11.5f, 12.9f, 14.4f, 15.8f, 17.1f, 18.4f,
+            19.6f, 20.8f, 21.9f, 23.0f, 24.0f, 25.0f, 25.9f, 26.8f, 27.6f, 28.4f };
+
+        static constexpr float kSignL[kTaps] = {
+             1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,
+            -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f };
+
+        static constexpr float kSignR[kTaps] = {
+             1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,
+             1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f };
+
+        static constexpr float kDecayMs   = 14.0f;   // tap amplitude envelope
+        static constexpr float kSizeMin   = 0.35f;   // ER SIZE 0   -> 1.3 .. 10 ms
+        static constexpr float kSizeSpan  = 1.15f;   // ER SIZE 100 -> 5.5 .. 43 ms
+        static constexpr float kMaxTapMs  = 45.0f;   // buffer must cover the longest
+        static constexpr float kHpHz      = 120.0f;  // stops the pattern going boxy
+        static constexpr float kDampMinHz = 3000.0f;
+        static constexpr float kDampMaxHz = 18000.0f;
+        static constexpr float kSlewMs    = 60.0f;   // ER SIZE moves, never jumps
+        static constexpr float kGain      = 1.0f;    // THE calibration constant
+
+        void prepare (double sr)
+        {
+            sampleRate = (sr > 0.0) ? sr : 44100.0;
+
+            const int need = (int) (kMaxTapMs * 0.001 * sampleRate) + 8;
+            int n = 1; while (n < need + 4) n <<= 1;
+            bufL.assign ((size_t) n, 0.0f);
+            bufR.assign ((size_t) n, 0.0f);
+            mask = n - 1;
+
+            // Amplitudes from one exponential, then NORMALISED TO UNIT ENERGY so
+            // the pattern can be retuned by ear without the level moving under
+            // it.  kGain is the only thing that sets how loud ER is against the
+            // tail, which is what makes it the one number worth touching.
+            float eL = 0.0f, eR = 0.0f;
+            for (int k = 0; k < kTaps; ++k)
+            {
+                gainL[k] = kSignL[k] * std::exp (-kTapMsL[k] / kDecayMs);
+                gainR[k] = kSignR[k] * std::exp (-kTapMsR[k] / kDecayMs);
+                eL += gainL[k] * gainL[k];
+                eR += gainR[k] * gainR[k];
+                sampL[k] = kTapMsL[k] * 0.001f * (float) sampleRate;
+                sampR[k] = kTapMsR[k] * 0.001f * (float) sampleRate;
+            }
+            const float nrmL = (eL > 0.0f) ? (kGain / std::sqrt (eL)) : 0.0f;
+            const float nrmR = (eR > 0.0f) ? (kGain / std::sqrt (eR)) : 0.0f;
+            for (int k = 0; k < kTaps; ++k) { gainL[k] *= nrmL; gainR[k] *= nrmR; }
+
+            slewCoef = 1.0f - std::exp (-1.0f / juce::jmax (1.0f,
+                                        (float) (sampleRate * kSlewMs * 0.001)));
+            hpCoef   = std::exp (-kTwoPi * kHpHz / (float) sampleRate);
+
+            reset();
+        }
+
+        void reset()
+        {
+            clearLines();
+            idleRun     = true;
+            scaleTarget = 1.0f;
+            lpCoef      = 0.0f;
+        }
+
+        /** Block-rate setup.  Call ONLY on blocks where tick() will run.
+
+            A first block after idling clears the lines rather than resuming
+            them: the taps are fed from the send, so an ER switched off for a
+            minute and back on again would otherwise replay a burst of whatever
+            was playing when it stopped. */
+        void beginBlock (float size01, float damp01) noexcept
+        {
+            if (idleRun)
+            {
+                clearLines();
+                scaleCur = -1.0f;      // jump to the wanted size, do not slew to it
+                idleRun  = false;
+            }
+
+            scaleTarget = kSizeMin + kSizeSpan * juce::jlimit (0.0f, 1.0f, size01);
+            if (scaleCur < 0.0f) scaleCur = scaleTarget;
+
+            // Wall absorption rides the reverb's own DAMP, so a dark hall gets a
+            // dark room in front of it without a second control asking the same
+            // question twice.
+            const float d  = juce::jlimit (0.0f, 1.0f, damp01);
+            const float hz = kDampMinHz + (kDampMaxHz - kDampMinHz) * (1.0f - d) * (1.0f - d);
+            lpCoef = std::exp (-kTwoPi * juce::jlimit (200.0f, 20000.0f, hz)
+                               / (float) sampleRate);
+        }
+
+        /** Not running this block. */
+        void goIdle() noexcept { idleRun = true; }
+
+        void tick (float inL, float inR, float& outL, float& outR) noexcept
+        {
+            if (mask == 0) { outL = outR = 0.0f; return; }
+
+            bufL[(size_t) w] = inL;
+            bufR[(size_t) w] = inR;
+            w = (w + 1) & mask;
+
+            scaleCur += (scaleTarget - scaleCur) * slewCoef;
+
+            float aL = 0.0f, aR = 0.0f;
+            for (int k = 0; k < kTaps; ++k)
+            {
+                aL += gainL[k] * readLin (bufL.data(), sampL[k] * scaleCur);
+                aR += gainR[k] * readLin (bufR.data(), sampR[k] * scaleCur);
+            }
+
+            lpL = (1.0f - lpCoef) * aL  + lpCoef * lpL;
+            lpR = (1.0f - lpCoef) * aR  + lpCoef * lpR;
+            hpL = (1.0f - hpCoef) * lpL + hpCoef * hpL;
+            hpR = (1.0f - hpCoef) * lpR + hpCoef * hpR;
+
+            // FLUSH, NOT A DC OFFSET.  Four one-poles left running on silence
+            // decay into denormals and stay there, and a denormal multiply costs
+            // real cycles on x86 unless the host happens to have set FTZ.  The
+            // FDN answers this by adding kAntiDenorm on its delay writes, which
+            // works there because a delay line has no DC path; doing the same to
+            // a one-pole would park a constant offset in its state instead.  A
+            // compare against a threshold far below anything audible is exact.
+            constexpr float kFlush = 1.0e-25f;
+            if (std::fabs (lpL) < kFlush) lpL = 0.0f;
+            if (std::fabs (lpR) < kFlush) lpR = 0.0f;
+            if (std::fabs (hpL) < kFlush) hpL = 0.0f;
+            if (std::fabs (hpR) < kFlush) hpR = 0.0f;
+
+            outL = lpL - hpL;
+            outR = lpR - hpR;
+        }
+
+        // ── state ────────────────────────────────────────────────────────────
+        std::vector<float> bufL, bufR;
+        int    mask = 0, w = 0;
+        double sampleRate = 44100.0;
+
+        float gainL[kTaps] {}, gainR[kTaps] {};
+        float sampL[kTaps] {}, sampR[kTaps] {};
+
+        float scaleCur = -1.0f, scaleTarget = 1.0f, slewCoef = 0.0f;
+        float lpCoef = 0.0f, hpCoef = 0.0f;
+        float lpL = 0.0f, lpR = 0.0f, hpL = 0.0f, hpR = 0.0f;
+        bool  idleRun = true;
+
+    private:
+        void clearLines() noexcept
+        {
+            std::fill (bufL.begin(), bufL.end(), 0.0f);
+            std::fill (bufR.begin(), bufR.end(), 0.0f);
+            w   = 0;
+            lpL = lpR = hpL = hpR = 0.0f;
+        }
+
+        float readLin (const float* buf, float delaySamples) const noexcept
+        {
+            const float fIdx = (float) w - delaySamples;
+            const int   i0   = ((int) std::floor (fIdx)) & mask;
+            const float frac = fIdx - std::floor (fIdx);
+            const float y0   = buf[(size_t) i0];
+            const float y1   = buf[(size_t) ((i0 + 1) & mask)];
+            return y0 + (y1 - y0) * frac;
+        }
+    };
+
+    //==========================================================================
     //  ReverbFx — two serious algorithms behind one drop-in API.
     //
     //    ALGO 0 — HALL / ROOM   (Feedback Delay Network)
@@ -609,7 +842,18 @@ namespace Betel
         }
 
         //======================================================================
-        void prepare (double sr)
+        /** `withEarlyReflections` decides whether the ER stage gets its buffers.
+
+            OFF BY DEFAULT, AND THAT IS THE POINT.  ReverbFx is held by value on
+            every Channel and every drum FX bus - fifty-odd instances - and the
+            ER lines are ~64 KB a pair at 96 kHz.  Only the two SECTION racks can
+            ever reach a non-zero erMix, so only they ask for them; everywhere
+            else the stage stays unallocated and tick() is unreachable anyway.
+
+            An unprepared ER is inert rather than dangerous: mask stays 0 and
+            tick() returns silence, so a future caller that passes an erMix
+            without asking for the buffers gets no ER, not a crash. */
+        void prepare (double sr, bool withEarlyReflections = false)
         {
             sampleRate = (sr > 0.0) ? sr : 44100.0;
             const float fs = (float) sampleRate;
@@ -618,6 +862,11 @@ namespace Betel
             const int maxPre = (int) (sampleRate * 0.200) + 8;
             preL.prepare (maxPre);
             preR.prepare (maxPre);
+
+            // EARLY REFLECTIONS.  Deliberately NOT behind the pre-delay: the
+            // hall gives the tail a 25 ms floor so the dry stays clear, and the
+            // whole point of a reflection is that it is the FIRST thing back.
+            if (withEarlyReflections) er.prepare (sampleRate);
 
             // ── HALL/ROOM: diffuser ─────────────────────────────────────────
             // Stage ranges double (6/12/24/48 ms).  Each channel owns its own
@@ -695,6 +944,7 @@ namespace Betel
         void reset()
         {
             preL.reset(); preR.reset();
+            er.reset();
             preCur    = 0.0f;
             preXfade  = 1.0f;
             primed    = false;
@@ -737,7 +987,8 @@ namespace Betel
         void process (float* L, float* R, int n,
                       float size01, float damp01, float mix01, float predelay01, double sr,
                       float dry01 = 1.0f, float tail01 = -1.0f,
-                      float hp01 = -1.0f, float lp01 = 1.0f)
+                      float hp01 = -1.0f, float lp01 = 1.0f,
+                      float erMix01 = 0.0f, float erSize01 = 0.5f)
         {
             juce::ignoreUnused (sr);
             if (n <= 0) return;
@@ -819,7 +1070,8 @@ namespace Betel
             // should go, because unreachable code that reads as live is exactly
             // the trap this codebase keeps setting for itself.
             juce::ignoreUnused (algo);
-            processFdn (L, R, n, size, damp, mix, dry, tail01, hp01, lp01);
+            processFdn (L, R, n, size, damp, mix, dry, tail01, hp01, lp01,
+                        erMix01, erSize01);
         }
 
     private:
@@ -828,13 +1080,29 @@ namespace Betel
         //======================================================================
         void processFdn (float* L, float* R, int n, float size, float damp, float mix,
                          float dry = 1.0f, float tail = -1.0f,
-                         float hp01 = -1.0f, float lp01 = 1.0f)
+                         float hp01 = -1.0f, float lp01 = 1.0f,
+                         float erMix01 = 0.0f, float erSize01 = 0.5f)
         {
             // TAIL < 0 means "no tail control supplied" - fall back to the old
             // behaviour where SIZE drove the decay, so nothing that calls the
             // short form changes character.
             if (tail < 0.0f) tail = size;
             const float fs = (float) sampleRate;
+
+            // ── EARLY REFLECTIONS: AN EQUAL-POWER BALANCE, NOT AN EXTRA SEND ──
+            //
+            // ER and TAIL share the one send.  At erMix 0 the balance is exactly
+            // today's sound - erAmt 0, tailAmt 1, and tick() is never called -
+            // which is what lets this ship without re-voicing a library that is
+            // already tuned.  Sine/cosine rather than a linear pair so sweeping
+            // the control does not dip through the middle.
+            const float erB     = juce::jlimit (0.0f, 1.0f, erMix01);
+            const bool  erOn    = (erB > 0.0005f);
+            const float erAmt   = erOn ? std::sin (erB * 1.5707963f) : 0.0f;
+            const float tailAmt = erOn ? std::cos (erB * 1.5707963f) : 1.0f;
+
+            if (erOn) er.beginBlock (erSize01, damp);
+            else      er.goIdle();
 
             // size scales the geometry AND the decay together.
             const float minMs = 13.0f + 32.0f * size;               // 13 -> 45 ms
@@ -1093,8 +1361,18 @@ namespace Betel
                 // reaching for a bigger tail necessarily removed the source —
                 // the exact opposite of a hall, where the dry is untouched and
                 // the space sits behind it.  MIX is now a send level.
-                L[i] = inL * dry + wetL * mix;
-                R[i] = inR * dry + wetR * mix;
+                // ER IS FED FROM THE RAW SEND, not from dL/dR.  Those are
+                // post-pre-delay and post the tank's own send filter; a
+                // reflection that arrives after the 25 ms hall floor is not an
+                // early reflection, and the send high-pass exists to stop low
+                // energy ACCUMULATING in the loop - which is a problem ER,
+                // having no feedback, does not have.  It carries its own fixed
+                // low cut instead.
+                float erL = 0.0f, erR = 0.0f;
+                if (erOn) er.tick (inL, inR, erL, erR);
+
+                L[i] = inL * dry + (wetL * tailAmt + erL * erAmt) * mix;
+                R[i] = inR * dry + (wetR * tailAmt + erR * erAmt) * mix;
             }
         }
 
@@ -1246,6 +1524,8 @@ namespace Betel
         float     fdnLp[kN] {},     fdnHp[kN] {};
         // Hall send high-pass state (one per output channel) — keeps low
         // energy out of the tank.  See kHallSendHpHz.
+        EarlyReflectionsFx er;
+
         float     sendHpL = 0.0f,   sendHpR = 0.0f;
         float     sendLpL = 0.0f,   sendLpR = 0.0f;
         float     lfoPhase[kN] {},  lfoInc[kN] {};
@@ -1271,20 +1551,63 @@ namespace Betel
     //==========================================================================
     struct StereoDelayFx
     {
+        //======================================================================
+        // WHAT WAS WRONG WITH THIS, AND WHY IT SOUNDED "MOODY AND FILTERED"
+        //
+        // 1. THE OUTPUT TAP WAS NOT DAMPED.  The 5 kHz one-pole was applied to
+        //    what went BACK INTO the line, but the output read the line raw.  So
+        //    repeat 1 came out bright and undamped, repeat 2 had been filtered
+        //    once, repeat 3 twice.  The tail did not darken evenly - it started
+        //    matching the source and then collapsed, which is heard as murk
+        //    rather than as warmth.  Both now read the same damped signal, so
+        //    every repeat has the same tone and only the LEVEL decays.
+        //
+        // 2. THE 5 kHz WAS HARD-CODED at prepare and never exposed, so a bright
+        //    delay was not reachable at all.  It is a parameter now, and its
+        //    default is 5 kHz so nothing that exists changes.
+        //
+        // 3. THE DELAY TIME WAS NOT SMOOTHED.  delaySamples arrived straight
+        //    from beats x 60/bpm x sr, so a tempo change or a division change
+        //    moved the read pointer instantly - a click, and none of the pitch
+        //    bend that makes a swept delay sound alive.  It is slewed now.
+        //
+        // ALSO NEW: a high-pass in the loop.  Defaulted OPEN so it is a no-op
+        // until asked for, but it is the single most useful control here - low
+        // energy is what makes repeats crowd the source instead of sitting
+        // behind it, and no amount of the low-pass fixes that.
+        //======================================================================
         double    sampleRate = 44100.0;
         DelayLine lineL, lineR;
         OnePoleLP dampL, dampR;
+
+        // Feedback high-pass, one pole per side, held as running state because a
+        // one-pole HP is "input minus its own low-passed self".
+        float     hpStateL = 0.0f, hpStateR = 0.0f;
+
+        // Slewed delay time.  -1 means "not started": the first block jumps to
+        // the wanted time rather than sliding up from zero, which would be an
+        // audible swoop every time the plugin loads.
+        float     delayCur = -1.0f;
 
         void prepare (double sr)
         {
             sampleRate = sr;
             const int maxSamples = (int) (sr * 2.5);   // 2.5 s max
             lineL.prepare (maxSamples); lineR.prepare (maxSamples);
-            dampL.prepare (sr); dampL.setCutoff (5000.0f);
-            dampR.prepare (sr); dampR.setCutoff (5000.0f);
+            dampL.prepare (sr); dampL.setCutoff (kDefaultDampHz);
+            dampR.prepare (sr); dampR.setCutoff (kDefaultDampHz);
             reset();
         }
-        void reset() { lineL.reset(); lineR.reset(); dampL.reset(); dampR.reset(); }
+        void reset()
+        {
+            lineL.reset(); lineR.reset(); dampL.reset(); dampR.reset();
+            hpStateL = hpStateR = 0.0f;
+            delayCur = -1.0f;
+        }
+
+        static constexpr float kDefaultDampHz   = 5000.0f;  // what it always was
+        static constexpr float kDefaultHpHz     = 20.0f;    // open = no-op
+        static constexpr float kDefaultSmoothMs = 40.0f;
 
         // dry01 IS INDEPENDENT OF mix01 - it is not 1-mix any more.
         //
@@ -1296,30 +1619,343 @@ namespace Betel
         //
         // Defaulted to 1.0 so any caller that has not been updated gets the
         // source untouched, which is the sane end of the range.
+        /** dampHz / hpHz / smoothMs default to what the delay always did, so a
+            caller that has not been updated is bit-for-bit unchanged apart from
+            the two fixes above - which are corrections, not options. */
         void process (float* L, float* R, int n,
                       float delaySamples, float fb01, float mix01, double sr,
-                      float dry01 = 1.0f)
+                      float dry01   = 1.0f,
+                      float dampHz  = kDefaultDampHz,
+                      float hpHz    = kDefaultHpHz,
+                      float smoothMs = kDefaultSmoothMs)
         {
             juce::ignoreUnused (sr);
-            const float delS     = juce::jlimit (1.0f, (float) (sampleRate * 2.4), delaySamples);
-            const float feedback = juce::jlimit (0.0f, 0.95f, fb01);
-            const float mixP     = juce::jlimit (0.0f, 1.0f, mix01);
-            const float dryP     = juce::jlimit (0.0f, 1.0f, dry01);
+            const float delTarget = juce::jlimit (1.0f, (float) (sampleRate * 2.4), delaySamples);
+            const float feedback  = juce::jlimit (0.0f, 0.95f, fb01);
+            const float mixP      = juce::jlimit (0.0f, 1.0f, mix01);
+            const float dryP      = juce::jlimit (0.0f, 1.0f, dry01);
+
+            dampL.setCutoff (juce::jlimit (200.0f, 20000.0f, dampHz));
+            dampR.setCutoff (juce::jlimit (200.0f, 20000.0f, dampHz));
+
+            const float hpCoef = std::exp (-kTwoPi * juce::jlimit (20.0f, 2000.0f, hpHz)
+                                           / (float) sampleRate);
+
+            // Per-sample slew, so a tempo change slides rather than jumps - and
+            // slides with the pitch bend a moving tape head gives, which is most
+            // of what a swept delay is for.
+            const float slew = 1.0f - std::exp (-1.0f / juce::jmax (1.0f,
+                                    (float) (sampleRate * juce::jlimit (1.0f, 500.0f, smoothMs)
+                                             * 0.001)));
+            if (delayCur < 0.0f) delayCur = delTarget;
 
             for (int i = 0; i < n; ++i)
             {
                 const float inL = L[i], inR = R[i];
-                const float dL = lineL.read (delS);
-                const float dR = lineR.read (delS);
-                const float dampedL = dampL.processL (dR);   // ping-pong cross-feedback
-                const float dampedR = dampR.processR (dL);
-                lineL.write (inL + dampedL * feedback);
-                lineR.write (inR + dampedR * feedback);
-                L[i] = inL * dryP + dL * mixP;
-                R[i] = inR * dryP + dR * mixP;
+
+                delayCur += (delTarget - delayCur) * slew;
+
+                const float rawL = lineL.read (delayCur);
+                const float rawR = lineR.read (delayCur);
+
+                // ONE FILTERED SIGNAL, USED FOR BOTH the output and the
+                // feedback.  Reading the line raw for the output was the bug -
+                // see the note at the top.
+                const float lpL = dampL.processL (rawL);
+                const float lpR = dampR.processR (rawR);
+
+                hpStateL = (1.0f - hpCoef) * lpL + hpCoef * hpStateL;
+                hpStateR = (1.0f - hpCoef) * lpR + hpCoef * hpStateR;
+
+                const float wetL = lpL - hpStateL;
+                const float wetR = lpR - hpStateR;
+
+                // The cross is in the FEEDBACK only - each side hears its own
+                // input delayed, then the other side's tail underneath it.
+                lineL.write (inL + wetR * feedback);
+                lineR.write (inR + wetL * feedback);
+
+                L[i] = inL * dryP + wetL * mixP;
+                R[i] = inR * dryP + wetR * mixP;
             }
         }
     };
+    // NOTE ON PLACEMENT: this sits AFTER the effects it contains BY VALUE, so
+    // they are complete types by the time the compiler reads these members.
+    // Declared above StereoDelayFx it failed with "unknown override specifier"
+    // on `StereoDelayFx delay;` — MSVC's way of saying the name meant nothing yet.
+
+    //==========================================================================
+    //  SectionSendFx — THE THREE GLOBAL SEND EFFECTS FOR ONE SECTION.
+    //
+    //  Chorus, reverb and delay, one instance of each, shared by every channel
+    //  in the section and fed by per-channel sends.  Two of these exist: LEFT
+    //  (the 16 style channels, drums and perc) and RIGHT (the 8 solo channels).
+    //  Six effects in total, where the insert model needed up to seventy-two.
+    //  Wah, phaser and sweetener are per-instrument INSERTS - see below.
+    //
+    //  ── WHAT IS *NOT* HERE, AND WHY ──────────────────────────────────────────
+    //
+    //  EQ and PAN stay on the channel.  They are corrective and per-instrument:
+    //  a shared EQ would mean tilting one voice tilts all sixteen, and a shared
+    //  pan is a contradiction in terms.  Drums additionally keep their own EQ,
+    //  saturation and compressor in DrumFxBus, for the same reason.
+    //
+    //  ── PARALLEL BUSES, AND NOTHING ELSE ─────────────────────────────────────
+    //
+    //      channel x send[n] ──► [ effect n ] ──► section bus
+    //
+    //  Each effect gets its own send and reaches the bus on its own.  No effect
+    //  feeds another.
+    //
+    //  THE DELAY USED TO FEED THE REVERB AS WELL, AND IT IS CUT.  The idea was
+    //  that repeats should sit in the same space as the source; what it actually
+    //  did was hand every discrete tap to a reverb that spreads it over hundreds
+    //  of milliseconds.  A tail carries far more integrated energy than the tap
+    //  that caused it, so the repeats stopped reading as repeats and the whole
+    //  effect was heard as a space - reported as "the repeats are barely
+    //  noticeable, it sounds more like space reverb".
+    //
+    //  If repeats in a room are wanted, the instrument already has the control
+    //  for it: send to BOTH the delay and the reverb.  That is one slider the
+    //  player can see and set per instrument, where the chain was a fixed amount
+    //  nothing on screen could reach.
+    //
+    //  ── EVERY EFFECT RUNS WET-ONLY ───────────────────────────────────────────
+    //
+    //  mix = 1 and dry = 0 throughout.  Each channel's dry reaches the bus by
+    //  its own route, so any dry returned here would be heard twice.  That is
+    //  the practical difference from the inserts these replace: raising a send
+    //  can only ever add, where raising an insert's wet took the dry away.
+    //
+    //  Sweetener is the one worth checking by ear after the change.  It is a
+    //  shaper rather than a parallel effect — but its own `mix` is documented as
+    //  a parallel blend of the whole block, so wet-only is what it was already
+    //  doing internally at mix = 1.
+    //==========================================================================
+    struct SectionSendFx
+    {
+        // THREE SLOTS, NOT SIX.  Wah, phaser and sweetener went back to being
+        // per-instrument INSERTS — see the note below — leaving only the three
+        // effects that genuinely work in parallel.
+        enum Slot { kChorus = 0, kReverb, kDelay, kNumSlots };
+
+        // ── WHY ONLY THREE ───────────────────────────────────────────────────
+        //
+        // A send takes a COPY, processes it, and adds it to the untouched dry.
+        // That is right for anything which produces something that did not
+        // exist before — a repeat, a tail, an ensemble.
+        //
+        // It is wrong for a SHAPER, whose output REPLACES the signal:
+        //
+        //   sweetener  a dynamics stage; dry + processed is roughly double
+        //   wah        a sweeping bandpass; in parallel you hear the dry with a
+        //              bump on it, not a wah
+        //   phaser     its notches only exist against its OWN dry, so in
+        //              parallel it is an allpass and spectrally flat
+        //
+        // Those three are inserts on the channel again, ahead of these sends,
+        // where they also get per-instrument SETTINGS — one wah rate for a whole
+        // hand was the other thing a shared rack could not give.
+        //
+        static const char* slotName (int s) noexcept
+        {
+            switch (s)
+            {
+                case kChorus:  return "chorus";
+                case kReverb:  return "reverb";
+                case kDelay:   return "delay";
+                default:       return "?";
+            }
+        }
+
+        //── per-effect enables ────────────────────────────────────────────────
+        // ALL THREE DEFAULT ON, and the reason is the send in front of each.
+        //
+        // A bus costs nothing while nothing is sent to it — every effect below
+        // returns early on a silent send — so "enabled" here is not "audible",
+        // it is "reachable".  What decides audibility is the per-instrument
+        // send, and each of the three migrates from a field the slot already
+        // carried: chorusMix, reverbWet and delayWet.
+        //
+        // Four of them used to default OFF, on the reasoning that an unasked-for
+        // effect is obvious where an absent one is not.  That was backwards in
+        // practice: it meant a slot whose author had dialled a wah arrived with
+        // a live send pointing at a bus that would not run, so the effect was
+        // silently missing with nothing on screen to explain it.  THE SWEETENER
+        // WAS WORSE — nothing outside the GLOBAL EFFECTS window ever set its
+        // enable at all, so it could not be heard by any route.
+        std::atomic<bool>  enabled [kNumSlots] { {true},  {true},  {true}  };
+        std::atomic<float> level   [kNumSlots] { {1.0f},  {1.0f},  {1.0f}  };
+
+        //── chorus (juce::dsp::Chorus, Juno-style pair — see ChorusConvolver.h)
+        //
+        // Defaults are the classic recipe, dialled to be OBVIOUS rather than
+        // tasteful: a chorus you cannot hear is indistinguishable from one that
+        // is broken, and this one has been mistaken for broken twice.  Pull the
+        // depth back once you can hear it working.
+        std::atomic<float> chorusRateHz  { 0.8f };    // 0.3-2 Hz is the useful band
+        std::atomic<float> chorusDepth   { 0.45f };   // JUCE says "low"; 0.45 is audible
+        std::atomic<float> chorusCentreMs{ 7.5f };    // 7-8 ms, JUCE's stated classic range
+
+        //── reverb ────────────────────────────────────────────────────────────
+        std::atomic<float> reverbSize    { 0.5f };
+        std::atomic<float> reverbDamp    { 0.5f };
+        std::atomic<float> reverbTail    { 0.5f };
+        std::atomic<float> reverbPreDelay{ 0.0f };
+        std::atomic<float> reverbHpNorm  { 0.0f };
+        std::atomic<float> reverbLpNorm  { 1.0f };
+
+        // EARLY REFLECTIONS.  BOTH DEFAULT TO A NO-OP ON PURPOSE: erMix 0 is
+        // bit-for-bit the reverb that shipped, so no existing set, style or
+        // calibration moves when this arrives.  A set written before the feature
+        // simply does not carry the properties and gets these values, which is
+        // the same "absent means unchanged" rule the rest of the block follows.
+        std::atomic<float> reverbErMix  { 0.0f };
+        std::atomic<float> reverbErSize { 0.5f };
+
+        std::atomic<int>   reverbAlgo    { 0 };
+
+        //── delay ─────────────────────────────────────────────────────────────
+        // 0.45, NOT 0.35.  At 0.35 the taps run 1.00 / 0.35 / 0.12 / 0.04 - one
+        // clear repeat and then nothing, which reads as a slapback rather than a
+        // delay.  0.45 gives 1.00 / 0.45 / 0.20 / 0.09 / 0.04, about four
+        // audible repeats, which is what a ballad delay is for.
+        //
+        // A DEFAULT ONLY.  delayFeedback is saved per set (Main.h), so an
+        // existing set keeps whatever it stored; the FB slider on the delay page
+        // is how that gets changed.
+        std::atomic<float> delayFeedback { 0.45f };
+        std::atomic<float> delayDampHz   { StereoDelayFx::kDefaultDampHz };
+        std::atomic<float> delayHpHz     { StereoDelayFx::kDefaultHpHz };
+        std::atomic<float> delaySmoothMs { StereoDelayFx::kDefaultSmoothMs };
+        std::atomic<int>   delayTimeSig  { 0 };
+        std::atomic<int>   delayDiv      { 2 };
+
+        void prepare (double sr, int blockSize)
+        {
+            sampleRate = sr;
+
+            chorus.prepare (sr, blockSize);
+            reverb.prepare (sr, true);      // the one place ER is reachable
+            delay .prepare (sr);
+
+            for (auto& b : sends)
+                b.setSize (2, juce::jmax (1, blockSize), false, true, true);
+
+            reset();
+        }
+
+        void reset()
+        {
+            chorus.reset(); reverb.reset(); delay.reset();
+            for (auto& b : sends) b.clear();
+        }
+
+        /** The buffer channels add their send into.  Cleared by clearSends()
+            once per block, before any channel renders. */
+        juce::AudioBuffer<float>& sendBuffer (int slot) noexcept
+        {
+            return sends[(size_t) juce::jlimit (0, kNumSlots - 1, slot)];
+        }
+
+        void clearSends (int numSamples)
+        {
+            for (auto& b : sends)
+            {
+                if (b.getNumSamples() < numSamples)
+                    b.setSize (2, numSamples, false, false, true);
+
+                b.clear (0, 0, numSamples);
+                b.clear (1, 0, numSamples);
+            }
+        }
+
+        /** Runs every enabled effect on its own send and adds the wet into
+            `busOut`, which already holds the section's dry mix. */
+        void process (juce::AudioBuffer<float>& busOut, int numSamples, double hostBPM)
+        {
+            if (numSamples <= 0 || busOut.getNumChannels() < 2) return;
+
+            auto ptrs = [numSamples] (juce::AudioBuffer<float>& b, float*& L, float*& R)
+            {
+                juce::ignoreUnused (numSamples);
+                L = b.getWritePointer (0);
+                R = b.getNumChannels() > 1 ? b.getWritePointer (1) : L;
+            };
+
+            auto addWet = [&] (int slot)
+            {
+                const float lvl = level[(size_t) slot].load();
+                busOut.addFrom (0, 0, sends[(size_t) slot], 0, 0, numSamples, lvl);
+                busOut.addFrom (1, 0, sends[(size_t) slot], 1, 0, numSamples, lvl);
+            };
+
+            float *L = nullptr, *R = nullptr;
+
+            // ── CHORUS ───────────────────────────────────────────────────────
+            if (enabled[kChorus].load())
+            {
+                chorus.enabled.store (true);
+                chorus.rateHz  .store (chorusRateHz .load());
+                chorus.depth   .store (chorusDepth  .load());
+                chorus.centreMs.store (chorusCentreMs.load());
+                chorus.level  .store (1.0f);         // level applied by addWet
+                chorus.process (sends[kChorus], numSamples);
+                addWet (kChorus);
+            }
+
+            // ── DELAY ────────────────────────────────────────────────────────
+            //
+            // Straight to the bus and nowhere else.  Its output used to be added
+            // to the reverb's send as well; see the header for why that is gone.
+            // The ordering is left as it was - delay before reverb - because
+            // nothing depends on it any more and moving it would be churn.
+            if (enabled[kDelay].load())
+            {
+                static constexpr float kBeats44[5] = { 4.0f, 2.0f, 1.0f, 0.5f, 0.25f };
+                static constexpr float kBeats34[4] = { 3.0f, 1.0f, 0.5f, 0.25f };
+
+                const int   ts  = delayTimeSig.load();
+                const int   div = delayDiv.load();
+                const float beats = (ts == 0)
+                        ? kBeats44[(size_t) juce::jlimit (0, 4, div)]
+                        : kBeats34[(size_t) juce::jlimit (0, 3, div)];
+
+                const float bpm = (float) juce::jmax (20.0, hostBPM);
+                const float delaySamples = beats * (60.0f / bpm) * (float) sampleRate;
+
+                ptrs (sends[kDelay], L, R);
+                delay.process (L, R, numSamples, delaySamples,
+                               delayFeedback.load(), 1.0f, sampleRate, 0.0f,
+                               delayDampHz.load(), delayHpHz.load(),
+                               delaySmoothMs.load());
+
+                addWet (kDelay);
+            }
+
+            // ── REVERB ───────────────────────────────────────────────────────
+            if (enabled[kReverb].load())
+            {
+                ptrs (sends[kReverb], L, R);
+                reverb.setAlgorithm (reverbAlgo.load());
+                reverb.process (L, R, numSamples,
+                                reverbSize.load(), reverbDamp.load(), 1.0f,
+                                reverbPreDelay.load(), sampleRate,
+                                0.0f, reverbTail.load(),
+                                reverbHpNorm.load(), reverbLpNorm.load(),
+                                reverbErMix.load(), reverbErSize.load());
+                addWet (kReverb);
+            }
+        }
+
+    private:
+        SectionChorusFx chorus;
+        ReverbFx        reverb;
+        StereoDelayFx   delay;
+
+        juce::AudioBuffer<float> sends [kNumSlots];
+        double sampleRate = 44100.0;
+    };
+
 }
-
-

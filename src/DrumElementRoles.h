@@ -1,4 +1,3 @@
-
 #pragma once
 //==============================================================================
 // DrumElementRoles.h
@@ -90,6 +89,13 @@ namespace Betel
         MuteTriangle         = 46,   // MIDI 80
         OpenTriangle         = 47,   // MIDI 81
 
+        // GM2 / XG percussion above GM's 81 ceiling.  These continue `key - 34`
+        // exactly (82 -> 48, 83 -> 49), which is why 48 and 49 were left free.
+        // Supplied by the_last; key 82 in particular is heavily used — one Korg
+        // conversion put 331 hits on it alone.
+        Shaker_82            = 48,   // MIDI 82
+        JingleBell           = 49,   // MIDI 83
+
         // ── Electronic — TR-808, TR-909, modern trap / EDM (50..79) ─────────
         Kick_808             = 50,
         SubKick_808          = 51,
@@ -124,6 +130,48 @@ namespace Betel
         VinylCrack           = 77,
         ClapStack            = 78,
         FingerSnap           = 79,
+
+        // ── XG low keys (80..89 -> MIDI 25..34) ─────────────────────────────
+        // Yamaha XG kits map below the GM floor of 35.  These ten are real,
+        // named elements on the hardware, supplied by the GLOBAL low-zone
+        // components (the_second over 23..34, with revo_first overriding 25..28
+        // on a Revo! kit) and merged into every kit.
+        //
+        // THE IDS DO NOT FOLLOW `key - 34` AND CANNOT: that arithmetic is only
+        // valid for 35..81 (roles 1..47) and would run negative here.  They take
+        // the free 80..89 band instead, which keeps every existing id untouched
+        // and stays under StyleBalanceFile's kMaxRoleId of 149.  getGMRoleForMidiKey
+        // is the single place that maps a key to a role for this range.
+        XgBrushTap           = 80,   // MIDI 25
+        XgBrushSwirl         = 81,   // MIDI 26
+        XgBrushSlap          = 82,   // MIDI 27
+        XgBrushTapSwirl      = 83,   // MIDI 28
+        XgSnareRoll          = 84,   // MIDI 29
+        XgCastanet           = 85,   // MIDI 30
+        XgSnareSoft          = 86,   // MIDI 31
+        XgSticks             = 87,   // MIDI 32
+        XgBassDrumSoft       = 88,   // MIDI 33
+        XgOpenRimShot        = 89,   // MIDI 34
+
+        // ── XG low keys, lower half (160..171 -> MIDI 13..24) ────────────────
+        // The rest of the sub-GM zone: surdo, noise and click material that sits
+        // below the brush band above.  Placed at 160 rather than continuing from
+        // 89 because 90..99 is too small for twelve and 140..159 is the reserved
+        // World / Ethnic band.  Non-contiguous with 80..89 on purpose — those
+        // ten are already in shipped .bset files as sourceRoleId, and renumbering
+        // a persisted id silently unmaps every key above it.
+        XgSurdoMute          = 160,  // MIDI 13
+        XgSurdoOpen          = 161,  // MIDI 14
+        XgHiQ                = 162,  // MIDI 15
+        XgWhipSlap           = 163,  // MIDI 16
+        XgScratchH           = 164,  // MIDI 17
+        XgScratchL           = 165,  // MIDI 18
+        XgFingerSnapLow      = 166,  // MIDI 19
+        XgClickNoise         = 167,  // MIDI 20
+        XgMetronomeClick     = 168,  // MIDI 21
+        XgMetronomeBell      = 169,  // MIDI 22
+        XgSeqClickL          = 170,  // MIDI 23
+        XgSeqClickH          = 171,  // MIDI 24
 
         // ── Arabic / Middle Eastern (100..119) ──────────────────────────────
         Darbuka_Doum         = 100,
@@ -192,6 +240,7 @@ namespace Betel
         Stick,      // side stick, rim, claves, wood blocks
         Tom,        // toms
         Metal,      // hats, cymbals, bells, cowbell, agogo, triangle
+        First,      // "the first" — the XG low keys, MIDI 25..34
         Other       // "the last" — all remaining percussion (congas, shakers, world…)
     };
 
@@ -215,6 +264,30 @@ namespace Betel
         {
             static const std::vector<DrumRoleInfo> t {
                 { DrumElementRole::Unset,            "-",                 -1 },
+
+                // XG low keys (MIDI 13..34) — supplied by the low-zone globals:
+                // revo_first / gm_first over 13..22, the_second over 23..34
+                { DrumElementRole::XgSurdoMute,      "Surdo Mute",         13 },
+                { DrumElementRole::XgSurdoOpen,      "Surdo Open",         14 },
+                { DrumElementRole::XgHiQ,            "Hi Q",               15 },
+                { DrumElementRole::XgWhipSlap,       "Whip Slap",          16 },
+                { DrumElementRole::XgScratchH,       "Scratch H",          17 },
+                { DrumElementRole::XgScratchL,       "Scratch L",          18 },
+                { DrumElementRole::XgFingerSnapLow,  "Finger Snap (low)",  19 },
+                { DrumElementRole::XgClickNoise,     "Click Noise",        20 },
+                { DrumElementRole::XgMetronomeClick, "Metronome Click",    21 },
+                { DrumElementRole::XgMetronomeBell,  "Metronome Bell",     22 },
+                { DrumElementRole::XgSeqClickL,      "Seq Click L",        23 },
+                { DrumElementRole::XgSeqClickH,      "Seq Click H",        24 },
+                { DrumElementRole::XgBrushTap,       "Brush Tap",          25 },                { DrumElementRole::XgBrushSwirl,     "Brush Swirl",        26 },
+                { DrumElementRole::XgBrushSlap,      "Brush Slap",         27 },
+                { DrumElementRole::XgBrushTapSwirl,  "Brush Tap Swirl",    28 },
+                { DrumElementRole::XgSnareRoll,      "Snare Roll",         29 },
+                { DrumElementRole::XgCastanet,       "Castanet",           30 },
+                { DrumElementRole::XgSnareSoft,      "Snare Soft",         31 },
+                { DrumElementRole::XgSticks,         "Sticks",             32 },
+                { DrumElementRole::XgBassDrumSoft,   "Bass Drum Soft",     33 },
+                { DrumElementRole::XgOpenRimShot,    "Open Rim Shot",      34 },
 
                 // GM percussion
                 { DrumElementRole::AcousticBassDrum, "Acoustic Bass Drum", 35 },
@@ -264,6 +337,8 @@ namespace Betel
                 { DrumElementRole::OpenCuica,        "Open Cuica",         79 },
                 { DrumElementRole::MuteTriangle,     "Mute Triangle",      80 },
                 { DrumElementRole::OpenTriangle,     "Open Triangle",      81 },
+                { DrumElementRole::Shaker_82,        "Shaker",             82 },
+                { DrumElementRole::JingleBell,       "Jingle Bell",        83 },
 
                 // Electronic
                 { DrumElementRole::Kick_808,         "808 Kick",           36 },
@@ -390,8 +465,28 @@ namespace Betel
             the role they'd typically host on a GM drum map. */
         inline DrumElementRole getGMRoleForMidiKey (int midiKey) noexcept
         {
-            if (midiKey >= 35 && midiKey <= 81)
+            // Ceiling is 83, not 81: keys 82 Shaker and 83 Jingle Bell are GM2
+            // percussion supplied by the_last, and roles 48/49 continue the same
+            // `key - 34` arithmetic.
+            if (midiKey >= 35 && midiKey <= 83)
                 return (DrumElementRole) (midiKey - 34);
+
+            // XG low keys sit BELOW the GM floor, so `key - 34` cannot reach
+            // them.  This is the one place the sub-GM mapping lives;
+            // DrumKitRegistry calls straight through here rather than doing the
+            // arithmetic itself, so the two can never disagree.
+            //
+            // Two bands, because 80..89 shipped first and its ids are persisted
+            // in .bset files as sourceRoleId — renumbering them would silently
+            // unmap every key that already references one.
+            if (midiKey >= 25 && midiKey <= 34)
+                return (DrumElementRole) (midiKey - 25
+                                          + (int) DrumElementRole::XgBrushTap);
+
+            if (midiKey >= 13 && midiKey <= 24)
+                return (DrumElementRole) (midiKey - 13
+                                          + (int) DrumElementRole::XgSurdoMute);
+
             return DrumElementRole::Unset;
         }
 
@@ -437,6 +532,20 @@ namespace Betel
                 case R::Agogo_Big: case R::Agogo_Small:
                     return DrumComponentGroup::Metal;
 
+                // The XG low keys are their own family.  Leaving them in Other
+                // would put them in "the last" bucket, so swapping REST GM would
+                // silently replace them too.
+                case R::XgBrushTap:  case R::XgBrushSwirl: case R::XgBrushSlap:
+                case R::XgBrushTapSwirl: case R::XgSnareRoll: case R::XgCastanet:
+                case R::XgSnareSoft: case R::XgSticks: case R::XgBassDrumSoft:
+                case R::XgOpenRimShot:
+                case R::XgSurdoMute: case R::XgSurdoOpen: case R::XgHiQ:
+                case R::XgWhipSlap:  case R::XgScratchH:  case R::XgScratchL:
+                case R::XgFingerSnapLow: case R::XgClickNoise:
+                case R::XgMetronomeClick: case R::XgMetronomeBell:
+                case R::XgSeqClickL: case R::XgSeqClickH:
+                    return DrumComponentGroup::First;
+
                 default:
                     return DrumComponentGroup::Other;
             }
@@ -457,6 +566,7 @@ namespace Betel
                 case DrumComponentGroup::Stick: return "Stick";
                 case DrumComponentGroup::Tom:   return "Tom";
                 case DrumComponentGroup::Metal: return "Metal";
+                case DrumComponentGroup::First: return "First";
                 default:                        return "Other";
             }
         }

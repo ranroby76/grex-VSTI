@@ -1,8 +1,11 @@
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <cmath>
 
 #include "GlobalMacrosPanel.h"
+#include "SetEditorTab.h"
 #include "RegistrationManager.h"   // machine-locked serial + demo mode
 
 //==============================================================================
@@ -11,25 +14,61 @@
 //
 //   • CONTROL NOTE MAP : read-only reference of the reserved MIDI control
 //     notes (0–35) and the arranger action each one fires.
-//   • MIDI CC CONTROL  : five learnable continuous controllers (master volume,
-//     style volume, tempo, transpose, split).  Engine wiring (capture / apply /
-//     persistence) is connected by MainComponent through the callbacks below.
-//   • REGISTRATION     : placeholder — no licensing backend exists yet.
+//   • MIDI ASSIGNING   : SAVE / LOAD for the MIDI assign map (.grexmidi in
+//     <root>/midi maps).  The five learnable CC rows that used to be this page
+//     are gone: assignment is drag-and-drop from the MIDI LINK canvas now, and
+//     a second modal way of doing it - one that could only reach five fixed
+//     targets - could only ever disagree with the real one.  The ENGINE keeps
+//     those five CC targets and their defaults; only the way they change moved.
+//   • REGISTRATION     : machine-locked serial + demo mode; the page is live.
+//     The machine ID is read off the screen, quoted to us, and the serial that
+//     comes back is typed in here.
 //   • GLOBAL SETTINGS  : the two global macros — FUNKEY MODE (seven GM-family
-//     FX presets) and BIG DRUMS (one global drum rack).  Engage switches plus
+//     FX presets).  Engage switch plus
 //     the buttons that open each editor; the presets themselves live in
 //     GlobalMacros and persist to their own files.
+//   • SET EDITOR       : bake the library's sets, rebuild them, edit style
+//     levels.  It sits here rather than in the main tab row - a maintenance
+//     surface should not cost a permanent slot beside MAIN, STYLES and MIXER.
 //==============================================================================
 class SettingsTab : public juce::Component
 {
 public:
     enum CcTarget { kMasterVol = 0, kStyleVol, kTempo, kTranspose, kSplit, kNumCcTargets };
-    enum Page     { kNoteMap = 0, kCc, kRegistration, kGlobal, kNumPages };
+    // THE ENUM IS THE AUTHORITY for the button row, the page count and the
+    // visibility switch, so an entry here adds all three at once.
+    //
+    // kRegistration is back - Grex is paid.  SET EDITOR STAYS WHERE BALLADA PUT
+    // IT: it moved out of the main tab row because it is a maintenance surface
+    // (bake the library's sets, rebuild them, edit style levels) and was costing
+    // a permanent slot beside MAIN, STYLES and MIXER, which are played.  That
+    // reasoning holds in Grex too, so it is not moved back.
+    enum Page     { kNoteMap = 0, kCc, kRegistration, kGlobal, kSetEditor, kNumPages };
 
-    // Fired when the user arms/cancels learn on a target, or clears it.  Wired
-    // to the engine by MainComponent.
-    std::function<void(int /*target*/)> onLearnRequested;
-    std::function<void(int /*target*/)> onForgetRequested;
+    //==========================================================================
+    // MIDI ASSIGNING page.  Two buttons, and that is the whole page.
+    //
+    // WHAT WAS HERE: five rows of LEARN / FORGET for the fixed continuous
+    // targets.  Assignment does not work that way any more - a source is
+    // captured passively by the MIDI LINK canvas and dragged onto whatever it
+    // should drive - so a second, modal, five-row-only way of assigning things
+    // was a duplicate that could only ever disagree with the real one.
+    //
+    // What a settings page CAN usefully own is the FILE side of that map, which
+    // the canvas offers only through a right-click nobody would find.
+    //==========================================================================
+    std::function<void()> onSaveMidiMap;
+    std::function<void()> onLoadMidiMap;
+
+    /** Put every assignment back to the factory control-note map.  The host
+        confirms first - it auto-saves, so there is no undo behind it. */
+    std::function<void()> onUnlearnAllMidi;
+
+    /** Fired after a registration ATTEMPT, successful or not.  The header keeps
+        its own lamp and status flag, and a page that changed the licence
+        without saying so would leave those two reading the old answer until the
+        editor was reopened. */
+    std::function<void()> onRegistrationChanged;
 
     // Global Settings: bypass instrument audio chain toggle.  When true,
     // every channel's filter + post-mix FX are skipped; only amp ADSR / amp
@@ -43,7 +82,10 @@ public:
     // sets the GlobalMacros flag, re-commits every slot so the change is
     // audible, and relights BOTH this page and the left-panel macro buttons.
     std::function<void(bool /*on*/)> onFunkeyModeToggled;
-    std::function<void(bool /*on*/)> onBigDrumsToggled;
+
+    /** RESET SOLO BASE GAIN, already confirmed by the panel's own dialog.  The
+        host does the work: every .ins in the library back to 0 dB base. */
+    std::function<void()> onResetSoloBaseGain;
     std::function<void()>            onMacroFxEdited;
 
     /** PITCH BEND RANGE moved, in semitones (1..12).  Solo instruments only —
@@ -53,6 +95,7 @@ public:
     /** LOW VELOCITY RESPONSE moved, 0..100.  Solo instruments only —
         see BetelgeuseProcessor::setSoloLowVelBoost. */
     std::function<void(int)>         onLowVelBoostChanged;
+    std::function<void(float)>       onStyleBoostChanged;
 
     // onStyleLevelsChanged is gone from this tab.  Style levels are per-STYLE
     // and now live in the SET EDITOR tab, which owns the panel and talks to the
@@ -62,14 +105,15 @@ public:
     {
         // ── Page selector (horizontal) ─────────────────────────────────────
         static const char* pageNames[kNumPages] =
-            { "CONTROL NOTE MAP", "MIDI CC CONTROL", "REGISTRATION", "GLOBAL SETTINGS" };
+            { "CONTROL NOTE MAP", "MIDI ASSIGNING", "REGISTRATION",
+              "GLOBAL SETTINGS", "SET EDITOR" };
 
         for (int p = 0; p < kNumPages; ++p)
         {
             pageBtn[p].setButtonText (pageNames[p]);
             pageBtn[p].setClickingTogglesState (false);
             pageBtn[p].setColour (juce::TextButton::buttonColourId,   juce::Colour (0xFF1A1A1A));
-            pageBtn[p].setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xFFCC6600));
+            pageBtn[p].setColour (juce::TextButton::buttonOnColourId, juce::Colour (Betel::Pal::kAccent));
             pageBtn[p].setColour (juce::TextButton::textColourOffId,  juce::Colours::white.withAlpha (0.75f));
             pageBtn[p].setColour (juce::TextButton::textColourOnId,   juce::Colours::black);
             pageBtn[p].onClick = [this, p] { selectPage (p); };
@@ -88,100 +132,94 @@ public:
         noteMapView.setText (buildNoteMapText(), juce::dontSendNotification);
         addAndMakeVisible (noteMapView);
 
-        // ── CC-control rows ────────────────────────────────────────────────
-        // Named after the CONTROL each one moves, not after the parameter
-        // underneath it: the point of this page is "which knob does my pedal
-        // grab", and "TRANSPOSE" / "SPLIT POINT" did not match anything
-        // written on the left panel.
-        static const char* targetNames[kNumCcTargets] =
-            { "MASTER VOLUME", "STYLE VOLUME", "TEMPO",
-              "GLOBAL SEMI", "SPLIT KEYBOARD" };
+        // ── MIDI ASSIGNING page ────────────────────────────────────────────
+        assignBlurb.setText ("Assignments are made by dragging a source from "
+                             "the MIDI LINK panel onto any control.\n"
+                             "Save the current map to a file, or load one back.",
+                             juce::dontSendNotification);
+        assignBlurb.setJustificationType (juce::Justification::centredTop);
+        assignBlurb.setColour (juce::Label::textColourId,
+                               juce::Colours::white.withAlpha (0.65f));
+        assignBlurb.setFont (juce::Font (juce::FontOptions (14.0f)));
+        addAndMakeVisible (assignBlurb);
 
-        for (int i = 0; i < kNumCcTargets; ++i)
+        auto initAssignBtn = [this] (juce::TextButton& b, const juce::String& t)
         {
-            target[i].setText (targetNames[i], juce::dontSendNotification);
-            target[i].setColour (juce::Label::textColourId, juce::Colours::white);
-            target[i].setFont (juce::Font (15.0f, juce::Font::bold));
-            addAndMakeVisible (target[i]);
+            b.setButtonText (t);
+            b.setColour (juce::TextButton::buttonColourId,  juce::Colour (0xFF1A1A1A));
+            b.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+            addAndMakeVisible (b);
+        };
+        initAssignBtn (saveMapBtn, "SAVE MIDI MAP");
+        initAssignBtn (loadMapBtn, "LOAD MIDI MAP");
+        initAssignBtn (unlearnBtn, "UNLEARN ALL");
 
-            value[i].setJustificationType (juce::Justification::centred);
-            value[i].setColour (juce::Label::textColourId, juce::Colour (0xFFD4AF37));
-            value[i].setColour (juce::Label::backgroundColourId, juce::Colour (0xFF101010));
-            value[i].setFont (juce::Font (15.0f, juce::Font::bold));
-            addAndMakeVisible (value[i]);
+        // Set apart from the other two on purpose. Save and load are reversible
+        // and this is not, so it does not sit flush beside them wearing the
+        // same colour - the row above is housekeeping, this one throws work
+        // away.
+        unlearnBtn.setColour (juce::TextButton::buttonColourId,  juce::Colour (0xFF3A1010));
+        unlearnBtn.setColour (juce::TextButton::textColourOffId, juce::Colour (0xFFFF9A9A));
 
-            learnBtn[i].setButtonText ("LEARN");
-            learnBtn[i].onClick = [this, i]
-            {
-                // Toggle: a second press on the armed row cancels learning.
-                const int t = (learningIdx == i) ? -1 : i;
-                if (onLearnRequested) onLearnRequested (t);
-                setLearning (t);
-            };
-            addAndMakeVisible (learnBtn[i]);
-
-            forgetBtn[i].setButtonText ("FORGET");
-            forgetBtn[i].onClick = [this, i]
-            {
-                if (onForgetRequested) onForgetRequested (i);
-            };
-            addAndMakeVisible (forgetBtn[i]);
-        }
+        saveMapBtn.onClick = [this] { if (onSaveMidiMap)    onSaveMidiMap();    };
+        loadMapBtn.onClick = [this] { if (onLoadMidiMap)    onLoadMidiMap();    };
+        unlearnBtn.onClick = [this] { if (onUnlearnAllMidi) onUnlearnAllMidi(); };
 
         // ── Registration ───────────────────────────────────────────────────
-        // The placeholder that used to sit here is gone; this page is live.
-        auto& rm = RegistrationManager::getInstance();
-
-        regTitle.setText ("REGISTRATION", juce::dontSendNotification);
-        regTitle.setJustificationType (juce::Justification::centred);
-        regTitle.setColour (juce::Label::textColourId, juce::Colour (0xFFC2C2C2));
-        regTitle.setFont (juce::Font (18.0f, juce::Font::bold));
-        addAndMakeVisible (regTitle);
-
-        // The ID is READ-ONLY and selectable: the user has to quote it to you
-        // accurately, and re-typing a five-digit number off a screen is where
-        // support tickets come from.
-        regIdLabel.setText ("MACHINE ID", juce::dontSendNotification);
-        regIdLabel.setJustificationType (juce::Justification::centred);
-        regIdLabel.setColour (juce::Label::textColourId, juce::Colour (0xFF8A8A8A));
-        addAndMakeVisible (regIdLabel);
-
-        regIdValue.setText (rm.getMachineIDString(), juce::dontSendNotification);
-        regIdValue.setJustificationType (juce::Justification::centred);
-        regIdValue.setColour (juce::Label::textColourId, juce::Colour (0xFFCC6600));
-        regIdValue.setFont (juce::Font (26.0f, juce::Font::bold));
-        regIdValue.setEditable (false);
-        // juce::Label has no onClick - it is a display widget, not a button.
-        // ClickableLabel below adds one mouseUp override rather than swapping in
-        // a TextButton, because the ID has to READ as a value, not as something
-        // to press; the copy is a convenience on top, not the point.
-        regIdValue.onClicked = [this]
         {
-            juce::SystemClipboard::copyTextToClipboard (regIdValue.getText());
-            regStatus.setText ("Machine ID copied to clipboard.", juce::dontSendNotification);
-        };
-        addAndMakeVisible (regIdValue);
+            auto& rm = RegistrationManager::getInstance();
 
-        regSerialBox.setTextToShowWhenEmpty ("enter your serial", juce::Colour (0xFF6A6A6A));
-        regSerialBox.setJustification (juce::Justification::centred);
-        regSerialBox.setFont (juce::Font (20.0f));
-        regSerialBox.onReturnKey = [this] { attemptRegistration(); };
-        addAndMakeVisible (regSerialBox);
+            regTitle.setText ("REGISTRATION", juce::dontSendNotification);
+            regTitle.setJustificationType (juce::Justification::centred);
+            regTitle.setColour (juce::Label::textColourId, juce::Colour (0xFFC2C2C2));
+            regTitle.setFont (juce::Font (18.0f, juce::Font::bold));
+            addAndMakeVisible (regTitle);
 
-        regButton.setButtonText ("REGISTER");
-        regButton.onClick = [this] { attemptRegistration(); };
-        addAndMakeVisible (regButton);
+            // The ID is READ-ONLY and copyable: the user has to quote it to you
+            // accurately, and re-typing a number off a screen is where support
+            // tickets come from.
+            regIdLabel.setText ("MACHINE ID", juce::dontSendNotification);
+            regIdLabel.setJustificationType (juce::Justification::centred);
+            regIdLabel.setColour (juce::Label::textColourId, juce::Colour (0xFF8A8A8A));
+            addAndMakeVisible (regIdLabel);
 
-        regStatus.setJustificationType (juce::Justification::centred);
-        addAndMakeVisible (regStatus);
+            regIdValue.setText (rm.getMachineIDString(), juce::dontSendNotification);
+            regIdValue.setJustificationType (juce::Justification::centred);
+            regIdValue.setColour (juce::Label::textColourId, juce::Colour (Betel::Pal::kAccent));
+            regIdValue.setFont (juce::Font (26.0f, juce::Font::bold));
+            regIdValue.setEditable (false);
+            // juce::Label has no onClick - it is a display widget, not a button.
+            // ClickableLabel below adds one mouseUp override rather than swapping
+            // in a TextButton, because the ID has to READ as a value, not as
+            // something to press; the copy is a convenience on top, not the point.
+            regIdValue.onClicked = [this]
+            {
+                juce::SystemClipboard::copyTextToClipboard (regIdValue.getText());
+                regStatus.setText ("Machine ID copied to clipboard.",
+                                   juce::dontSendNotification);
+            };
+            addAndMakeVisible (regIdValue);
 
-        refreshRegistrationState();
+            regSerialBox.setTextToShowWhenEmpty ("enter your serial",
+                                                 juce::Colour (0xFF6A6A6A));
+            regSerialBox.setJustification (juce::Justification::centred);
+            regSerialBox.setFont (juce::Font (20.0f));
+            regSerialBox.onReturnKey = [this] { attemptRegistration(); };
+            addAndMakeVisible (regSerialBox);
 
-        // ── Global Settings: the two macro sections ────────────────────────
+            regButton.setButtonText ("REGISTER");
+            regButton.onClick = [this] { attemptRegistration(); };
+            addAndMakeVisible (regButton);
+
+            regStatus.setJustificationType (juce::Justification::centred);
+            addAndMakeVisible (regStatus);
+
+            refreshRegistrationState();
+        }
+
+        // ── Global Settings: the macro section ─────────────────────────────
         macrosPanel.onFunkeyToggled = [this] (bool on)
         { if (onFunkeyModeToggled) onFunkeyModeToggled (on); };
-        macrosPanel.onBigDrumsToggled = [this] (bool on)
-        { if (onBigDrumsToggled) onBigDrumsToggled (on); };
         macrosPanel.onMacroFxEdited = [this]
         { if (onMacroFxEdited) onMacroFxEdited(); };
         macrosPanel.onPitchBendRangeChanged = [this] (int semis)
@@ -189,6 +227,12 @@ public:
 
         macrosPanel.onLowVelBoostChanged = [this] (int amount)
         { if (onLowVelBoostChanged) onLowVelBoostChanged (amount); };
+
+        macrosPanel.onStyleBoostChanged = [this] (float db)
+        { if (onStyleBoostChanged) onStyleBoostChanged (db); };
+
+        macrosPanel.onResetSoloBaseGain = [this]
+        { if (onResetSoloBaseGain) onResetSoloBaseGain(); };
         addAndMakeVisible (macrosPanel);
 
 
@@ -199,25 +243,20 @@ public:
         // duplicates — and orphaned ones: their callbacks were never wired, so
         // the sliders moved but changed nothing.
 
-        refreshCcLabels();
+        // addChildComponent, not addAndMakeVisible: selectPage below owns
+        // visibility for every page, and a page that shows itself would be
+        // painted over the selected one until the first page press.
+        addChildComponent (setEditorTab);
+
         selectPage (kNoteMap);
     }
 
-    //==========================================================================
-    // Engine → UI: set the controller number assigned to a target (-1 = none).
-    void setCcNumber (int targetIdx, int cc)
-    {
-        if (targetIdx < 0 || targetIdx >= kNumCcTargets) return;
-        ccNumber[targetIdx] = cc;
-        refreshCcLabels();
-    }
-
-    // Engine → UI: mark which target (if any) is currently waiting for a CC.
-    void setLearning (int targetIdx)
-    {
-        learningIdx = targetIdx;
-        refreshCcLabels();
-    }
+    // The CC-learn mirrors are retired with the rows they fed.  Kept as inert
+    // no-ops - same treatment as setBypassInstrumentChain below - so the host's
+    // 30 Hz mirror and its startup seed still compile while the engine keeps
+    // its five fixed CC targets working exactly as before.
+    void setCcNumber (int /*targetIdx*/, int /*cc*/) {}
+    void setLearning (int /*targetIdx*/) {}
 
     // Bypass-instrument-audio-chain has been retired (the chain is always
     // connected).  Kept as an inert no-op so existing callers — MainComponent's
@@ -225,9 +264,15 @@ public:
     void setBypassInstrumentChain (bool /*b*/) {}
 
     /** Relight the macro switches from GlobalMacros.  Called by the host after
-        the left-panel BIG DRUMS / FUNKEY MODE buttons flip a flag, and after a
+        the FUNKEY MODE button flips a flag, and after a
         set restore, so the two surfaces never disagree. */
     void refreshMacroState() { macrosPanel.refreshFromState(); }
+
+    /** The SET EDITOR page.  MainComponent owns every callback on it - the
+        baker, the style-name provider, the levels hook - because those need the
+        processor and the style library, neither of which a settings page has
+        any business knowing about.  So the page LIVES here and is WIRED there. */
+    SetEditorTab& getSetEditorTab() noexcept { return setEditorTab; }
 
     void paint (juce::Graphics& g) override
     {
@@ -236,7 +281,7 @@ public:
         const auto content = contentArea();
         g.setColour (juce::Colour (0xFF0E0E0E));
         g.fillRoundedRectangle (content.toFloat(), 6.0f);
-        g.setColour (juce::Colour (0xFF3A3322));
+        g.setColour (juce::Colour (Betel::Pal::kTintPanel));
         g.drawRoundedRectangle (content.toFloat(), 6.0f, 1.5f);
 
     }
@@ -260,11 +305,10 @@ public:
         // CONTROL NOTE MAP fills the content panel.
         noteMapView.setBounds (content);
 
-        // REGISTRATION placeholder fills the content panel.
+        // REGISTRATION: a centred column with a capped width - a machine number
+        // and one text field stretched across a full-width tab reads as a form
+        // to fill in rather than the two-step exchange it actually is.
         {
-            // Centred column, capped width - a five-digit number and one text
-            // field stretched across a full-width tab reads as a form to fill
-            // in rather than the two-step exchange it actually is.
             auto col = content.withSizeKeepingCentre (juce::jmin (420, content.getWidth() - 40),
                                                       juce::jmin (300, content.getHeight()));
             regTitle    .setBounds (col.removeFromTop (30));
@@ -279,23 +323,32 @@ public:
             regStatus   .setBounds (col.removeFromTop (40));
         }
 
-        // MIDI CC rows stacked in the content panel.
-        auto rows = content;
-        const int rowH = juce::jmin (56, juce::jmax (1, rows.getHeight() / kNumCcTargets));
-        for (int i = 0; i < kNumCcTargets; ++i)
+        // MIDI ASSIGNING: a line of explanation and two buttons, centred in the
+        // content panel rather than stretched across it - two controls spread
+        // over a full-width page read as a page missing its other eight.
         {
-            auto row = rows.removeFromTop (rowH).reduced (0, 4);
-            const int w = row.getWidth();
-            target [i].setBounds (row.removeFromLeft ((int) (w * 0.38f)));
-            value  [i].setBounds (row.removeFromLeft ((int) (w * 0.18f)).reduced (2, 6));
-            const int bw = (row.getWidth() - 6) / 2;
-            learnBtn [i].setBounds (row.removeFromLeft (bw).reduced (2, 6));
-            forgetBtn[i].setBounds (row.removeFromRight (bw).reduced (2, 6));
+            auto col = content.reduced (juce::jmax (0, (content.getWidth() - 420) / 2), 0);
+            col.removeFromTop (juce::jmax (0, col.getHeight() / 5));
+
+            assignBlurb.setBounds (col.removeFromTop (56));
+            col.removeFromTop (18);
+
+            auto row = col.removeFromTop (40);
+            const int bw = (row.getWidth() - 16) / 2;
+            saveMapBtn.setBounds (row.removeFromLeft  (bw));
+            loadMapBtn.setBounds (row.removeFromRight (bw));
+
+            col.removeFromTop (26);
+            unlearnBtn.setBounds (col.removeFromTop (36).reduced (bw / 3, 0));
         }
 
         // GLOBAL SETTINGS page: three trigger buttons, nothing else — every
         // control now lives in the window its feature owns.
         macrosPanel.setBounds (content);
+
+        // SET EDITOR fills the content panel.  It draws its own frame inside
+        // this one, which is what every other page here does.
+        setEditorTab.setBounds (content);
     }
 
 private:
@@ -319,43 +372,37 @@ private:
         const bool cc   = (currentPage == kCc);
         const bool reg  = (currentPage == kRegistration);
         const bool glob = (currentPage == kGlobal);
+        const bool sete = (currentPage == kSetEditor);
 
         noteMapView.setVisible (note);
-        for (int i = 0; i < kNumCcTargets; ++i)
-        {
-            target  [i].setVisible (cc);
-            value   [i].setVisible (cc);
-            learnBtn[i].setVisible (cc);
-            forgetBtn[i].setVisible (cc);
-        }
-        for (juce::Component* c : { (juce::Component*) &regTitle,  (juce::Component*) &regIdLabel,
-                                    (juce::Component*) &regIdValue, (juce::Component*) &regSerialBox,
-                                    (juce::Component*) &regButton, (juce::Component*) &regStatus })
+        assignBlurb.setVisible (cc);
+        saveMapBtn .setVisible (cc);
+        loadMapBtn .setVisible (cc);
+        unlearnBtn .setVisible (cc);
+        for (juce::Component* c : { (juce::Component*) &regTitle,
+                                    (juce::Component*) &regIdLabel,
+                                    (juce::Component*) &regIdValue,
+                                    (juce::Component*) &regSerialBox,
+                                    (juce::Component*) &regButton,
+                                    (juce::Component*) &regStatus })
             c->setVisible (reg);
+
+        // Re-read the licence every time the page is opened: registering in one
+        // plugin instance leaves every other instance's page showing the old
+        // answer until it is looked at again.
+        if (reg) refreshRegistrationState();
+
         macrosPanel.setVisible (glob);
         if (glob) macrosPanel.refreshFromState();
 
-        repaint();
-    }
+        setEditorTab.setVisible (sete);
+        // Re-read the levels every time the page is opened.  It is the only page
+        // here showing state another surface can change while it is hidden - a
+        // style load rewrites the levels underneath it - so a stale reading
+        // would be the normal case rather than the rare one.
+        if (sete) setEditorTab.refreshFromState();
 
-    void refreshCcLabels()
-    {
-        for (int i = 0; i < kNumCcTargets; ++i)
-        {
-            if (learningIdx == i)
-            {
-                value[i].setText ("LEARN...", juce::dontSendNotification);
-                value[i].setColour (juce::Label::textColourId, juce::Colours::orange);
-            }
-            else
-            {
-                value[i].setText (ccNumber[i] >= 0 ? ("CC " + juce::String (ccNumber[i]))
-                                                   : juce::String ("-"),
-                                  juce::dontSendNotification);
-                value[i].setColour (juce::Label::textColourId, juce::Colour (0xFFD4AF37));
-            }
-            learnBtn[i].setButtonText (learningIdx == i ? "CANCEL" : "LEARN");
-        }
+        repaint();
     }
 
     static juce::String buildNoteMapText()
@@ -399,10 +446,8 @@ private:
 
     juce::TextEditor noteMapView;
 
-    juce::Label      target   [kNumCcTargets];
-    juce::Label      value    [kNumCcTargets];
-    juce::TextButton learnBtn [kNumCcTargets];
-    juce::TextButton forgetBtn[kNumCcTargets];
+    juce::Label      assignBlurb;
+    juce::TextButton saveMapBtn, loadMapBtn, unlearnBtn;
 
     /** A Label that can be clicked.  juce::Label deliberately has no onClick;
         this is the smallest thing that adds one without turning the machine ID
@@ -438,6 +483,11 @@ private:
             regStatus.setText ("That serial is not valid for this machine.",
                                juce::dontSendNotification);
         }
+
+        // EITHER WAY.  A failed attempt still has to reach the header, because
+        // the licence file may have been deleted since the lamp was last drawn
+        // and this is the moment somebody is looking at the answer.
+        if (onRegistrationChanged) onRegistrationChanged();
     }
 
     void refreshRegistrationState()
@@ -456,12 +506,13 @@ private:
         regIdValue  .setText (rm.getMachineIDString(), juce::dontSendNotification);
     }
 
-    // Global Settings controls: FUNKEY MODE + BIG DRUMS.
+    // Global Settings controls: FUNKEY MODE.
     GlobalMacrosPanel macrosPanel;
+    SetEditorTab      setEditorTab;
 
-    // Defaults per spec: vol=CC7, style-vol=CC11, tempo=CC16, transpose=CC17, split=CC18.
-    int ccNumber[kNumCcTargets] = { 7, 11, 16, 17, 18 };
-    int learningIdx = -1;
+    // The CC-number cache and the armed-row index went with the rows they drew.
+    // kNumCcTargets stays: the ENGINE still has its five fixed continuous
+    // targets and the host counts them by this name.
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SettingsTab)
 };

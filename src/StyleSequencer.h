@@ -191,6 +191,36 @@ namespace Betel
         // a crash on a real section transition and/or every N loop cycles.
         int consumeTransitionEvents() noexcept { return transitionEvents.exchange (0); }
 
+        /** THE SECTION A QUEUED BUTTON PRESS WILL ENTER, or the current section
+            when nothing is queued.  Message-thread safe; reads atomics only.
+
+            This exists for the LEDs, not for the audio.  A variation LED that
+            follows getCurrentSection() cannot light until the transition has
+            actually happened, so pressing ENDING left the panel showing the
+            variation still playing for up to a whole quantise unit — and the
+            player reads that as the button not having registered.  On hardware
+            the lamp answers "what did I ask for", from the instant of the press.
+
+            The priority order MUST match applyPendingAtBarBoundary, or the lamp
+            would promise a section the audio will not go to. */
+        StyleSection getQueuedOrCurrentSection() const noexcept;
+
+        /** Drop every queued section request.
+
+            WHILE STOPPED, ARMING IS LAST-PRESS-WINS, and this is what makes it
+            so. Nothing consumes the pending flags until playback starts, so
+            without this they ACCUMULATE - and because the queued-section getter
+            reads them in priority order, the highest-ranking one it ever saw
+            wins forever.
+
+            The symptom was exact: from stopped you could go VAR -> INTRO, but
+            never INTRO -> VAR (pendingIntro outranks the variation), you could
+            still reach ENDING (it outranks intro), and after that nothing moved
+            at all (ending outranks everything). Each press was landing on top
+            of the last instead of replacing it. */
+        void clearPendingSections() noexcept;
+        bool isStoppedForArming() const noexcept;
+
         /** LANDINGS: a transition section handing back to a main.
         
             transitionEvents counts the moment a transition is ENTERED — the
@@ -252,10 +282,6 @@ namespace Betel
         void enterSection (StyleSection s, int afterCurrent);
         void onSectionEndReached();
         bool applyPendingAtBarBoundary();   // true if a transition was applied
-
-        /** Diagnostic line per transition — see StyleSequencer.cpp. */
-        void logTransition (const char* what, int section,
-                            double lt, double len) const;
         void processPendingCommands();
 
         // ── State ─────────────────────────────────────────────────────────────
@@ -276,6 +302,38 @@ namespace Betel
         std::atomic<int> fillLength      { 0 };   // subdivides the one-bar cap:
                                                   // 0 = the capped window whole,
                                                   // 1 = its second half
+        //======================================================================
+        // THE ENDING TAIL — SILENT BARS THE STYLE KEEPS "PLAYING" AFTER AN
+        // ENDING'S LAST EVENT, SO VOICES DIE OF THEIR OWN RELEASE
+        //
+        // An ending used to stop the transport the instant its last tick
+        // elapsed.  The processor watches the playing->stopped edge and flushes
+        // every voice with allNotesOff, which is a 5 ms release — and a style
+        // whose final chord releases close to the section boundary still has
+        // that chord near full level when the flush lands.  A sustaining voice
+        // stepped to zero in 5 ms is a click.
+        //
+        // Soul Ballad's Ending B is the case: its last note-off is 10 ms before
+        // the section ends, on a pad.  Ending A's is 240 ms before, and Ending A
+        // does not click — the pad is already gone by the time the flush runs.
+        //
+        // So the ending now runs on past its content for half a bar with nothing
+        // to emit.  The chord gets its own release, in full, and the flush at the
+        // end of the tail finds silence.  No release time is changed and no note
+        // data is touched; the style simply is not declared stopped until it has
+        // actually finished sounding.
+        //
+        // THE TRANSPORT DELIBERATELY STILL READS "PLAYING" FOR THE TAIL.  That
+        // is the entire mechanism — the flush is driven by the stopped edge, so
+        // delaying the edge is what buys the decay.  The visible cost is that
+        // STOP stays lit for the tail: half a bar is 2.0 s at 60 BPM, which is
+        // the slow end of a ballad library and therefore the worst case.
+        //
+        // Ticks remaining, or 0 when no tail is running.  Audio-thread-owned;
+        // atomic only so a message-thread stop can cancel it.
+        static constexpr double       kEndingTailBars = 0.5;
+        std::atomic<double>           endingTailTicks { 0.0 };
+
         std::atomic<double>           localTick       { 0.0 };
         size_t                        eventCursor     { 0 };   // audio-thread-only
 
@@ -307,6 +365,7 @@ namespace Betel
         // Consumed by the host (crash tab).  Incremented on a real section
         // transition / on each section loop respectively.
         std::atomic<int>  transitionEvents  { 0 };
+
         std::atomic<int>  landingEvents      { 0 };
         std::atomic<int>  mainEntryEvents     { 0 };
         std::atomic<int>  loopEvents        { 0 };

@@ -1,3 +1,4 @@
+
 #pragma once
 #include <JuceHeader.h>
 #include <array>
@@ -8,10 +9,14 @@
 // GrexSongRecorder.h  —  MIDI performance capture (PHASE 1)
 //==============================================================================
 //
-// STATUS: PARKED / NOT WIRED.  This component is complete and self-contained,
-// but it is intentionally NOT hooked into the processor yet and may or may not
-// ship in the first public release of Grex.  Including this header has zero
-// runtime cost until the activation hooks below are added.
+// STATUS: LIVE.  Armed from the RECORD half of the seventh play-control slot
+// (MainTab's btnRecord -> MainComponent::onRecordClicked), fed from
+// BetelgeuseProcessor::processBlock, and saved through promptSaveSong().
+//
+// This header said PARKED / NOT WIRED for a long time after it stopped being
+// either, which is the failure mode this codebase keeps hitting: the comments
+// here are unusually detailed, and that makes a stale one unusually convincing.
+// If the wiring changes again, this line changes with it.
 //
 // ─── What it does ────────────────────────────────────────────────────────────
 // Records a whole arranger performance as a single self-contained "Grex song".
@@ -123,9 +128,30 @@ public:
         uint8_t data2  = 0;
     };
 
+    //==========================================================================
     // Session state captured the moment recording is armed.
+    //
+    // `setSnapshot` IS THE SETUP NOW. The thin fields below it were an attempt
+    // to name the handful of things a performance depends on, and they were
+    // never going to be complete: they say nothing about the mixer, the style
+    // levels, the ducker, the finisher, per-slot voicing, kit unity or the
+    // macros. A song replayed against a different set sounded different, which
+    // for a format whose entire promise is "it sounds like the original" is the
+    // one thing it must not do.
+    //
+    // The whole set costs ~980 KB against a performance of ~50 KB, so the file
+    // is dominated by it either way - and a megabyte buys a song that cannot
+    // drift when a set is edited later. Referencing the set by name would be
+    // smaller and would make every song a hostage to a file it does not own.
+    //
+    // `splitPoint` STAYS as its own field, and it is the one thing that must:
+    // the split decides which recorded notes were CHORD and which were SOLO, so
+    // replaying with a different split re-routes the entire performance. The SET
+    // stopped carrying it when it moved to grex_master.xml, so the song has to.
+    //==========================================================================
     struct Setup
     {
+        juce::ValueTree    setSnapshot;   // a full <BetelSet>, embedded
         juce::String       stylePath;
         double             tempoBpm   = 120.0;
         int                timeSigNum = 4;
@@ -153,6 +179,7 @@ public:
         setup = setupAtArm;
         song.clear();
         fifo.reset();
+        droppedEvents.store (0, std::memory_order_relaxed);
         startBeats.store (0.0, std::memory_order_release);
         state.store ((int) State::Armed, std::memory_order_release);
     }
@@ -161,8 +188,12 @@ public:
         until the next arm(); call saveToFile() afterwards to persist it. */
     void stop()
     {
+        const bool wasRecording = (getState() == State::Recording);
+
         state.store ((int) State::Idle, std::memory_order_release);
         serviceFifo();   // final drain
+
+        juce::ignoreUnused (wasRecording);
     }
 
     /** Move queued events from the lock-free FIFO into the song buffer. Pump
@@ -196,6 +227,35 @@ public:
     /** Record one MIDI event at absolute beat position @p beatsAbsolute.
         Call for every incoming message while isActive(). The first event seen
         while Armed latches the song start (action-driven). */
+    //==========================================================================
+    // A GESTURE THAT NEVER TOUCHED THE MIDI STREAM.
+    //
+    // Pressing a variation with the MOUSE drives the same processor call a pad
+    // does, but nothing enters the midi buffer - so the whole half of the
+    // performance made by hand was missing from the recording. That is exactly
+    // the gap Rob named: "a mix of midi playing and variation button presses".
+    //
+    // STATUS 0x01 IS SAFE AS A MARKER because 0x00-0x7F are DATA bytes and can
+    // never be a MIDI status - so a remote event cannot be mistaken for one, and
+    // the existing 3-byte record needs no change at all. `RemoteId` has 71
+    // entries and fits the 7 bits of a data byte with room to spare; if it ever
+    // passes 127 this encoding has to grow, which is why the assert is here.
+    //==========================================================================
+    static constexpr uint8_t kRemoteStatus = 0x01;
+
+    void recordRemote (double beatsAbsolute, int remoteId, int value) noexcept
+    {
+        jassert (remoteId >= 0 && remoteId <= 127);
+        if (remoteId < 0 || remoteId > 127) return;
+
+        recordEvent (beatsAbsolute, kRemoteStatus,
+                     (uint8_t) remoteId,
+                     (uint8_t) juce::jlimit (0, 127, value));
+    }
+
+    static bool isRemoteEvent (const Event& e) noexcept
+    { return e.status == kRemoteStatus; }
+
     void recordEvent (double beatsAbsolute, uint8_t status, uint8_t d1, uint8_t d2) noexcept
     {
         const State st = (State) state.load (std::memory_order_acquire);
@@ -214,7 +274,10 @@ public:
         fifo.prepareToWrite (1, s1, n1, s2, n2);
         if (n1 > 0) fifoBuffer[(size_t) s1] = { rel, status, d1, d2 };
         // If the FIFO is full (n1 == 0) the event is dropped rather than
-        // blocking the audio thread. serviceFifo() must keep up.
+        // blocking the audio thread. serviceFifo() must keep up - and now says
+        // so when it does not, instead of losing the take in silence.
+        if (n1 <= 0)
+            droppedEvents.fetch_add (1, std::memory_order_relaxed);
         fifo.finishedWrite (n1);
     }
 
@@ -225,7 +288,18 @@ public:
     bool saveToFile (const juce::File& file) const
     {
         juce::ValueTree vt ("GrexSong");
-        vt.setProperty ("version",    1,                  nullptr);
+        vt.setProperty ("version",    2,                  nullptr);
+
+        // THE WHOLE SET, as a child. Version 2 is the only difference from
+        // version 1 that matters; everything below is kept so a v2 file still
+        // opens in a reader that only understands v1's header.
+        if (setup.setSnapshot.isValid())
+            vt.appendChild (setup.setSnapshot.createCopy(), nullptr);
+
+        // Length, for the transport's position readout. Derived rather than
+        // tracked, so it cannot disagree with the events.
+        vt.setProperty ("lengthBeats",
+                        song.empty() ? 0.0 : song.back().beats, nullptr);
         vt.setProperty ("stylePath",  setup.stylePath,    nullptr);
         vt.setProperty ("tempoBpm",   setup.tempoBpm,     nullptr);
         vt.setProperty ("timeSigNum", setup.timeSigNum,   nullptr);
@@ -271,7 +345,29 @@ public:
         auto vt = juce::ValueTree::readFromStream (fis);
         if (! vt.isValid() || ! vt.hasType ("GrexSong")) return false;
 
+        // ── THE EMBEDDED SET, READ *AFTER* THE RESET ────────────────────────
+        //
+        // THIS WAS THE BUG.  The snapshot was read into outSetup and then
+        // `outSetup = Setup{}` default-constructed straight over the top of it,
+        // one line later, so setSnapshot came back INVALID from every single
+        // v2 file - the ~980 KB the format exists to carry was read off disk
+        // and thrown away.
+        //
+        // Downstream, loadSongFile only applies the set when the snapshot is
+        // valid, so it never applied one. The song then replayed against
+        // whatever set and style happened to be loaded - which, if that is
+        // nothing, is SILENCE, and if it is something else, is the wrong
+        // instrument on every channel. Either way the file itself was fine and
+        // the loader was lying about it.
+        //
+        // Clearing first, reading second. Also gone: a duplicated
+        // isValid/hasType guard that made the block look longer than it was.
         outSetup = Setup{};
+
+        // A v1 song has no embedded set and simply comes back without one -
+        // the thin fields still load, so it plays as well as it ever did.
+        outSetup.setSnapshot = vt.getChildWithName ("BetelSet").createCopy();
+
         outSetup.stylePath  = vt.getProperty ("stylePath").toString();
         outSetup.tempoBpm   = (double) vt.getProperty ("tempoBpm",   120.0);
         outSetup.timeSigNum = (int)    vt.getProperty ("timeSigNum", 4);
@@ -327,6 +423,7 @@ private:
     std::array<Event, kFifoCapacity> fifoBuffer {};
 
     std::atomic<int>    state      { (int) State::Idle };
+    std::atomic<int>    droppedEvents { 0 };
     std::atomic<double> startBeats { 0.0 };
 
     Setup              setup;            // captured at arm() — message thread

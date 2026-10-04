@@ -1,4 +1,7 @@
+
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 //==============================================================================
 // EffectsPanel.h  —  Effects tab of the InstrEditorWindow.
 //
@@ -90,8 +93,27 @@ public:
             eqFreq[i].onFreqChanged = [this](float){ if (onAnythingChanged) onAnythingChanged(); };
         }
 
+        for (auto* s : { &dDamp,&dHp,&dSmooth })
+            { addAndMakeVisible(*s); s->onChange = notifyFn(); }
+
+        // Real units - "62" says nothing about a filter.
+        dDamp  .displayFn = [] (float ui)
+        {
+            const float hz = uiToDampHz (ui);
+            return hz >= 1000.0f ? juce::String (hz / 1000.0f, 1) + " kHz"
+                                 : juce::String ((int) hz) + " Hz";
+        };
+        dHp    .displayFn = [] (float ui)
+        {
+            const float hz = uiToHpHz (ui);
+            return hz <= 21.0f ? juce::String ("OFF") : juce::String ((int) hz) + " Hz";
+        };
+        dSmooth.displayFn = [] (float ui)
+        { return juce::String ((int) uiToSmoothMs (ui)) + " ms"; };
+
         // ── Reverb ────────────────────────────────────────────────────────────
-        for (auto* s : { &rSize,&rDamp,&rWet,&rDry,&rTail,&rPre }) { addAndMakeVisible(*s); s->onChange = notifyFn(); }
+        for (auto* s : { &rSize,&rDamp,&rWet,&rDry,&rTail,&rPre,&rEr,&rErSize })
+            { addAndMakeVisible(*s); s->onChange = notifyFn(); }
 
         // ── Pan ───────────────────────────────────────────────────────────────
         addAndMakeVisible(panSlider); panSlider.onChange = notifyFn();
@@ -206,6 +228,9 @@ public:
         dFB .setValue(kDelayFbRange.toUi (p.delayFeedback));
         dDry.setValue(kUnitRange   .toUi (p.delayDry));
         dWet.setValue(kUnitRange   .toUi (p.delayWet));
+        dDamp  .setValue (dampHzToUi   (p.delayDampHz));
+        dHp    .setValue (hpHzToUi     (p.delayHpHz));
+        dSmooth.setValue (smoothMsToUi (p.delaySmoothMs));
         delayWetBase  = p.delayWetBase;
         reverbWetBase = p.reverbWetBase;
 
@@ -264,6 +289,9 @@ public:
         p.delayFeedback = kDelayFbRange.toNative (dFB .getValue());
         p.delayDry      = kUnitRange   .toNative (dDry.getValue());
         p.delayWet      = kUnitRange   .toNative (dWet.getValue());
+        p.delayDampHz   = uiToDampHz   (dDamp  .getValue());
+        p.delayHpHz     = uiToHpHz     (dHp    .getValue());
+        p.delaySmoothMs = uiToSmoothMs (dSmooth.getValue());
         p.delayWetBase  = delayWetBase;
         p.reverbWetBase = reverbWetBase;
         p.eqEnabled     = eqOn;
@@ -288,6 +316,50 @@ public:
         p.phaserDepth    = kUnitRange.toNative (phDepth.getValue());
         p.phaserFeedback = kUnitRange.toNative (phFB   .getValue());
         p.phaserMix      = kUnitRange.toNative (phMix  .getValue());
+    }
+
+    //==========================================================================
+    // 0..100 <-> Hz / ms.  Squared on the two filters so the useful bottom of
+    // each range is not crushed into a few slider steps, which is the same law
+    // the reverb's band filter already uses.
+    //==========================================================================
+    static float uiToDampHz (float ui)
+    { const float u = juce::jlimit (0.0f, 100.0f, ui) * 0.01f; return 200.0f + 19800.0f * u * u; }
+    static float dampHzToUi (float hz)
+    { return 100.0f * std::sqrt (juce::jlimit (0.0f, 1.0f, (juce::jlimit (200.0f, 20000.0f, hz) - 200.0f) / 19800.0f)); }
+
+    static float uiToHpHz (float ui)
+    { const float u = juce::jlimit (0.0f, 100.0f, ui) * 0.01f; return 20.0f + 1980.0f * u * u; }
+    static float hpHzToUi (float hz)
+    { return 100.0f * std::sqrt (juce::jlimit (0.0f, 1.0f, (juce::jlimit (20.0f, 2000.0f, hz) - 20.0f) / 1980.0f)); }
+
+    static float uiToSmoothMs (float ui)
+    { const float u = juce::jlimit (0.0f, 100.0f, ui) * 0.01f; return 1.0f + 499.0f * u * u; }
+    static float smoothMsToUi (float ms)
+    { return 100.0f * std::sqrt (juce::jlimit (0.0f, 1.0f, (juce::jlimit (1.0f, 500.0f, ms) - 1.0f) / 499.0f)); }
+
+    /** EARLY REFLECTIONS load / read.
+
+        OUTSIDE the templated loadFx / readFx pair, for exactly the reason the
+        sweetener is: those two are shared with the Funkey family editor through
+        Betel::FamilyFxParams, and every field added there has to exist on
+        SlotParams too.  ER belongs to a SECTION RACK and to nothing else - there
+        is no per-slot early-reflections stage and there should not be one - so
+        putting it in the shared struct would give every slot and every macro
+        family two parameters they neither own nor persist.
+
+        GlobalEffectsContent calls these; the slot path does not, and never shows
+        the REVERB page anyway (see InstrEditorWindow::setSelectorsVisible). */
+    void loadEr (float erMix01, float erSize01)
+    {
+        rEr    .setValue (kUnitRange.toUi (erMix01));
+        rErSize.setValue (kUnitRange.toUi (erSize01));
+    }
+
+    void readEr (float& erMix01, float& erSize01) const
+    {
+        erMix01  = kUnitRange.toNative (rEr    .getValue());
+        erSize01 = kUnitRange.toNative (rErSize.getValue());
     }
 
     /** SWEETENER load / read.
@@ -487,7 +559,7 @@ public:
                 // same two colours and the same meaning as the Finisher's GR
                 // meter, so a reading learned on one page transfers.
                 g.setColour (db >= kSweetMeterHotDb ? juce::Colour (0xFFCC3322)
-                                                    : juce::Colour (0xFFD4AF37));
+                                                    : juce::Colour (Betel::Pal::kAccentBright));
                 g.fillRect (fill);
             }
 
@@ -569,7 +641,8 @@ private:
     std::vector<GoldSlider*> everySlider()
     {
         std::vector<GoldSlider*> v {
-            &rSize, &rDamp, &rWet, &rDry, &rTail, &rPre, &panSlider, &dFB, &dDry, &dWet,
+            &rSize, &rDamp, &rWet, &rDry, &rTail, &rPre, &rEr, &rErSize,
+            &panSlider, &dFB, &dDry, &dWet, &dDamp, &dHp, &dSmooth,
             &chRate, &chDepth, &chMix,
             &wSens, &wRate, &wLfo, &wFreq, &wQ, &wMix,
             &phRate, &phDepth, &phFB, &phMix
@@ -690,19 +763,30 @@ private:
         revBtn.setBounds(inner.removeFromTop(24).removeFromLeft(70));
         inner.removeFromTop(4);
         const int g = 6;
-        // Six faders on top, the send band underneath - a two-handle slider
-        // reads as a frequency AXIS and wants width, not a column.
+        // Seven faders on top (see the count note below), the send band
+        // underneath - a two-handle slider reads as a frequency AXIS and wants
+        // width, not a column.
         auto band = inner.removeFromBottom (juce::jmax (34, inner.getHeight() / 3));
         inner.removeFromBottom (4);
 
-        const int sw = (inner.getWidth() - 5 * g) / 6;
-        rSize.setBounds(inner.getX(),                 inner.getY(), sw, inner.getHeight());
-        rTail.setBounds(inner.getX() + (sw + g),      inner.getY(), sw, inner.getHeight());
-        rDamp.setBounds(inner.getX() + (sw + g) * 2,  inner.getY(), sw, inner.getHeight());
-        rWet .setBounds(inner.getX() + (sw + g) * 3,  inner.getY(), sw, inner.getHeight());
-        rDry .setBounds(inner.getX() + (sw + g) * 4,  inner.getY(), sw, inner.getHeight());
-        rPre .setBounds(inner.getX() + (sw + g) * 5,  inner.getY(),
-                        inner.getWidth() - (sw + g) * 5, inner.getHeight());
+        // DRY IS GONE FROM THIS PAGE.  The reverb is a SEND now — the dry
+        // reaches the bus by its own route and this rack only ever returns wet,
+        // so a dry control here wrote to a field nothing reads.  Five across
+        // rather than six; rDry still exists and still round-trips, it is just
+        // never shown.
+        // SEVEN across now, ER and ER SIZE on the end.  They go last rather
+        // than beside SIZE because the first five are the tail and reading them
+        // as a group is worth more than grouping the two SIZEs together - which
+        // would also invite the assumption that they are one control.
+        const int sw = (inner.getWidth() - 6 * g) / 7;
+        rSize  .setBounds(inner.getX(),                 inner.getY(), sw, inner.getHeight());
+        rTail  .setBounds(inner.getX() + (sw + g),      inner.getY(), sw, inner.getHeight());
+        rDamp  .setBounds(inner.getX() + (sw + g) * 2,  inner.getY(), sw, inner.getHeight());
+        rWet   .setBounds(inner.getX() + (sw + g) * 3,  inner.getY(), sw, inner.getHeight());
+        rPre   .setBounds(inner.getX() + (sw + g) * 4,  inner.getY(), sw, inner.getHeight());
+        rEr    .setBounds(inner.getX() + (sw + g) * 5,  inner.getY(), sw, inner.getHeight());
+        rErSize.setBounds(inner.getX() + (sw + g) * 6,  inner.getY(),
+                          inner.getWidth() - (sw + g) * 6, inner.getHeight());
         rBand.setBounds (band);
     }
 
@@ -730,12 +814,16 @@ private:
         // Three across now (FB / DRY / WET) rather than two.  The reverb row
         // reads SIZE DAMP TAIL WET DRY; this keeps WET and DRY adjacent so the
         // pair reads the same way on both effects.
+        // FIVE across now: FB WET DAMP HP SMOOTH.  DRY stays hidden whatever the
+        // page - the delay is a send and returns wet only.
         const int g3 = 6;
-        const int w3 = (inner.getWidth() - g3 * 2) / 3;
-        dFB .setBounds(inner.getX(),                  fbY, w3, fbH);
-        dDry.setBounds(inner.getX() + (w3 + g3),      fbY, w3, fbH);
-        dWet.setBounds(inner.getX() + (w3 + g3) * 2,  fbY,
-                       inner.getWidth() - (w3 + g3) * 2, fbH);
+        const int w3 = (inner.getWidth() - g3 * 4) / 5;
+        auto place = [&] (GoldSlider& s, int i)
+        { s.setBounds (inner.getX() + i * (w3 + g3), fbY, w3, fbH); };
+
+        place (dFB, 0); place (dWet, 1); place (dDamp, 2); place (dHp, 3);
+        dSmooth.setBounds (inner.getX() + 4 * (w3 + g3), fbY,
+                           inner.getWidth() - 4 * (w3 + g3), fbH);
     }
 
     void setSelectedEffect(int idx)
@@ -759,6 +847,13 @@ private:
         for (int i = 0; i < 5; ++i) { eqGain[i].setVisible(showEq); eqFreq[i].setVisible(showEq); }
         eqBtn.setVisible(showEq);
 
+        // THREE CONTROLS.  RATE and DEPTH are real again — the chorus is
+        // juce::dsp::Chorus now and those are its actual parameters, not a
+        // convolver's drift and width dressed up as them.  MIX stays the
+        // CEILING the per-instrument sends reach.
+        //
+        // Centre delay stays fixed at 7.5 ms in the bridge: 7-8 ms is the
+        // classic range and moving it is how a chorus becomes a flanger.
         setFxGroupVisible(idx == 1, chBtn,  { &chRate, &chDepth, &chMix });
         setFxGroupVisible(idx == 2, wahBtn, { &wSens, &wRate, &wLfo, &wFreq, &wQ, &wMix });
         setFxGroupVisible(idx == 3, phBtn,  { &phRate, &phDepth, &phFB, &phMix });
@@ -766,7 +861,10 @@ private:
         const bool showDl = (idx == 4);
         delBtn.setVisible(showDl);
         btnSig44.setVisible(showDl); btnSig34.setVisible(showDl);
-        dFB.setVisible(showDl); dDry.setVisible(showDl); dWet.setVisible(showDl);
+        // dDry stays hidden whatever the page: the delay is a SEND and returns
+        // wet only, so its dry control writes to a field nothing reads.
+        dFB.setVisible(showDl); dDry.setVisible(false); dWet.setVisible(showDl);
+        dDamp.setVisible(showDl); dHp.setVisible(showDl); dSmooth.setVisible(showDl);
 
         // The division row's visibility is NOT set here - refreshDelayButtons
         // owns it, because only it knows how many buttons this signature uses.
@@ -777,9 +875,10 @@ private:
         const bool showRv = (idx == 5);
         revBtn.setVisible(showRv);
         rSize.setVisible(showRv); rDamp.setVisible(showRv);
-        rDry.setVisible(showRv);  rTail.setVisible(showRv);
+        rDry.setVisible(false);   rTail.setVisible(showRv);   // rDry: see dDry above
         rBand.setVisible(showRv);
         rWet.setVisible(showRv);  rPre.setVisible(showRv);
+        rEr.setVisible(showRv);   rErSize.setVisible(showRv);
 
         panSlider.setVisible(idx == 6);
 
@@ -1044,6 +1143,22 @@ private:
     BandFilterSlider rBand { "SEND BAND" };
     GoldSlider rPre  { "PRE",  0.0f, 100.0f,  0.0f, "" };
 
+    // ── EARLY REFLECTIONS ────────────────────────────────────────────────────
+    //
+    // ER is the balance between the room and the tail, not a second wet: at 0
+    // the reverb is exactly what it was, at 100 it is reflections only.  That is
+    // the control worth having, because "spatial definition with no noticeable
+    // tail" is the setting an arranger actually wants - sixteen parts through a
+    // long tail is mud, and turning the tail down used to mean turning the room
+    // off with it.
+    //
+    // ER SIZE compresses the tap pattern in time.  It is a SEPARATE size from
+    // the tail's, deliberately: the tail's SIZE sets the FDN geometry, and a
+    // small bright room in front of a long hall is a real and useful combination
+    // that one shared control cannot express.
+    GoldSlider rEr     { "ER",      0.0f, 100.0f,  0.0f, "" };
+    GoldSlider rErSize { "ER SIZE", 0.0f, 100.0f, 50.0f, "" };
+
     // PAN: 50 = centre, maps to pan -1..+1.
     GoldSlider panSlider { "PAN", 0.0f, 100.0f, 50.0f, "" };
 
@@ -1056,6 +1171,19 @@ private:
     // untouched until the user says otherwise, and WET only adds on top.
     GoldSlider dDry { "DRY", 0.0f, 100.0f, 100.0f, "" };
     GoldSlider dWet { "WET", 0.0f, 100.0f,  0.0f, "" };
+
+    // ── DELAY TONE.  Two were hidden, one did not exist. ────────────────────
+    // DAMP was a hard-coded 5 kHz inside StereoDelayFx::prepare, so a bright
+    // delay was unreachable.  HP is new and is the control that stops repeats
+    // crowding the source - no amount of the low-pass does that job.  SMOOTH is
+    // the time slew: at the bottom the delay jumps on a tempo change, at the top
+    // it slides like a moving tape head.
+    GoldSlider dDamp   { "DAMP",   0.0f, 100.0f, 49.0f, "" };   // 4954 Hz - the
+                                                               // closest integer
+                                                               // step to the 5000
+                                                               // this was fixed at
+    GoldSlider dHp     { "HP",     0.0f, 100.0f,  0.0f, "" };   // open
+    GoldSlider dSmooth { "SMOOTH", 0.0f, 100.0f, 28.0f, "" };   // ~40 ms
 
     // What full travel on each WET slider is worth.  Stored with the slot, set
     // by the LEFT double-click box below.  Defaults differ on purpose - see

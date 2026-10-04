@@ -1,3 +1,5 @@
+
+
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_gui_extra/juce_gui_extra.h>
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -5,13 +7,15 @@
 #include "RegistrationManager.h"
 
 #include "Main.h"
-#include "PerfMonitor.h"
 #include "GlobalMacros.h"       // GrexPaths + the funkey / big-drums macro presets
 #include "StyleFavorites.h"     // the stars, read at startup with everything else
 #include "CcMap.h"             // the rig's CC bindings, in force before the first event
 #include "MainComponent.h"
 #include "StyleLoader.h"
+#include "FstLibrary.h"      // the styles folder, as loose .fgt files
+#include "SearchHistory.h"   // saved search keywords, root-backed
 #include "StyleLevels.h"    // per-style loudness-trim switch, read in the callback
+#include "SetBaker.h"       // setFileNameForStyle - ONE spelling of the set name
 
 // ======================================================
 //  BetelgeuseProcessor — implementation
@@ -36,72 +40,96 @@ BetelgeuseProcessor::BetelgeuseProcessor()
     //==========================================================================
     // EVERYTHING THAT READS A FILE AT STARTUP LIVES HERE, NOT IN THE EDITOR.
     //
-    // All of this used to run in the MainComponent constructor, which means it
-    // ran only when the plugin WINDOW was built.  The processor is built every
-    // time the plugin is instantiated; the editor is built only when somebody
-    // looks at it.  Three ordinary things never open the window:
+    // All of this used to run in the MainComponent constructor, which meant an
+    // offline bounce, a project played without opening the UI, or a host that
+    // instantiates before showing a window got none of it.
     //
-    //   * an offline bounce / freeze / render-in-place;
-    //   * reopening a saved project and pressing play without clicking the
-    //     plugin;
-    //   * any headless or scripted host.
+    // IT HAS ALL MOVED INTO rescanFromFolderManager, WHICH RAN AT LINE 37
+    // ABOVE.  Not for tidiness: those files live under GrexPaths::root(), and
+    // reading them from the constructor meant they were read ONCE, against
+    // whatever root existed at startup.  On a clean install that root does not
+    // exist yet, so every one of them silently fell back to defaults - and then
+    // the user pressed LOCATE, the real files were right there, and nothing
+    // re-read them until the plugin was reloaded.
     //
-    // In every one of those the plugin used to come up UNREGISTERED - three
-    // seconds of silence out of every twenty-one, in a render, on a machine
-    // that owns a licence - and with the master settings still at their
-    // defaults, so the wheel range, the solo base unity and the chord mode
-    // were all wrong too.  None of it had anything to do with the UI; it was
-    // simply parked in the only constructor that happened to be there.
+    // The comment at line 33 already promised that relocating "re-runs this
+    // same logic".  It did not.  Now it does.
     //==========================================================================
+    RegistrationManager::getInstance().checkRegistration();
+}
+
+//==============================================================================
+// See the declaration in Main.h for the rule this enforces.
+//
+// CALLED FROM rescanFromFolderManager AND NOWHERE ELSE, so there is exactly one
+// answer to "when is this re-read": whenever the root is set, including the
+// first time.  Adding a second call site is how the two drift apart.
+//==============================================================================
+void BetelgeuseProcessor::reloadRootBackedSettings()
+{
+    auto& ms = Betel::MasterSettings::get();
+    ms.load();
+
+    // ── THE CC BINDINGS, BEFORE THE FIRST MIDI EVENT ─────────────────────────
+    //
+    // grex_cc_map.xml describes the RIG - which knob on this desk drives
+    // what - so like the pitch bend range below it has to be in force before
+    // anything can arrive, window or no window.
     {
-        // The licence is re-validated against THIS machine every launch, so
-        // copying grex_license.key to another computer achieves nothing there.
-        RegistrationManager::getInstance().checkRegistration();
-
-        auto& ms = Betel::MasterSettings::get();
-        ms.load();
-
-        // ── THE CC BINDINGS, BEFORE THE FIRST MIDI EVENT ─────────────────────
-        //
-        // grex_cc_map.xml describes the RIG - which knob on this desk drives
-        // what - so like the pitch bend range above it has to be in force before
-        // anything can arrive, window or no window.
-        //
-        // It was loaded in the EDITOR, which meant a window-less session (an
-        // offline bounce, or a project simply played without opening the UI) ran
-        // on whatever the processor's own defaults were.  Those defaults are now
-        // "nothing assigned", so that case is already safe - but loading here is
-        // what makes the user's REAL assignments work in the same session.
-        {
-            auto& cm = Betel::CcMap::get();
-            cm.load();
-            for (int i = 0; i < kNumCcTargets; ++i)
-                setCcNumber (i, cm.ccFor (i));
-        }
-
-        // The wheel's throw and the right hand's base unity are properties of
-        // the RIG, not of a song, so they must be in force before the first set
-        // loads - and before the first note, in a session with no window.
-        setSoloPitchBendRange (ms.getPitchBendRange());
-        applyStoredSoloBaseUnity();
-
-        chordTracker.setChordMode (
-            ms.isFingeredChord() ? Betel::ChordZoneTracker::ChordMode::Fingered
-                                 : Betel::ChordZoneTracker::ChordMode::SingleFinger);
-        setTempoSynced (ms.isTempoSynced());
+        auto& cm = Betel::CcMap::get();
+        cm.load();
+        for (int i = 0; i < kNumCcTargets; ++i)
+            setCcNumber (i, cm.ccFor (i));
     }
+
+    // The wheel's throw and the right hand's base unity are properties of the
+    // RIG, not of a song, so they must be in force before the first set loads -
+    // and before the first note, in a session with no window.
+    setSoloPitchBendRange (ms.getPitchBendRange());
+    applyStoredSoloBaseUnity();
+
+    chordTracker.setChordMode (
+        ms.isFingeredChord() ? Betel::ChordZoneTracker::ChordMode::Fingered
+                             : Betel::ChordZoneTracker::ChordMode::SingleFinger);
+
+    // WHERE THE HANDS DIVIDE, BEFORE THE FIRST NOTE, WINDOW OR NO WINDOW.
+    //
+    // chordTracker directly, NOT setSplitPoint(): the full setter writes back
+    // to MasterSettings, and seeding must never re-save the value it has just
+    // finished reading.
+    chordTracker.setSplitPoint (ms.getSplitPoint());
+
+    setTempoSynced (ms.isTempoSynced());
 
     // Global macro presets (funkey / big drums) and the style stars are
     // installation-wide files under the same root.  Same reasoning: a style
     // played without the window open should sound the way this install sounds.
     Betel::GlobalMacros::get().loadFunkey();
-    Betel::GlobalMacros::get().loadBigDrums();
     Betel::StyleFavorites::get().load();
+    Betel::SearchHistory::get().load();
 
-    // Crash settings own themselves (grex_crash.xml is the sole owner - the set
-    // deliberately does not carry them), so they can be read here too.  The
-    // editor re-reads them after the Crash tab has pushed its defaults, which
-    // is a no-op on an established install and correct on a fresh one.
+    // ── THE GLOBAL STYLE-BUS BOOST ───────────────────────────────────────────
+    //
+    // grex_boost.xml was the one root-backed file missing from this list, and
+    // it is the worst one to miss: StyleLevels is a lazy singleton, so it reads
+    // the file on FIRST USE, which on a clean install is before the user has
+    // located the library.  It then resolved next to the executable, found
+    // nothing, and sat on the factory value for the rest of the session while
+    // the real file was in the folder the user had just picked.
+    //
+    // Re-reading here is the same rule every line above follows - whenever the
+    // root is set, including the first time.
+    Betel::StyleLevels::get().loadGlobalBoost();
+
+    // AND PUSH IT, because loading a number nothing reads is half a fix.  This
+    // is the same single call setStyleBoostDb makes; it is an atomic store on
+    // the engine, so it is safe with no style loaded and safe from the ctor.
+    stylePlayer.pushStyleBoost();
+
+    // Crash settings own themselves (grex_crash.xml is the sole owner - the
+    // set deliberately does not carry them).  The editor re-reads them after the
+    // Crash tab has pushed its defaults, which is a no-op on an established
+    // install and correct on a fresh one.
     loadCrashSettings();
 }
 
@@ -133,9 +161,8 @@ void BetelgeuseProcessor::rescanFromFolderManager()
     // kicks/ snares/ toms/ cymbals/ percussion/ ...); scanFolder recurses and
     // groups them into virtual kits by family-prefix.
     {
-        // Always call scanFolder (it logs the resolved path + isDir to
-        // grex_drum.txt and safely returns 0 if the folder is absent), so the
-        // diagnostic is written even when the path is wrong.
+        // Always call scanFolder: it safely returns 0 when the folder is
+        // absent, so a wrong path costs nothing and needs no guard here.
         drumKitRegistry.scanFolder (drums, juce::String (kFixedAccessCode));
 
         // The SAMPLED-KIT folders sit alongside the component folders:
@@ -170,6 +197,14 @@ void BetelgeuseProcessor::rescanFromFolderManager()
                                    folderManager.getOrientalSoundsFolder(),
                                    juce::String (kFixedAccessCode));
 
+    // EDM KIT base kits (.dsin - SAVE PAD AS BASE) live in the GM pack beside the
+    // style presets.  This used to be set only inside rescanSoundLibrary(), which
+    // nothing calls: the saver never knew where to write ("The sound library
+    // folder is not set yet") and no saved base was ever read.  Set here, where
+    // the libraries actually load - before the first style pools its kits.
+    EdmKitFiles::setBaseKitFolder (folderManager.getGmSoundsFolder()
+                                                .getChildFile ("style_instruments_presets"));
+
     // A duplicate instrument number means a saved set can resolve to the wrong
     // sound, and nothing on screen would ever say so - the report is the only
     // way it becomes visible.
@@ -189,7 +224,7 @@ void BetelgeuseProcessor::rescanFromFolderManager()
     // live here.
     // One instruments_presets folder per installed pack, merged - a pack ships
     // its sounds and their voicing in one folder, so both arrive and leave
-    // together.
+    // together.  Three of them now, one per pack.
     engine.setInstrumentPresetFolders      (allInstrumentPresetsFolders());
     engine.setStyleInstrumentPresetFolders (allStyleInstrumentPresetsFolders());
 
@@ -211,6 +246,61 @@ void BetelgeuseProcessor::rescanFromFolderManager()
     const auto styles = folderManager.getStylesFolder();
     if (styles.isDirectory())
         stylesFolders.push_back (styles);
+
+    // ── RE-OPEN THE BLOB LIBRARY.  THIS LINE WAS MISSING, AND IT IS THE WHOLE
+    //    REASON "LOCATE SYSTEM FOLDER" APPEARED NOT TO WORK ─────────────────
+    //
+    // openStyleLibrary() was called in exactly one place: the processor
+    // constructor.  So the library was mapped ONCE, from whatever root was
+    // resolved at startup, and nothing ever re-mapped it.
+    //
+    // Relocating the folder therefore did everything EXCEPT the one thing the
+    // user pressed the button for.  The new root was saved to the locator, the
+    // drum kits and the sound library were re-scanned, GrexPaths moved, the LED
+    // went green - and `styleLibrary` still held whatever it had found (usually
+    // nothing) at construction.  rescanStyleBrowser then faithfully published
+    // that empty library to the browser.
+    //
+    // Every symptom pointed at the locator and none of them were the locator:
+    // it had saved the path correctly, and a plugin RELOAD picked the styles up
+    // immediately, because the constructor is where the one call lived.
+    //
+    // Safe to re-map with a style loaded and playing: readStyleById copies the
+    // bytes out and StyleLoader parses them into a StyleData, so a loaded style
+    // owns its data and holds no pointer into the mapping we are replacing.
+    openStyleLibrary();
+
+    // ── AND FORGET THE CACHED LICENCE CARRIER KEY ────────────────────────
+    //
+    // Same reasoning as the library above, for the same reason.  The carrier
+    // (grex_ambience.wav) lives under GrexPaths::root(), and the registration
+    // code caches the key it extracts so a per-track plugin instance does not
+    // re-read a megabyte of WAV every time.
+    //
+    // On a clean install the constructor rescans BEFORE the root exists, so
+    // checkRegistration finds no carrier and caches "no key".  Without this
+    // line the user then locates the folder, the carrier is sitting right
+    // there, and registration still fails for the rest of the session.
+    RegistrationManager::getInstance().forgetCarrierKey();
+
+    // ── AND EVERY OTHER FILE THAT LIVES UNDER THE ROOT ───────────────────────
+    //
+    // The style library was not the only thing cached against a root that had
+    // not been chosen yet.  grex_master.xml, grex_cc_map.xml,
+    // grex_funkey.xml, grex_bigdrums.xml, grex_style_favorites.xml and
+    // grex_crash.xml were ALL read exactly once, in the constructor, and none
+    // of them were re-read when the root moved.
+    //
+    // On a clean install that is six files falling back to defaults, then the
+    // user locating the folder that holds the real ones, and every one of them
+    // staying wrong until the plugin is reloaded: the master settings, the CC
+    // rig, both macro presets, the style stars and the crash config.
+    //
+    // MUST STAY LAST IN THIS FUNCTION.  GrexPaths::setRoot runs at the top, and
+    // every file above is resolved through it - reading them before the root
+    // moves would re-read the OLD folder and cache it as the new answer, which
+    // is worse than not re-reading at all.
+    reloadRootBackedSettings();
 }
 
 void BetelgeuseProcessor::addStylesFolder (const juce::File& folder)
@@ -224,44 +314,49 @@ void BetelgeuseProcessor::addStylesFolder (const juce::File& folder)
 std::vector<BetelgeuseProcessor::StyleSearchResult>
 BetelgeuseProcessor::searchStyles (const juce::String& keyword) const
 {
+    // ── SEARCHES THE LIBRARY, NOT THE DISK ───────────────────────────────────
+    //
+    // This used to walk stylesFolders with findChildFiles and a filter of
+    // "*.sty;*.prs;*.bcs;*.sst;*.pst;*.pcs;*.fps;*.scp;*.aus" - every Yamaha SFF
+    // extension.  GREX'S LIBRARY IS LOOSE .fgt FILES, so that filter matched
+    // nothing, the scan returned an empty list, and EVERY search came back empty
+    // for every keyword.  Reported as "I added the keyword pop and it didn't find
+    // anything"; "pop" was never the problem.
+    //
+    // It also returned f.getFullPathName() as the ref, while the grid is fed
+    // from getStylesInGenre, which returns the STYLE ID (the filename stem).
+    // StylesTab::selectStyleByRef does stylePaths.indexOf(ref) against those
+    // stems, so an absolute path could never match one: even with the extensions
+    // fixed, clicking a result would have said "That style is no longer in the
+    // library."  TWO faults, and fixing only the visible one leaves the second.
+    //
+    // Both go away by reading styleLibrary.allEntries() - the same source
+    // getStylesInGenre uses.  One authority for what exists, so a search result
+    // and a grid cell cannot disagree, and the ref is right by construction.
+    // The old de-dupe pass is gone with it: the library is already unique.
     std::vector<StyleSearchResult> results;
-    const juce::String kw = keyword.trim();
 
-    for (const auto& folder : stylesFolders)
+    // ── ALL TOKENS MUST MATCH, IN ANY ORDER ──────────────────────────────────
+    //
+    // A plain containsIgnoreCase on the whole string only finds "pop ballad" if
+    // the name has those two words adjacent and in that order.  Splitting on
+    // whitespace and requiring every token lets "ballad pop" and "80s pop" find
+    // "80s Pop Ballad", which is how anyone actually types a half-remembered
+    // name.  An empty keyword still returns the whole library.
+    juce::StringArray tokens;
+    tokens.addTokens (keyword.trim(), false);
+    tokens.removeEmptyStrings();
+
+    for (const auto& e : styleLibrary.allEntries())
     {
-        if (! folder.isDirectory()) continue;
+        bool matches = true;
+        for (const auto& tok : tokens)
+            if (! e.displayName.containsIgnoreCase (tok)) { matches = false; break; }
 
-        // Recursive scan for every Yamaha SFF style variant we ship parsing
-        // for.  Extensions are categorical hints — all of them are SFF1 /
-        // SFF2 / SFF GE internally and parse through the same StyleLoader.
-        //
-        //   .sty — generic   .prs — Pro          .bcs — Basic
-        //   .sst — Session   .pst — Pianist      .pcs — Piano Combo
-        //   .fps — Free Play .scp — DJ           .aus — Audio
-        const auto files = folder.findChildFiles (
-            juce::File::findFiles | juce::File::ignoreHiddenFiles,
-            true,                          // recursive
-            "*.sty;*.prs;*.bcs;*.sst;*.pst;*.pcs;*.fps;*.scp;*.aus");
-
-        for (const auto& f : files)
-        {
-            const auto name = Betel::displayNameFor (f);
-            if (kw.isEmpty() || name.containsIgnoreCase (kw))
-                results.push_back ({ name, f.getFullPathName() });
-        }
+        if (matches)
+            results.push_back ({ e.displayName, e.styleId });
     }
 
-    // De-dupe by absolute path (same file showing up under multiple
-    // overlapping folders gets folded to one entry).
-    std::sort (results.begin(), results.end(),
-               [] (const StyleSearchResult& a, const StyleSearchResult& b)
-               { return a.absolutePath < b.absolutePath; });
-    results.erase (std::unique (results.begin(), results.end(),
-                                [] (const StyleSearchResult& a, const StyleSearchResult& b)
-                                { return a.absolutePath == b.absolutePath; }),
-                   results.end());
-
-    // Sort the visible list alphabetically by display name.
     std::sort (results.begin(), results.end(),
                [] (const StyleSearchResult& a, const StyleSearchResult& b)
                { return a.displayName.compareIgnoreCase (b.displayName) < 0; });
@@ -269,40 +364,165 @@ BetelgeuseProcessor::searchStyles (const juce::String& keyword) const
     return results;
 }
 
+//==============================================================================
+// OPEN THE LIBRARY. Called once, from the constructor.
+//
+// A file that fails to open is LOGGED AND SKIPPED, never fatal. Losing one style
+// is recoverable by replacing one file; refusing to start because of it is not,
+// and a player mid-gig cannot debug a style folder.
+//
+// THE SCAN IS RECURSIVE AND THE SUBFOLDERS ARE THE CATEGORIES - see
+// FstLibrary.h.  <root>/styles/Latin/Bossa Nova.fgt files under "Latin"; a style
+// sitting loose in <root>/styles files under GENERAL.
+//==============================================================================
+void BetelgeuseProcessor::openStyleLibrary()
+{
+    juce::StringArray problems;
+    const auto stylesFolder = folderManager.getStylesFolder();
+
+    styleLibrary.openFolder (stylesFolder, problems);
+
+    // ── AN EMPTY LIBRARY IS A FAILURE AND MUST SAY SO ────────────────────────
+    //
+    // `problems` only collects files that failed to OPEN, so the two commonest
+    // ways to end up with no styles - the folder is not there, or it holds no
+    // *.fgt - would produce an empty problems list, no report, and a browser
+    // that came up blank with nothing anywhere saying why. "Nothing failed" and
+    // "there was nothing to try" are the same answer, and only one is healthy.
+    //
+    // The report is therefore written when the library is EMPTY as well, and it
+    // names the folder that was searched and lists what is actually in it -
+    // because the answer is nearly always visible the moment you see the path
+    // the plugin looked at next to the path you put the styles in.
+    const bool empty = styleLibrary.isEmpty();
+
+    if (! problems.isEmpty() || empty)
+    {
+        juce::String report;
+        report << "GREX - STYLE LIBRARY REPORT" << juce::newLine
+               << juce::Time::getCurrentTime().toString (true, true) << juce::newLine
+               << juce::newLine
+               << "root folder   : " << folderManager.getRootFolder().getFullPathName()
+               << (folderManager.isRootFolderValid() ? "" : "   <-- DOES NOT EXIST") << juce::newLine
+               << "styles folder : " << stylesFolder.getFullPathName()
+               << (stylesFolder.isDirectory() ? "" : "   <-- DOES NOT EXIST") << juce::newLine
+               << "looking for   : " << Betel::Fst::kFileWildcard
+               << "  (recursively, one category per subfolder)" << juce::newLine
+               << "styles loaded : " << styleLibrary.getNumStyles() << juce::newLine
+               << "rejected      : " << problems.size() << juce::newLine
+               << juce::newLine;
+
+        for (const auto& p : problems)
+            report << "REJECTED: " << p << juce::newLine;
+
+        if (empty)
+        {
+            report << juce::newLine << "NO STYLES LOADED." << juce::newLine << juce::newLine;
+
+            if (! stylesFolder.isDirectory())
+            {
+                report << "The styles folder above does not exist." << juce::newLine
+                       << "Either put the .fgt files there, or press LOCATE SYSTEM FOLDER in"
+                       << juce::newLine
+                       << "the plugin header and pick the folder that CONTAINS the styles folder."
+                       << juce::newLine;
+            }
+            else
+            {
+                // WHAT IS ACTUALLY IN THERE, not what should be. A style still
+                // named .sty, or one with a second extension appended by a
+                // download, is invisible to the glob and completely visible in
+                // this list.
+                // RECURSIVE, to match the scan.  Listing only the top level
+                // would show an organised library as "3 file(s)" - the three
+                // folder entries findChildFiles does not return - and say
+                // nothing at all about the 200 styles inside them.
+                const auto found = stylesFolder.findChildFiles (juce::File::findFiles, true, "*");
+                report << "The folder exists but holds no readable *.fgt. It contains "
+                       << found.size() << " file(s):" << juce::newLine;
+                for (const auto& f : found)
+                    report << "   " << f.getRelativePathFrom (stylesFolder) << juce::newLine;
+            }
+        }
+
+        folderManager.getRootFolder().getChildFile ("grex_style_library.txt")
+                     .replaceWithText (report);
+    }
+}
+
 juce::StringArray BetelgeuseProcessor::getStyleGenres() const
 {
-    juce::StringArray genres;
-    const auto root = folderManager.getStylesFolder();
-    if (! root.isDirectory()) return genres;
-
-    const auto dirs = root.findChildFiles (
-        juce::File::findDirectories | juce::File::ignoreHiddenFiles, false);
-    for (const auto& d : dirs)
-        genres.add (d.getFileName());
-
-    genres.sort (true);   // case-insensitive alphabetical
-    return genres;
+    // ONE PER SUBFOLDER OF <root>/styles, alphabetical.  Derived from what was
+    // actually SCANNED rather than from the folders on disk, so an empty folder
+    // does not produce a category button with nothing behind it.
+    return styleLibrary.getGroups();
 }
 
 std::vector<BetelgeuseProcessor::StyleSearchResult>
 BetelgeuseProcessor::getStylesInGenre (const juce::String& genre) const
 {
+    // The `absolutePath` field carries a STYLE ID, which is now the file's PATH
+    // RELATIVE TO THE STYLES FOLDER without its extension - "Latin/Bossa Nova".
+    // The browser never looks inside that string - it takes it, shows the name
+    // beside it and hands it back on selection.
+    //
+    // THE ID IS THE PATH AND THE DISPLAY NAME IS THE STEM, which is the one
+    // place they differ.  A bare stem would collide the first time two folders
+    // both held a "Slow Rock", and one of them would then shadow the other in
+    // every set that referenced it, silently.
     std::vector<StyleSearchResult> out;
-    const auto dir = folderManager.getStylesFolder().getChildFile (genre);
-    if (! dir.isDirectory()) return out;
 
-    // Non-recursive: only the styles sitting directly inside this genre folder.
-    const auto files = dir.findChildFiles (
-        juce::File::findFiles | juce::File::ignoreHiddenFiles, false,
-        "*.sty;*.prs;*.bcs;*.sst;*.pst;*.pcs;*.fps;*.scp;*.aus");
-
-    for (const auto& f : files)
-        out.push_back ({ Betel::displayNameFor (f), f.getFullPathName() });
+    for (const auto& e : styleLibrary.allEntries())
+        if (e.group == genre)
+            out.push_back ({ e.displayName, e.styleId });
 
     std::sort (out.begin(), out.end(),
                [] (const StyleSearchResult& a, const StyleSearchResult& b)
                { return a.displayName.compareIgnoreCase (b.displayName) < 0; });
     return out;
+}
+
+//==============================================================================
+bool BetelgeuseProcessor::loadStyleByRef (const juce::String& idOrPath,
+                                          juce::String& errorMsg)
+{
+    if (idOrPath.isEmpty()) { errorMsg = "No style selected."; return false; }
+
+    // ── 1. THE LIBRARY FIRST ─────────────────────────────────────────────────
+    //
+    // Resolved through FstLibrary::find, which matches an id, then a display
+    // name, then the tail of a LEGACY BLOB ID - so a set saved while the blobs
+    // existed still finds its style without anything being rewritten.
+    if (const auto* e = styleLibrary.find (idOrPath))
+    {
+        auto fresh = std::make_unique<Betel::StyleData>();
+        if (! Betel::Fst::loadFromFile (e->file, *fresh, errorMsg))
+            return false;
+
+        adoptFreshStyle (std::move (fresh), e->file, e->styleId);
+        // THE LIBRARY'S id, not the string that was asked for. A legacy blob id
+        // resolves through find() but must not be stored again, or the set that
+        // carried it would keep carrying it forever.
+        currentStyleRef     = e->styleId;
+        lastLoadedStylePath = e->styleId;
+        return true;
+    }
+
+    // ── 2. A LEGACY PATH ─────────────────────────────────────────────────────
+    //
+    // Every set written before the blobs stores a real filesystem path. Trying
+    // it here is the whole migration: an old set keeps working from loose files
+    // if they are still there, and the moment it is re-saved it carries an id
+    // instead. Nothing is rewritten behind the player's back.
+    const juce::File f (idOrPath);
+    if (f.existsAsFile() && loadStyle (f, errorMsg))
+    {
+        currentStyleRef = f.getFullPathName();
+        return true;
+    }
+
+    errorMsg = "Style not found in the library: " + idOrPath;
+    return false;
 }
 
 bool BetelgeuseProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -324,14 +544,6 @@ void BetelgeuseProcessor::prepareToPlay(double sampleRate, int blockSize)
     // construction defaults (and, before this fix, it was never run at all).
     finisher.prepare(sampleRate, blockSize);
     emittedEvents.reserve (512);
-
-    // Spike diagnostics.  Writes alongside grex_log.txt; see PerfMonitor.h for
-    // how to read it.  prepare() must run here so block times can be expressed
-    // as a percentage of the REAL-TIME BUDGET for this sample rate / block size
-    // — a 3 ms block is fine at 512/48k and a dropout at 64/48k.
-    Betel::PerfMonitor::get().prepare (sampleRate, blockSize);
-    if (! Betel::PerfMonitor::get().isEnabled())
-        Betel::PerfMonitor::get().start (Betel::GrexPaths::perfLog());
 }
 
 void BetelgeuseProcessor::releaseResources()
@@ -361,44 +573,210 @@ bool BetelgeuseProcessor::loadStyle (const juce::File& file, juce::String& error
     // dispatch gate (per-quality winner / chord-mute), so no load-time rewrite
     // is needed here.
 
+    adoptFreshStyle (std::move (fresh), file, file.getFullPathName());
+    lastLoadedStylePath = file.getFullPathName();
+    currentStyleRef     = file.getFullPathName();
+    return true;
+}
+
+//==============================================================================
+// Everything that happens AFTER a style is parsed, wherever the bytes came from.
+//
+// Split out when the blob path arrived: two copies of "retire the old one, adopt
+// the new one, re-voice, reset the tracker" would have drifted the first time
+// one of those steps changed, and the symptom would be a style that behaves
+// differently depending on whether it came from a file or a blob.
+//==============================================================================
+//==============================================================================
+// WHERE A STYLE'S SET LIVES.  Moved here from MainComponent - see Main.h.
+//==============================================================================
+juce::File BetelgeuseProcessor::setFileForStyleRef (const juce::String& styleRef) const
+{
+    if (styleRef.isEmpty()) return {};
+    if (! folderManager.isRootFolderValid()) return {};
+
+    // A LIBRARY ID, which is what this receives almost always.  Betel::
+    // setFileNameForStyle is the SAME function the baker names sets with; two
+    // copies of that rule would differ by a dash one day and the sets would
+    // exist but never be found, which looks correct on disk and is not.
+    if (const auto* e = styleLibrary.find (styleRef))
+        return folderManager.getSetsFolder()
+                 .getChildFile (e->group)
+                 .getChildFile (Betel::setFileNameForStyle (e->displayName) + ".bset");
+
+    // A LEGACY PATH, from a set written before the library existed.
+    const juce::File style (styleRef);
+    const auto genre = style.getParentDirectory().getFileName();
+    if (genre.isEmpty()) return {};
+
+    return folderManager.getSetsFolder()
+             .getChildFile (genre)
+             .getChildFile (style.getFileNameWithoutExtension() + ".bset");
+}
+
+juce::ValueTree BetelgeuseProcessor::setTreeForStyleRef (const juce::String& styleRef) const
+{
+    const auto f = setFileForStyleRef (styleRef);
+    if (! f.existsAsFile()) return {};
+
+    // A SET THAT WILL NOT PARSE IS NO SET.  Returning an invalid tree here is
+    // what lets CC 7 seed the faders anyway, which is the right answer: a
+    // corrupt file must not leave every slot silent.
+    if (auto xml = juce::XmlDocument::parse (f))
+        return juce::ValueTree::fromXml (*xml);
+
+    return {};
+}
+
+juce::ValueTree BetelgeuseProcessor::mixerSetForStyleRef (const juce::String& styleRef) const
+{
+    return setTreeForStyleRef (styleRef).getChildWithName ("MixerState");
+}
+
+void BetelgeuseProcessor::adoptFreshStyle (std::unique_ptr<Betel::StyleData> fresh,
+                                           const juce::File& sourceFile,
+                                           const juce::String& styleRef)
+{
     if (currentStyle != nullptr)
         retiredStyles.push_back (std::move (currentStyle));
 
     currentStyle = std::move (fresh);
     sequencer.setStyle (currentStyle.get());
+
+    // THE FADER RESET IS NOT HERE ANY MORE.
+    //
+    // It was, and the probe caught what that cost: file / engine / fader all
+    // agreed at LOAD, and three seconds later the engine read unity on every
+    // style AND solo slot.  resetUserVolumesToUnity touches both blocks, and
+    // adoptFreshStyle is the only thing that calls it - so the style was being
+    // adopted AGAIN after the set had finished restoring, with no set behind
+    // that adoption to put the faders back.
+    //
+    // Tying the reset to "a style was adopted" was the mistake: a style can be
+    // adopted several times for one user action (Rob saw the set load itself
+    // run twice).  It now lives with the ACTION instead - applySetPayload
+    // resets immediately before applying the set's own MixerState, and the
+    // bare-style path resets because there is no set coming.  However many
+    // times the style is re-adopted, nothing wipes a restored mixer.
+
+    // ── balance.grexv, RE-READ ON EVERY STYLE LOAD ───────────────────────────
+    //
+    // BEFORE applyVoiceSetup, so the setup's own program changes pick up the
+    // freshly-read trims rather than the previous file's. Re-reading here is
+    // what makes the calibration loop workable: save the file, switch style,
+    // hear it - no restart. It is a small text file, and a style load is
+    // already the most expensive thing the plugin does.
+    stylePlayer.reloadBalanceFile();
+
+    // ── DOES A SET OWN THIS STYLE'S MIXER? ───────────────────────────────────
+    //
+    // ASKED BEFORE applyVoiceSetup, WHICH IS THE ENTIRE POINT.  The style's CC 7
+    // numbers were written for Yamaha's oscillators; ours are calibrated per
+    // instrument already, so CC 7 is a STARTING POINT and nothing more.  If a
+    // set states the levels, the style never gets to state them at all - not
+    // even for the instant it would take the set to overwrite them.
+    //
+    // The node, not the file - see mixerSetForStyleRef.
+    const juce::ValueTree mixerSet = mixerSetForStyleRef (styleRef);
+    const bool setOwnsMixer = mixerSet.isValid();
+
+    stylePlayer.setStyleCc7Suppressed (setOwnsMixer);
+
     stylePlayer.applyVoiceSetup (*currentStyle);
+
+    // ── AND APPLY IT, HERE, WITHOUT WAITING FOR AN EDITOR ────────────────────
+    //
+    // A DAW project reopened with the window closed never reaches
+    // MainComponent::applySetPayload, and with CC 7 suppressed there would then
+    // be nothing at all setting these faders.  The editor still applies the FULL
+    // payload when it is open - slots, FX, the ducker - and repeating the levels
+    // is harmless because both write the same numbers.
+    //
+    // UNITY FIRST, exactly as the editor does it: applyMixerState treats an
+    // absent value as "leave it alone", so without the reset a set that does not
+    // mention a slot would inherit the previous style's fader.
+    if (setOwnsMixer)
+    {
+        resetUserVolumesToUnity();
+        applyMixerState (mixerSet);
+    }
+
     chordTracker.reset();
 
-    // Commit the loaded style's own tempo as the working BPM.  In FREE mode the
-    // sequencer reads manualBPM directly, so without this the previous style's
-    // (or the 120 default) tempo would persist and the new style would play at
-    // the wrong speed.  In SYNCED mode manualBPM isn't used for playback, but
-    // setting it keeps the TEMPO knob correct for when the user switches back.
-    if (currentStyle->originalBPM > 0.0f)
-        manualBPM.store (juce::jlimit (30.0f, 300.0f, currentStyle->originalBPM));
+    // ── THE STYLE'S OWN TEMPO BECOMES THE BASE, NOT THE ANSWER ───────────────
+    //
+    // In FREE mode the sequencer reads manualBPM directly, so without this the
+    // previous style's (or the 120 default) tempo would persist and the new
+    // style would play at the wrong speed.  In SYNCED mode manualBPM isn't used
+    // for playback, but setting it keeps the TEMPO knob correct for when the
+    // user switches back.
+    //
+    // WHAT CHANGED: this used to store the style's tempo straight into
+    // manualBPM, which threw away whatever the player had dialled in.  It now
+    // moves the BASE and lets setStyleBaseBPM re-resolve, so a held offset
+    // rides onto the new style - style 90 with +20 held plays at 110.  The
+    // offset itself is untouched here; only RESET TEMPO and a set load move it.
+    //
+    // A style with no tempo meta event (originalBPM <= 0) falls back to 120,
+    // matching what the SYNCED branch in processBlock assumes for the same case.
+    setStyleBaseBPM (currentStyle->originalBPM > 0.0f ? currentStyle->originalBPM
+                                                      : 120.0f);
 
     // Hand the meter the new file.  This commits and saves whatever the
     // OUTGOING style had learned, then loads this file's cached measurements if
-    // it has any — keyed on path + size + modification date, so a style edited
-    // since it was measured is re-measured rather than trusted.
-    styleLoudness.setStyle (file);
+    // it has any — keyed on path + size + modification date.
+    //
+    // GUARDED, because a style out of a blob HAS no file: the cache key does not
+    // exist for it, and handing the meter an invalid File would ask it to key on
+    // nothing. Skipping is harmless — the section trim has been hard-wired to
+    // unity since MAKEUP was removed, so the measurement feeds nothing today.
+    if (sourceFile.existsAsFile())
+        styleLoudness.setStyle (sourceFile);
+
     lastMeasuredSection = -1;
     engine.setStyleSectionTrim (1.0f);
-
-    lastLoadedStylePath = file.getFullPathName();
-    return true;
 }
 
 juce::ValueTree BetelgeuseProcessor::captureGlobalState() const
 {
     juce::ValueTree t ("GlobalState");
     t.setProperty ("activeSoloSlot",   activeSoloSlot.load(),    nullptr);
-    t.setProperty ("splitPoint",       chordTracker.getSplitPoint(), nullptr);
+
+    // splitPoint is DELIBERATELY not written.  Where this player's two hands
+    // divide is a property of the PLAYER, not of the song: it follows the reach
+    // and the habit of whoever is at the keyboard, and it must survive loading
+    // somebody else's set the same way the pitch-bend range and the solo base
+    // unity do.  Betel::MasterSettings owns it and persists it to
+    // grex_master.xml the instant the knob moves.  Same reasoning, and the same
+    // shape, as cc0..cc4 and the crash settings below.
     t.setProperty ("currentStylePath", lastLoadedStylePath,      nullptr);
     for (int ch = 0; ch < Betel::StylePlayer::kNumUserStyleSlots; ++ch)
         t.setProperty ("subFlag" + juce::String (ch),
                        stylePlayer.getSlotSubstitution (ch), nullptr);
     t.setProperty ("comments",         comments,                 nullptr);
+
+    // HARMONY IS PART OF A SET, unlike the split point above.  Which harmony a
+    // song wants - whether it is on at all, duet or block, how loud - is a
+    // property of the ARRANGEMENT, not of the player: a ballad wants a soft
+    // duet where the next number wants none. The split point is the opposite
+    // case and is deliberately absent for exactly that reason.
+    t.setProperty ("harmonyOn",    harmonyOn.load(),                nullptr);
+    t.setProperty ("harmonyType",  harmonyType.load(),              nullptr);
+    t.setProperty ("harmonyBelow", harmonyBelow.load(),             nullptr);
+    t.setProperty ("harmonyLevel", harmonyLevel.load(),             nullptr);
+
+    // MULTI SPLIT is a set property for the same reason harmony is: where the
+    // zones fall belongs to the ARRANGEMENT. An organ number wants pedals; the
+    // next number may not.
+    t.setProperty ("multiSplitOn",   multiSplitOn.load(),           nullptr);
+    t.setProperty ("bassSplitPoint", bassSplitPoint.load(),         nullptr);
+    t.setProperty ("bassZoneSlot",   bassZoneSlot.load(),           nullptr);
+
+    // The two bass switches, saved beside the rest. Which bass a number wants
+    // is an arrangement property like the others here.
+    t.setProperty ("bassInversionOn",   bassInversionOn.load(),     nullptr);
+    t.setProperty ("bassInversionMode", bassInversionMode.load(),   nullptr);
+    t.setProperty ("manualBassOn",      manualBassOn.load(),        nullptr);
 
     // THE MIDI CC LEARN MAP IS NOT PART OF A SET.  It lives in grex_cc_map.xml
     // and describes THE RIG — which physical knob is wired to which function.
@@ -417,6 +795,19 @@ juce::ValueTree BetelgeuseProcessor::captureGlobalState() const
 
     // ── Session-wide performance state ────────────────────────────────────
     t.setProperty ("globalTranspose",  globalTranspose.load(),          nullptr);
+    // TEMPO: THE SET OWNS THE OFFSET, NOT THE NUMBER.  See the tempo block in
+    // Main.h for why.  `userBpmDelta` is what applyGlobalState reads back.
+    t.setProperty ("userBpmDelta",     (double) userBpmDelta.load(),    nullptr);
+    // Written under a NEW NAME.  The old "styleEnergy" was 0..100 with 50
+    // neutral; 47 on that scale and 47 on this one are different settings, and a
+    // silently reinterpreted value is worse than one that fails to load.
+    t.setProperty ("styleEnergy200",   getStyleEnergy(),                nullptr);
+    // `manualBPM` is still written, and is now PURELY INFORMATIONAL from this
+    // build's point of view - the resolved tempo at save time, for a human
+    // reading the .bset and for Grex, which shares this file format and still
+    // reads the absolute.  Never read it back HERE when userBpmDelta is
+    // present, or a set would re-impose the tempo of the style it was saved
+    // against, which is the whole bug this change exists to remove.
     t.setProperty ("manualBPM",        (double) manualBPM.load(),       nullptr);
     t.setProperty ("tempoSpeedMult",   (double) tempoSpeedMult.load(),  nullptr);
     t.setProperty ("transitionQuant",  getTransitionQuant(),            nullptr);
@@ -477,18 +868,50 @@ juce::ValueTree BetelgeuseProcessor::captureMixerState() const
                        (double) engine.getChannelVolume (
                            Betel::SamplePlayerEngine::kNumStyleChannels + s), nullptr);
 
+    // THE POST BASE TRIM, style side only - the right hand's base lives with the
+    // instrument (.ins) and in the sound editor, where nothing competes for it.
+    for (int ch = 0; ch < Betel::StylePlayer::kNumUserStyleSlots; ++ch)
+        t.setProperty ("styleBaseDb" + juce::String (ch),
+                       (double) engine.getChannelUserBaseDb (ch), nullptr);
+
     // Buses and master.  masterGain is the PRE-boost fader value — see
     // getMasterVolume for why reading the engine back would be wrong.
     t.setProperty ("styleBusGain", (double) getStyleVolume(),     nullptr);
+    // What the STYLE VOLUME detent is worth for THIS song.  The solo base is
+    // deliberately NOT here: that one is global, in grex_master.xml.
+    t.setProperty ("styleBaseUnityDb", (double) getStyleBaseUnityDb(), nullptr);
+    // What the STYLE VOLUME detent is worth for THIS song.  The solo base is
+    // deliberately NOT here: that one is global, in grex_master.xml, because it
+    // describes the install's balance between the two hands rather than a song.
+    t.setProperty ("styleBaseUnityDb", (double) getStyleBaseUnityDb(), nullptr);
     t.setProperty ("soloBusGain",  (double) getRightHandVolume(), nullptr);
     t.setProperty ("masterGain",   (double) getMasterVolume(),    nullptr);
     t.setProperty ("masterBoostDb",(double) getMasterBoostDb(),   nullptr);
 
     // Finisher: on/off, the two macro controls, every slider and every stage
     // bypass.  It is a master-bus chain tuned per song, so all of it travels.
+    // ── DUCKER — per set, because how much the band gets out of the way is a
+    // property of the arrangement, not of the install.
+    {
+        auto& d = getDucker();
+        t.setProperty ("duckOn", d.isEnabled(), nullptr);
+        for (int b = 0; b < Betel::StyleDucker::kNumBands; ++b)
+        {
+            const juce::String k = "duck" + juce::String (b);
+            t.setProperty (k + "On",     d.isBandEnabled  (b),         nullptr);
+            t.setProperty (k + "Freq",   (double) d.getFreq        (b), nullptr);
+            t.setProperty (k + "Q",      (double) d.getQ           (b), nullptr);
+            t.setProperty (k + "Depth",  (double) d.getDepthDb     (b), nullptr);
+            t.setProperty (k + "Thresh", (double) d.getThresholdDb (b), nullptr);
+            t.setProperty (k + "Ratio",  (double) d.getRatio       (b), nullptr);
+            t.setProperty (k + "Atk",    (double) d.getAttackMs    (b), nullptr);
+            t.setProperty (k + "Rel",    (double) d.getReleaseMs   (b), nullptr);
+        }
+    }
+
     t.setProperty ("finEnabled",   getFinisherEnabled(),   nullptr);
     t.setProperty ("finAmount",    (double) getFinisherAmount(), nullptr);
-    t.setProperty ("finCharacter", getFinisherCharacter(), nullptr);
+    // finCharacter is no longer written — the selector is gone (see Finisher.h).
     for (int i = 0; i < Betel::Finisher::kNumParams; ++i)
         t.setProperty ("finP" + juce::String (i),
                        (double) getFinisherParam (i), nullptr);
@@ -521,8 +944,28 @@ void BetelgeuseProcessor::applyMixerState (const juce::ValueTree& ms)
                                      (float) (double) ms.getProperty (key));
     }
 
+    // ABSENT MEANS UNCHANGED here too, and the style load has just zeroed these -
+    // so a set written before the trim existed correctly leaves them at 0 dB.
+    for (int ch = 0; ch < Betel::StylePlayer::kNumUserStyleSlots; ++ch)
+    {
+        const auto key = "styleBaseDb" + juce::String (ch);
+        if (ms.hasProperty (key))
+            engine.setChannelUserBaseDb (ch, (float) (double) ms.getProperty (key));
+    }
+
     if (ms.hasProperty ("styleBusGain"))
         setStyleVolume    ((float) (double) ms.getProperty ("styleBusGain"));
+    // ABSENT MEANS UNCHANGED does not serve here: a set written before this
+    // existed was saved under an implicit 0 dB, so leaving the previous song's
+    // base in place would re-voice it.
+    setStyleBaseUnityDb ((float) (double) ms.getProperty ("styleBaseUnityDb",
+                                                          (double) kDefaultStyleBaseUnityDb));
+    // ABSENT MEANS UNCHANGED does not serve here: a set written before this
+    // existed was saved under an implicit 0 dB, so leaving the previous song's
+    // base in place would re-voice it. Default to 0 rather than to "whatever
+    // happens to be loaded".
+    setStyleBaseUnityDb ((float) (double) ms.getProperty ("styleBaseUnityDb",
+                                                          (double) kDefaultStyleBaseUnityDb));
     if (ms.hasProperty ("soloBusGain"))
         setRightHandVolume((float) (double) ms.getProperty ("soloBusGain"));
 
@@ -534,12 +977,35 @@ void BetelgeuseProcessor::applyMixerState (const juce::ValueTree& ms)
     if (ms.hasProperty ("masterGain"))
         setMasterVolume   ((float) (double) ms.getProperty ("masterGain"));
 
+    // ── DUCKER.  Every field DEFAULTS rather than "absent means unchanged":
+    // a set written before the ducker existed was saved with no ducking at all,
+    // and inheriting the previous song's carve would be audible and wrong.
+    {
+        auto& d = getDucker();
+        d.setEnabled ((bool) ms.getProperty ("duckOn", false));
+        for (int b = 0; b < Betel::StyleDucker::kNumBands; ++b)
+        {
+            const juce::String k = "duck" + juce::String (b);
+            const auto& def = Betel::StyleDucker::kDefaults[b];
+            d.setBandEnabled  (b, (bool)  ms.getProperty (k + "On",     true));
+            d.setFreq         (b, (float) (double) ms.getProperty (k + "Freq",   (double) def.freq));
+            d.setQ            (b, (float) (double) ms.getProperty (k + "Q",      (double) def.q));
+            d.setDepthDb      (b, (float) (double) ms.getProperty (k + "Depth",  (double) def.depth));
+            d.setThresholdDb  (b, (float) (double) ms.getProperty (k + "Thresh", (double) def.thresh));
+            d.setRatio        (b, (float) (double) ms.getProperty (k + "Ratio",  (double) def.ratio));
+            d.setAttackMs     (b, (float) (double) ms.getProperty (k + "Atk",    (double) def.attack));
+            d.setReleaseMs    (b, (float) (double) ms.getProperty (k + "Rel",    (double) def.release));
+        }
+    }
+
     if (ms.hasProperty ("finEnabled"))
         setFinisherEnabled ((bool) ms.getProperty ("finEnabled"));
     if (ms.hasProperty ("finAmount"))
         setFinisherAmount  ((float) (double) ms.getProperty ("finAmount"));
-    if (ms.hasProperty ("finCharacter"))
-        setFinisherCharacter ((int) ms.getProperty ("finCharacter"));
+    // `finCharacter` in an older set is read and DISCARDED.  It named a preset
+    // that has been deleted, and the eleven slider values it used to load are
+    // saved in this same block anyway — so the set already carries the sound it
+    // described, and re-applying the preset would overwrite it.
 
     for (int i = 0; i < Betel::Finisher::kNumParams; ++i)
     {
@@ -560,8 +1026,51 @@ void BetelgeuseProcessor::applyGlobalState (const juce::ValueTree& gs)
     if (! gs.isValid()) return;
 
     setActiveSoloSlot ((int) gs.getProperty ("activeSoloSlot", getActiveSoloSlot()));
-    setSplitPoint     ((int) gs.getProperty ("splitPoint",     getSplitPoint()));
     comments = gs.getProperty ("comments", comments).toString();
+
+    // Absent in a set written before harmony existed -> the CURRENT value is
+    // the default, not a hard-coded one. A set that predates the feature says
+    // nothing about it, so it must not silently switch it off underneath a
+    // player who just turned it on.
+    harmonyOn   .store ((bool) gs.getProperty ("harmonyOn",    harmonyOn.load()));
+    harmonyBelow.store ((bool) gs.getProperty ("harmonyBelow", harmonyBelow.load()));
+    harmonyType .store (juce::jlimit (0, Betel::Harmonizer::kNumTypes - 1,
+                        (int) gs.getProperty ("harmonyType",  harmonyType.load())));
+    harmonyLevel.store (juce::jlimit (0, 100,
+                        (int) gs.getProperty ("harmonyLevel", harmonyLevel.load())));
+
+    multiSplitOn  .store ((bool) gs.getProperty ("multiSplitOn", multiSplitOn.load()));
+
+    // ABSENT MEANS UNCHANGED, like everything else here - and because the
+    // default is 50, a set written before ENERGY existed leaves the band exactly
+    // as authored.  Routed through the SETTER, not the atomic: the sixteen
+    // channel pushes it performs are the entire point.
+    // New name first; an older set carries the 0..100 form, which doubles onto
+    // this scale exactly - 50 was neutral, 100 is neutral, and every point in
+    // between maps one to two.
+    if (gs.hasProperty ("styleEnergy200"))
+        setStyleEnergy ((int) gs.getProperty ("styleEnergy200", getStyleEnergy()));
+    else if (gs.hasProperty ("styleEnergy"))
+        setStyleEnergy (2 * (int) gs.getProperty ("styleEnergy", 50));
+    bassSplitPoint.store (juce::jlimit (0, 127,
+                          (int) gs.getProperty ("bassSplitPoint", bassSplitPoint.load())));
+    // setBassZoneSlot rather than a raw store: it refuses the harmony slot, and
+    // an old or hand-edited set must not be able to put the pedals there.
+    setBassZoneSlot ((int) gs.getProperty ("bassZoneSlot", bassZoneSlot.load()));
+
+    bassInversionOn  .store ((bool) gs.getProperty ("bassInversionOn", bassInversionOn.load()));
+    manualBassOn     .store ((bool) gs.getProperty ("manualBassOn",    manualBassOn.load()));
+    bassInversionMode.store (juce::jlimit (0, 1,
+                             (int) gs.getProperty ("bassInversionMode",
+                                                   bassInversionMode.load())));
+
+    // `splitPoint` is DELIBERATELY not read - see captureGlobalState.
+    // MasterSettings owns it now, so a set written before this change is simply
+    // ignored on that one property and cannot move the player's hands.  Reading
+    // it here would be worse than merely wrong: applyGlobalState runs on the
+    // message thread through the full setSplitPoint, which WRITES BACK to
+    // MasterSettings - so one set load would not just change the split for now,
+    // it would overwrite the saved split permanently.
 
     // `cc0..cc4` are DELIBERATELY not read — see captureGlobalState.  CcMap owns
     // them now, so an older set still carrying them cannot move the player's
@@ -582,13 +1091,37 @@ void BetelgeuseProcessor::applyGlobalState (const juce::ValueTree& gs)
     const juce::String path = gs.getProperty ("currentStylePath", juce::String()).toString();
     if (path.isNotEmpty())
     {
-        juce::File f (path);
+        // A LIBRARY STYLE IS STORED BY ITS ID ("Dance/6-8 Trance"), not a file
+        // path - and this block used to reload FILES ONLY.  An id is not a file,
+        // so a set saved by hand never loaded its style here, and the style
+        // browser loaded it AFTER the whole set had been applied.  A new style
+        // clears every slot lock and re-voices every slot, so what SoundsState
+        // had just restored - an edited EDM KIT above all, but also a slot's
+        // chosen instrument - was replaced by the style's own a moment later,
+        // while the editor still showed the set's values.  loadStyleByRef takes
+        // an id or a path, so the style now loads HERE, before SoundsState:
+        // the order applySetPayload is built around.
+        //
+        // No juce::File is built from an id - a relative path is not a legal
+        // File and asserts in a debug build.  An id the library no longer holds
+        // is skipped, exactly like a missing file always was.
+        const bool isFilePath    = juce::File::isAbsolutePath (path);
         const bool alreadyLoaded = hasStyle()
-                                 && f.getFullPathName() == lastLoadedStylePath;
-        if (! alreadyLoaded && f.existsAsFile())
+                                 && (path == lastLoadedStylePath
+                                     || (isFilePath && juce::File (path).getFullPathName() == lastLoadedStylePath));
+        if (! alreadyLoaded)
         {
             juce::String err;
-            loadStyle (f, err);
+            if (isFilePath)
+            {
+                const juce::File f (path);
+                if (f.existsAsFile())
+                    loadStyle (f, err);
+            }
+            else if (styleLibrary.find (path) != nullptr)
+            {
+                loadStyleByRef (path, err);
+            }
         }
     }
 
@@ -602,7 +1135,31 @@ void BetelgeuseProcessor::applyGlobalState (const juce::ValueTree& gs)
 
     // ── Session-wide performance state ────────────────────────────────────
     setGlobalTranspose ((int)   gs.getProperty ("globalTranspose", globalTranspose.load()));
-    setManualBPM       ((float) (double) gs.getProperty ("manualBPM", (double) manualBPM.load()));
+    // ── TEMPO, AND THE ORDER HERE MATTERS ────────────────────────────────
+    //
+    // This runs AFTER the style reload above, so styleBaseBPM already holds the
+    // incoming style's own tempo.  Both branches therefore resolve against the
+    // right base.
+    //
+    //   NEW SET  carries `userBpmDelta`: apply it and the tempo falls out as
+    //            the new style's own + the offset the player saved.
+    //
+    //   OLD SET  carries only the absolute `manualBPM`.  Feeding it through
+    //            setManualBPM reproduces exactly what that set used to do -
+    //            it plays at the number it stored - AND derives the offset from
+    //            it on the way past, so the next save is in the new form.  That
+    //            is the whole migration; nothing rewrites anything on disk
+    //            behind the player's back.
+    //
+    //   NEITHER  (a set from before either property, or a factory set) leaves
+    //            the current offset alone, matching the ABSENT MEANS UNCHANGED
+    //            rule the rest of this function follows.
+    if (gs.hasProperty ("userBpmDelta"))
+        setUserBpmDelta ((float) (double) gs.getProperty ("userBpmDelta",
+                                                          (double) userBpmDelta.load()));
+    else if (gs.hasProperty ("manualBPM"))
+        setManualBPM    ((float) (double) gs.getProperty ("manualBPM",
+                                                          (double) manualBPM.load()));
     setTempoSpeedMult  ((float) (double) gs.getProperty ("tempoSpeedMult",
                                                          (double) tempoSpeedMult.load()));
     setTransitionQuant ((int)   gs.getProperty ("transitionQuant", getTransitionQuant()));
@@ -676,7 +1233,13 @@ void BetelgeuseProcessor::tapTempo()
 
     const double avgMs = sum / (double) count;
     const float  bpm   = (float) juce::jlimit (30.0, 300.0, 60000.0 / avgMs);
-    manualBPM.store (bpm);
+
+    // THROUGH THE SETTER, NOT A BARE STORE.  A raw manualBPM.store() here would
+    // move the resolved tempo and leave userBpmDelta describing the tempo the
+    // player had BEFORE tapping - so the next style load would snap the tapped
+    // tempo away, and saving the set would record an offset nobody asked for.
+    // TAP is a tempo decision like the knob, and takes the same route.
+    setManualBPM (bpm);
 }
 
 void BetelgeuseProcessor::auditionDrumKey (int engineChannel, int midiKey)
@@ -705,6 +1268,11 @@ void BetelgeuseProcessor::editorNoteOff (int engineChannel, int midiNote)
 void BetelgeuseProcessor::getSoundingNotes (int engineChannel, uint32_t out[4]) const
 {
     engine.getSoundingNotes (engineChannel, out);
+}
+
+void BetelgeuseProcessor::getPadActivity (int engineChannel, uint32_t out[4]) const
+{
+    engine.getPadActivity (engineChannel, out);
 }
 
 void BetelgeuseProcessor::triggerCrash()
@@ -739,13 +1307,41 @@ void BetelgeuseProcessor::triggerCrash()
     // would drag the whole kit along with it.
     const float g = getCrashGainLinear();
 
+    // AN EDM KIT ON THE DRUMS SLOT: the four options are the kit's own crash
+    // pads - the purple ones.  Every factory kit keeps them on these same four
+    // keys, so nothing moves there; an edited kit whose crash now sits on
+    // another pad still gets its crash (edm::crashPads).  Any other kit: GM.
+    int keys[4] = { kCrashNotes[0], kCrashNotes[1], kCrashNotes[2], kCrashNotes[3] };
+    engine.edmCrashKeys (0, kCrashNotes, keys);
+
     for (int i = 0; i < 4; ++i)
-        if (mask & (1u << i))
-            engine.noteOn (0, kCrashNotes[i], vel, /*fromEditor*/ false, g);
+        if ((mask & (1u << i)) && keys[i] >= 0)
+            engine.noteOn (0, keys[i], vel, /*fromEditor*/ false, g);
 }
 
 void BetelgeuseProcessor::performVariation (int variButtonIdx)
 {
+    // ── FLAG THE GESTURE FOR THE AUDIO THREAD TO RECORD ──────────────────────
+    //
+    // THE CHOKE POINT, and that is why it is here and not in the button handler
+    // or in performRemote. A variation reaches this function from three places -
+    // a mouse click, an assigned pad or CC through performRemote, and a legacy
+    // control note - and recording at any one of them would miss the other two,
+    // while recording at all three would record some presses twice.
+    //
+    // BUT IT IS NOT RECORDED HERE. This function runs on the MESSAGE thread for
+    // a click and on the AUDIO thread for a pad, and the recorder's FIFO is
+    // single-producer: two threads writing it is exactly the corruption that
+    // kind of queue cannot survive. So the gesture is parked in one atomic and
+    // the AUDIO thread picks it up, keeping one producer.
+    //
+    // One slot, so two gestures inside a single audio block would lose the
+    // first. A block is a few milliseconds and these are button presses; a
+    // human cannot produce two in that window, and the alternative is a second
+    // queue to maintain for an event rate of a few per minute.
+    if (variButtonIdx >= 0 && variButtonIdx < 16)
+        pendingUiGesture.store (variButtonIdx, std::memory_order_relaxed);
+
     // Mirrors MainTab's 16-button indexing:
     //   0-2 INTRO 1-3, 3 INTRO 4 (no backing section), 4-7 VAR 1-4,
     //   8-11 FILL 1-4, 12 BRAKE, 13-15 END 1-3.
@@ -785,8 +1381,27 @@ void BetelgeuseProcessor::performVariation (int variButtonIdx)
 
 void BetelgeuseProcessor::togglePlayStop()
 {
-    if (sequencer.isPlaying())      sequencer.stop();
-    else if (hasStyle())            sequencer.start();
+    if (sequencer.isPlaying()) { sequencer.stop(); return; }
+
+    if (hasStyle()) { sequencer.start(); return; }
+
+    // ── NO STYLE: SAY SO, DO NOT JUST SIT THERE ─────────────────────────────
+    //
+    // This used to be the silent tail of an `else if` and it is the single line
+    // that has cost the most debugging time in this project.  With no style
+    // loaded, PLAY produced no start, no lamp, no caption change and no sound -
+    // from the mouse and from an assigned hardware pad alike, because both
+    // arrive here.  That reads as a dead transport, so every investigation
+    // started at the transport, and the fault was always upstream in style
+    // loading (a styleless project snapshot one time, an orphaned factory-set
+    // StyleLink the next).
+    //
+    // The flag makes the refusal VISIBLE and RECOVERABLE.  The editor drains it
+    // and loads a style, then starts - so the button now does the obvious
+    // thing.  Headless, nothing drains it and the behaviour is exactly as
+    // before: an offline render with no style still renders nothing, which is
+    // correct.
+    notePlayRefusedNoStyle();
 }
 
 void BetelgeuseProcessor::toggleSyncPlay()
@@ -807,45 +1422,185 @@ void BetelgeuseProcessor::toggleStyleElement (int slot)
     stylePlayer.setChannelMute (slot, ! stylePlayer.isChannelMuted (slot));
 }
 
-void BetelgeuseProcessor::handleControlNote (int note)
+//==============================================================================
+// ONE ACTION PER REMOTE ID.
+//
+// Everything here is PROCESSOR state, and that is the rule this table enforces:
+// a remote assignment may only drive something that works with no editor open.
+// An offline bounce, or a project played without ever showing the window, must
+// behave identically to a live one - the failure mode we chased repeatedly
+// through the sound-editor and macro paths, and the reason the UI-only controls
+// on the tabs are not in the id list at all.
+//
+// `value` is 0-127: a CC's value, or 127 for a pad hit. Continuous ids scale it;
+// button ids treat anything over 63 as a press and ignore the rest, so a CC on
+// a button behaves like a switch rather than firing twice per sweep.
+//==============================================================================
+void BetelgeuseProcessor::performRemote (Betel::RemoteId id, int value)
 {
-    // Reserved control-notes (0–35).  Note-ON only; note-OFF is swallowed by
-    // the caller.  Semantics per group:
-    //   1-8   style elements   → toggle mute
-    //   9-14  solo channels 1-6 (single mode) → radio select
-    //   15-30 variation pads    → momentary trigger
-    //   31    PLAY/STOP         → toggle
-    //   32    RESTART           → momentary
-    //   33    HOLD              → toggle
-    //   34    ARRANGER/PIANO    → toggle
-    //   35    SYNCED PLAY       → toggle (arm)
-    if (note >= 1 && note <= 8)            // style elements
+    using R = Betel::RemoteId;
+
+    const bool pressed = value > 63;
+    const auto norm    = juce::jlimit (0.0f, 1.0f, (float) value / 127.0f);
+
+    const int i = (int) id;
+
+    // ── MODE ─────────────────────────────────────────────────────────────────
+    //
+    // Push and Toggle differ ONLY in what a release does, so this is the one
+    // place that has to know: in Push a release gives the control back, in
+    // Toggle it is ignored and the press latches.  Knob never sees a release at
+    // all - a sweep is values, not edges - so it falls straight through to the
+    // continuous handlers below.
+    const auto mode = Betel::RemoteMap::get().modeOf (id);
+
+    if (! pressed && ! Betel::remoteIsContinuous (id))
     {
-        toggleStyleElement (note - 1);
+        if (mode == Betel::RemoteMap::Mode::Push)
+            performRemoteRelease (id);
+        return;
     }
-    else if (note >= 9 && note <= 14)      // solo channels 1-6
+
+    // ── the sixteen variation pads ───────────────────────────────────────────
+    if (i >= (int) R::Intro1 && i <= (int) R::End3)
     {
-        selectSoloSlot (note - 9);
+        if (pressed) performVariation (i - (int) R::Intro1);
+        return;
     }
-    else if (note >= 15 && note <= 30)     // variation pads
+
+    // ── the eight element mutes ──────────────────────────────────────────────
+    if (i >= (int) R::Element1 && i <= (int) R::Element8)
     {
-        // note 15 → INTRO 1 (idx 0) ... note 29 → END 3 (idx 15) except BREAK.
-        // Map per the spec: 15-18 INTRO1-4 (0-3), 19-22 VAR1-4 (4-7),
-        // 23-26 FILL1-4 (8-11), 27-29 END1-3 (13-15), 30 BREAK (12).
-        int varIdx;
-        if      (note <= 18) varIdx = note - 15;        // 0-3
-        else if (note <= 22) varIdx = note - 19 + 4;    // 4-7
-        else if (note <= 26) varIdx = note - 23 + 8;    // 8-11
-        else if (note <= 29) varIdx = note - 27 + 13;   // 13-15
-        else                 varIdx = 12;               // 30 = BREAK
-        performVariation (varIdx);
+        if (pressed) toggleStyleElement (i - (int) R::Element1);
+        return;
     }
-    else if (note == 31) togglePlayStop();
-    else if (note == 32) requestRestart();
-    else if (note == 33) toggleHold();
-    else if (note == 34) togglePianoMode();
-    else if (note == 35) toggleSyncPlay();
-    // note 0 (and any unassigned) — reserved but no action.
+
+    // ── the eight solo selectors ─────────────────────────────────────────────
+    if (i >= (int) R::Solo1 && i <= (int) R::Solo8)
+    {
+        if (pressed) selectSoloSlot (i - (int) R::Solo1);
+        return;
+    }
+
+    // ── mixer channel faders ─────────────────────────────────────────────────
+    //
+    // SILENCE TO UNITY, not silence to double. The existing ccMasterVol target
+    // maps a CC to `norm` and stops at unity, and matching it matters more than
+    // reaching the headroom: a controller that can double a gain will do it by
+    // accident, and the faders' upper half is there for a deliberate hand.
+    if (i >= (int) R::StyleCh1 && i <= (int) R::StyleCh8)
+    {
+        engine.setChannelVolume (i - (int) R::StyleCh1, norm);
+        return;
+    }
+    if (i >= (int) R::SoloCh1 && i <= (int) R::SoloCh8)
+    {
+        engine.setChannelVolume (Betel::SamplePlayerEngine::kNumStyleChannels
+                                     + (i - (int) R::SoloCh1), norm);
+        return;
+    }
+
+    switch (id)
+    {
+        case R::PlayStop:  if (pressed) togglePlayStop();   break;
+        case R::Restart:   if (pressed) requestRestart();   break;
+        case R::SyncPlay:  if (pressed) toggleSyncPlay();   break;
+        case R::Hold:      if (pressed) toggleHold();       break;
+        case R::PianoMode: if (pressed) togglePianoMode();  break;
+
+        // Ranges lifted VERBATIM from handleControllerMessage's five targets.
+        // Two spellings of one mapping is how they drift, and a remote that
+        // reaches a different tempo than the Settings-tab CC for the same knob
+        // position would be indefensible.
+        case R::Tempo:      setManualBPM (30.0f + norm * 270.0f); break;
+        case R::Transpose:  setGlobalTranspose ((int) std::lround (norm * (2.0f * kMaxTranspose)
+                                                                   - kMaxTranspose)); break;
+        case R::SplitPoint: setSplitPoint ((int) std::lround (36.0f + norm * (127.0f - 36.0f))); break;
+
+        case R::StyleVolume:  setStyleVolume     (norm); break;
+        case R::SoloVolume:   setRightHandVolume (norm); break;
+        case R::MasterVolume: setMasterVolume    (norm); break;
+        // MASTER BOOST IS FIVE TICKBOXES, not a continuous control - 0/+3/+6/
+        // +9/+12. A CC has to land ON one of them or the mixer would show no
+        // box lit while the gain sat between two, which reads as broken.
+        case R::MasterBoost:
+        {
+            static constexpr float kSteps[5] = { 0.0f, 3.0f, 6.0f, 9.0f, 12.0f };
+            setMasterBoostDb (kSteps[juce::jlimit (0, 4, (int) std::lround (norm * 4.0f))]);
+            break;
+        }
+        case R::FinisherOn:   if (pressed) setFinisherEnabled (! getFinisherEnabled()); break;
+
+        // LIVE AGAIN, and GLOBAL: this is one number for the whole install, not
+        // a per-style value - see StyleLevels.h.  A CC mapped here moves the
+        // level of every style and writes grex_boost.xml as it goes.
+        // THE SAME DOOR THE SLIDER USES - store, save and PUSH.  Writing the
+        // value without pushing is what made the slider look dead.
+        case R::StyleBoost:
+            setStyleBoostDb (norm * Betel::StyleLevels::kBoostMaxDb);
+            break;
+
+        // ENERGY is 0..100 with 50 neutral, so a controller at its centre detent
+        // lands on "as authored" - which is the position that has to be
+        // reachable by feel on a hardware fader.
+        case R::StyleEnergy: setStyleEnergy ((int) std::lround (norm * 200.0f)); break;
+
+        // StyleFollow still STORES, and deliberately does nothing audible.
+        // FOLLOW PROGRAMMED GAINS is retired - the style states the base and the
+        // mixer trims after it, so there is no blend left to drive. The case is
+        // kept rather than deleted so a controller already mapped to it does not
+        // fall through to whatever the default arm does, and so the value still
+        // round-trips into the .bset with every other set already on disk.
+        case R::StyleFollow: Betel::StyleLevels::get().setStyleVolFollow (norm * 100.0f); break;
+
+        // ── DELIBERATELY NOT ACTED ON HERE ───────────────────────────────────
+        // OnPress, Crash, Fingered, DawStart, Comments, OrientalScale and
+        // FunkeyMode all live in the EDITOR today. Assigning them
+        // is allowed - the popup opens and the map stores it - but the action
+        // has to be delivered by MainComponent while the window is open, and it
+        // is honest for that to be visible here rather than hidden behind a
+        // silent default case.
+        default: break;
+    }
+
+    // Whatever moved, the UI has to catch up. The mirror already polls at 30 Hz,
+    // so nothing is pushed from the audio thread; this only marks the fact.
+    remoteTouched.store (true, std::memory_order_relaxed);
+}
+
+//==============================================================================
+// THE RELEASE HALF OF PUSH MODE.
+//
+// Only a STATEFUL control has anything to give back.  Every action in the table
+// below is already a toggle, so "restore" is simply the same call again - which
+// is also why this cannot drift out of step with the press path.
+//
+// A variation pad, RESTART or CRASH is momentary by nature: it fired on the
+// press and there is no state left over, so the release is correctly ignored
+// rather than firing the thing twice.
+//==============================================================================
+void BetelgeuseProcessor::performRemoteRelease (Betel::RemoteId id)
+{
+    using R = Betel::RemoteId;
+    const int i = (int) id;
+
+    if (i >= (int) R::Element1 && i <= (int) R::Element8)
+    {
+        toggleStyleElement (i - (int) R::Element1);
+        remoteTouched.store (true, std::memory_order_relaxed);
+        return;
+    }
+
+    switch (id)
+    {
+        case R::PlayStop:   togglePlayStop();  break;
+        case R::Hold:       toggleHold();      break;
+        case R::PianoMode:  togglePianoMode(); break;
+        case R::FinisherOn: setFinisherEnabled (! getFinisherEnabled()); break;
+        default: return;    // momentary - nothing to restore, and no repaint
+    }
+
+    remoteTouched.store (true, std::memory_order_relaxed);
 }
 
 void BetelgeuseProcessor::handleControllerMessage (int ccNum, int value)
@@ -892,8 +1647,16 @@ void BetelgeuseProcessor::applyCcToTarget (int target, int value)
 
 void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
+    // ── DRAIN THE PARKED UI GESTURE ──────────────────────────────────────────
+    //
+    // Once per block, before anything else touches the recorder, so it keeps
+    // exactly ONE producer - see performVariation for why the gesture cannot be
+    // written where it happens.
+    if (const int g = pendingUiGesture.exchange (-1, std::memory_order_relaxed); g >= 0)
+        if (songRecorder.isRecording())
+            songRecorder.recordRemote (perfSongBeats, g, 127);
+
     juce::ScopedNoDenormals noDenormals;
-    const int64_t blockStart = Betel::PerfMonitor::get().tick();   // spike diagnostics
     const int numSamples = buffer.getNumSamples();
 
     // 1) Merge virtual on-screen keyboard events into the incoming MIDI buffer.
@@ -987,18 +1750,81 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     // every enabled slot.  When the mask is zero (default at first launch
     // and after a clear), we keep the legacy single-slot routing via
     // activeSoloSlot so nothing breaks for users who never touch the row.
-    const uint8_t soloMask = soloEnableMask.load();
+    // SLOT 7 (SOLO 8) IS THE HARMONY CHANNEL and the keyboard must never reach
+    // it directly - harmony writes there and nothing else may. Masked off HERE,
+    // at the single point every keyboard event passes through, rather than
+    // trusted to stay clear everywhere upstream: a set, a project or a
+    // favourite saved before harmony existed can carry bit 7 set, and the main
+    // tab's SOLO 8 button is a plain HARMONY plate now, so there would be no
+    // control on screen to turn it back off.
+    const uint8_t soloMask =
+        (uint8_t) (soloEnableMask.load() & ~(1u << kHarmonySlot));
 
     const auto forEachSoloChannel = [&](auto&& fn)
     {
         if (soloMask == 0)
         {
-            fn (Betel::SamplePlayerEngine::kNumStyleChannels + activeSoloSlot.load());
+            // The legacy single-slot path. Clamped away from the harmony slot
+            // for the same reason: activeSoloSlot is restored from old state
+            // too, and landing on 7 would put the whole right hand on the
+            // harmony voice.
+            const int slot = juce::jlimit (0, kHarmonySlot - 1, activeSoloSlot.load());
+            fn (Betel::SamplePlayerEngine::kNumStyleChannels + slot);
             return;
         }
         for (int s = 0; s < 8; ++s)
             if (soloMask & (1u << s))
                 fn (Betel::SamplePlayerEngine::kNumStyleChannels + s);
+    };
+
+    //==========================================================================
+    // HARMONY - the two helpers the note dispatch below uses.
+    //
+    // Kept here rather than as members because they close over `engine` and the
+    // per-block settings reads, and because they are only ever meaningful
+    // inside this loop.
+    //==========================================================================
+    const int  harmonyCh    = Betel::SamplePlayerEngine::kNumStyleChannels + kHarmonySlot;
+    const bool harmonyLive  = harmonyOn.load (std::memory_order_relaxed);
+
+    // RELEASE WHATEVER THIS KEY HOLDS. Used at note-off AND before a restrike,
+    // because they are the same operation - see takeHarmony in Main.h.
+    const auto releaseHarmony = [&](int phys)
+    {
+        int notes[kMaxHarmonyVoices];
+        const int n = takeHarmony (phys, notes);
+        for (int i = 0; i < n; ++i)
+            engine.noteOff (harmonyCh, notes[i]);
+    };
+
+    const auto spawnHarmony = [&](int phys, int velocity)
+    {
+        // The previous strike goes first, ALWAYS - even when harmony is now
+        // off. Switching it off mid-note must not strand the voices a note-on
+        // already started, and this is the only place that can release them.
+        releaseHarmony (phys);
+
+        if (! harmonyLive) return;
+
+        const auto r = Betel::Harmonizer::compute (
+                           phys,
+                           chordTracker.getCurrentChord(),
+                           (Betel::Harmonizer::Type) harmonyType.load (std::memory_order_relaxed),
+                           harmonyBelow.load (std::memory_order_relaxed));
+
+        if (r.count == 0) return;
+
+        // Quieter than the lead by default, or the melody stops reading as the
+        // melody. jmax(1) because a velocity of 0 IS a note-off in MIDI - at a
+        // level of 0 with a soft touch it would round down and silently
+        // release the note it was supposed to start.
+        const int lvl = harmonyLevel.load (std::memory_order_relaxed);
+        const int vel = juce::jlimit (1, 127, (velocity * lvl) / 100);
+
+        for (int i = 0; i < r.count; ++i)
+            engine.noteOn (harmonyCh, r.notes[i], (juce::uint8) vel);
+
+        latchHarmony (phys, r);
     };
 
     // GLOBAL TRANSPOSE IS NO LONGER APPLIED HERE.
@@ -1036,18 +1862,76 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     {
         const auto m = meta.getMessage();
 
-        // Reserved control-notes (0–35) never reach chord recognition or solo
-        // routing — they drive the transport / element / variation controls.
-        if ((m.isNoteOn() || m.isNoteOff()) && m.getNoteNumber() < 36)
+        // ── CONTROL PADS ─────────────────────────────────────────────────
+        //
+        // NOTES 0-35 ARE THE ARRANGER'S CONTROL RANGE and are consumed here.
+        // Above 35 the keyboard is the keyboard: an earlier version swallowed
+        // everything below 36 AND above it too under some paths, which cost
+        // three octaves of playable range on an 88-key controller.
+        //
+        // What each control note DOES is no longer decided here - it comes from
+        // RemoteMap, which is seeded with the historic table on first run. One
+        // mapping, in one place, visible in the popup.
+
+        if (m.isNoteOn() || m.isNoteOff())
         {
+            const int note = m.getNoteNumber();
+
+            // The monitor sees every note-on, assigned or not - that is the
+            // point of it: you look at it to find out what a pad sends BEFORE
+            // you have assigned anything.
             if (m.isNoteOn())
-                handleControlNote (m.getNoteNumber());
-            continue;   // swallow both note-on and note-off
+                noteLastMidi ((int) Betel::RemoteMap::Kind::Pad, note, m.getVelocity());
+
+            const auto id  = Betel::RemoteMap::get().findPad (note);
+
+            if (id != Betel::RemoteId::kNumRemoteIds)
+            {
+                // BOTH HALVES GO THROUGH NOW.  The note-off used to be
+                // swallowed here, which was correct while every assignment was
+                // latching - but PUSH mode is defined by what a release does,
+                // and a release that never arrives is a control that engages
+                // and never lets go.  performRemote ignores it in the other two
+                // modes, so nothing else changes.
+                performRemote (id, m.isNoteOn() ? 127 : 0);
+                continue;                       // swallowed either way
+            }
+
+            if (note < 36)
+            {
+                // NOTES 0-35 STAY RESERVED even with nothing assigned to this
+                // one: they are the arranger's control range, and letting an
+                // unassigned one through would play it as a bass note.
+                //
+                // The old dispatcher that used to run here is gone. Its whole
+                // table now lives in RemoteMap::seedFactoryDefaults as real
+                // entries, so the notes still do what they always did while
+                // being visible and overridable - and there is no second,
+                // invisible copy of the mapping to drift out of step with the
+                // first.
+                continue;
+            }
         }
 
         if (m.isController())
         {
-            handleControllerMessage (m.getControllerNumber(), m.getControllerValue());
+            const int cc  = m.getControllerNumber();
+            const int val = m.getControllerValue();
+
+            noteLastMidi ((int) Betel::RemoteMap::Kind::Cc, cc, val);
+
+            // The user's own map first, then the five original CC targets. Both
+            // layers exist because the original five are learnable from the
+            // Settings tab and people already have them set; a control assigned
+            // here simply takes precedence over the older route.
+            const auto id = Betel::RemoteMap::get().findCc (cc);
+            if (id != Betel::RemoteId::kNumRemoteIds)
+            {
+                performRemote (id, val);
+                continue;
+            }
+
+            handleControllerMessage (cc, val);
             continue;   // CC consumed by the arranger control layer
         }
 
@@ -1058,7 +1942,41 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
             // LATCH THE ROUTE - see noteRouteSolo in Main.h.  The note-off must
             // reach exactly the channels this note-on reached, whatever the
             // split, the mode or the solo mask do in between.
-            if (! piano && chordTracker.isChordZone(phys))
+            // ── ZONE 1: BASS ─────────────────────────────────────────────────
+            //
+            // Its own solo slot, so the pedals get their own instrument, level
+            // and FX - AND the chord tracker, because a left hand playing a bass
+            // line is still telling the band what the chord is. Dropping the
+            // chord feed here would make a wide left hand stop moving the
+            // harmony, which reads as the arranger losing the plot rather than
+            // as a routing choice.
+            //
+            // PIANO MODE still wins: it means "the whole keyboard is the right
+            // hand", and a zone boundary underneath it would contradict that.
+            //
+            // WHETHER IT ALSO FEEDS CHORDS DEPENDS ON WHICH MODE OPENED THE
+            // ZONE, and the two answers are opposite on purpose - see
+            // bassZoneFeedsChords() in Main.h.  MULTI SPLIT yes, MANUAL BASS no.
+            //
+            // The slot comes from getActiveBassSlot(), not getBassZoneSlot():
+            // manual bass is always solo 7 and has no cycler, while multi split
+            // keeps its own.  One call answers for both so the router and the
+            // M.BASS lamp can never disagree about which slot is the bass.
+            if (! piano && isBassZone (phys))
+            {
+                const int bassSlot = getActiveBassSlot();
+                const int ch = Betel::SamplePlayerEngine::kNumStyleChannels + bassSlot;
+
+                engine.noteOn (ch, phys, m.getVelocity());
+                noteRouteSolo[phys] = (uint8_t) (noteRouteSolo[phys] | (1u << bassSlot));
+
+                if (bassZoneFeedsChords())
+                {
+                    chordTracker.noteOn (phys);
+                    noteRouteChord[phys] = true;
+                }
+            }
+            else if (! piano && chordTracker.isChordZone(phys))
             {
                 chordTracker.noteOn(phys);
                 noteRouteChord[phys] = true;
@@ -1073,6 +1991,37 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
                     if (slot >= 0 && slot < 8)
                         noteRouteSolo[phys] = (uint8_t) (noteRouteSolo[phys] | (1u << slot));
                 });
+
+                // ── HARMONY: THE TOP NOTE ONLY ───────────────────────────────
+                //
+                // Harmonising every note of a right-hand CHORD multiplies the
+                // voice count - four notes in Trio is twelve - and it sounds
+                // wrong besides: a hardware arranger harmonises the MELODY, and
+                // the melody is the top note. Anything below the current
+                // highest held key is accompaniment and is left alone.
+                //
+                // `>=` rather than `>` so a restrike of the same top note still
+                // re-spawns, which is what a repeated melody note should do.
+                //
+                // THIS BRANCH IS THE UPPER ZONE BY CONSTRUCTION - the bass and
+                // chord zones are the two `else if`s above it, so anything
+                // reaching here is already right-hand material. Stated rather
+                // than left implicit: with one split that was obvious, with
+                // three zones it is a property of the branch ORDER, and
+                // reordering those branches would silently start harmonising
+                // the bass zone.
+                if (phys >= highestHeldSoloNote)
+                {
+                    // The old top note stops being the melody the moment a
+                    // higher one arrives, so its harmony goes with it -
+                    // otherwise a rising line leaves a harmony stack behind it
+                    // on every note it passes.
+                    if (highestHeldSoloNote >= 0 && highestHeldSoloNote != phys)
+                        releaseHarmony (highestHeldSoloNote);
+
+                    highestHeldSoloNote = phys;
+                    spawnHarmony (phys, m.getVelocity());
+                }
             }
         }
         else if (m.isNoteOff())
@@ -1108,6 +2057,15 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
 
                 noteRouteSolo[phys] = 0;
             }
+
+            // UNCONDITIONAL, outside the latch test above. A key can hold
+            // harmony even when its solo route was lost, and the only thing
+            // that can ever release a harmony voice is the note-off of the key
+            // that spawned it - so this must not sit behind a branch.
+            releaseHarmony (phys);
+
+            if (phys == highestHeldSoloNote)
+                highestHeldSoloNote = -1;
         }
         else if (m.isAllNotesOff() || m.isAllSoundOff())
         {
@@ -1116,6 +2074,11 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
             // lost is exactly what it exists to clear.
             for (int slot = 0; slot < 8; ++slot)
                 engine.allNotesOff (Betel::SamplePlayerEngine::kNumStyleChannels + slot);
+
+            // The loop above already covers the harmony channel - it is solo
+            // slot 7 - so this only has to forget the melody, which
+            // clearNoteRoutes below cannot know about.
+            highestHeldSoloNote = -1;
 
             clearNoteRoutes();
             chordTracker.reset();
@@ -1137,6 +2100,7 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     emittedEvents.clear();
     sequencer.renderBlock(numSamples, emittedEvents);
 
+
     // Always dispatch — even when no events fell in this block — so any
     // pending chord change can latch on the 1/8 boundary that crosses inside
     // this block.  Pass the sequencer's tick position (end-of-block) and the
@@ -1148,6 +2112,24 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
         const int tpq          = (st != nullptr) ? st->ticksPerQuarter : 1920;
         const int ticksPerEighth = juce::jmax (1, tpq / 2);
         const int currentTick  = (int) sequencer.getCurrentTickInSection();
+        // The two bass overrides, resolved on this side because both depend on
+        // the chord tracker and on switches the processor owns. Set immediately
+        // before the call, on the same thread - see setBassOverrides.
+        //
+        // THE THIRD ARGUMENT SILENCES THE STYLE'S OWN BASS PART while manual
+        // bass is on, and without it the mode gives you TWO basses: the left
+        // hand on solo 7 and the style's bass pattern still running underneath
+        // on whatever chord it was last given.  Taking the bass over is what
+        // the mode is for, so the style's bass stands down for the duration.
+        //
+        // Note that getManualBassNote() is inert whenever this is true: it
+        // reads the chord tracker's lowest held note, and in manual bass the
+        // left hand no longer feeds the tracker.  The note-substitution path it
+        // drives is the OLD implementation of this mode and is left in place
+        // only because bass inversion shares the same call.
+        stylePlayer.setBassOverrides (getBassRootOverride(), getManualBassNote(),
+                                      isManualBassEnabled());
+
         stylePlayer.dispatchBlock (emittedEvents,
                                    chordTracker.getCurrentChord(),
                                    currentTick,
@@ -1269,10 +2251,7 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
 
     // 5) Synth convention: clear before render.
     buffer.clear();
-    auto& perf = Betel::PerfMonitor::get();
-    const auto tRender = perf.tick();
     engine.renderBlock(buffer, numSamples, effectiveBPM);
-    const auto tAfterRender = perf.tick();
 
     // 5b) Feed the loudness meter — deliberately HERE, after the engine and
     //     before the Finisher.  The Finisher is a master chain: measuring
@@ -1315,11 +2294,12 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     // stage downstream can partially undo it - the ceiling limiter would
     // otherwise still be pumping on a signal nobody hears.
     //
-    // clear() rather than a gain ramp: a fade would let a determined user
-    // reconstruct the missing seconds from the shoulders, and an abrupt cut is
-    // unambiguously "this is a demo" rather than "this plugin has a glitch".
-    // Every voice keeps running underneath, so the style stays in time and the
-    // audio simply reappears when the window ends.
+    // GREX IS PAID, SO THIS BLOCK IS LIVE.  updateDemoMode() advances the
+    // timer and isDemoSilenceActive() answers true during the silent window -
+    // 18 s playing, 3 s muted - on a machine with no valid licence.  In Ballada
+    // the same two calls are an empty function and a constant false, so the
+    // optimiser deletes the block outright; the code is identical in both trees
+    // and only RegistrationManager differs.
     {
         auto& rm = RegistrationManager::getInstance();
         rm.updateDemoMode();
@@ -1327,17 +2307,6 @@ void BetelgeuseProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
         if (rm.isDemoSilenceActive())
             buffer.clear();
     }
-
-    // Spike diagnostics: one entry per block, atomics only — no allocation, no
-    // lock, no file I/O on this thread.  The engine reports its own style/solo
-    // split, so a spike can be attributed to a bus rather than just "the audio
-    // thread was slow".
-    perf.endBlock (blockStart,
-                   engine.getLastStyleRenderTicks(),
-                   engine.getLastSoloRenderTicks(),
-                   perf.tick() - tAfterRender,
-                   engine.getActiveVoiceCount());
-    juce::ignoreUnused (tRender);
 
     // 7) We consumed all MIDI.
     midi.clear();
@@ -1439,17 +2408,8 @@ private:
 // some smoothness on the animations and nothing else.
 #define GREX_EDITOR_USE_OPENGL 1
 
-// ============================================================================
-// TEMPORARY UI DIAGNOSTICS.  Set to 0 to remove entirely.
-//
-// Six attempts at this bug have been built on reasoning about what the host,
-// the wrapper and the peer are doing.  None of them measured it.  This writes
-// the real numbers to grex_ui_debug.txt in the Grex VSTI folder so the next
-// fix is aimed at something observed rather than something assumed.
-// ============================================================================
-#define GREX_UI_DIAGNOSTICS 1
-
-class BetelgeuseEditor : public juce::AudioProcessorEditor
+class BetelgeuseEditor : public juce::AudioProcessorEditor,
+                        private juce::Timer
 {
 public:
     static constexpr int kDesignW = 1600;
@@ -1478,23 +2438,14 @@ public:
         // range the plugin is willing to be resized to.
         const auto open = constrainer.preferredOpenSize();
         setSize(open.getWidth(), open.getHeight());
-
-       #if GREX_UI_DIAGNOSTICS
-        // Start a clean file per editor, then take a reading once everything
-        // has settled - the constructor is far too early to be interesting.
-        grexDebugFile().deleteFile();
-
-        juce::Component::SafePointer<BetelgeuseEditor> safe (this);
-        juce::Timer::callAfterDelay (3000, [safe]() mutable
-        {
-            if (auto* ed = safe.getComponent())
-                ed->logUiState ("3 seconds after open (SETTLED - read this one)");
-        });
-       #endif
     }
 
     ~BetelgeuseEditor() override
     {
+        // Before the context: a watchdog tick during teardown would re-attach a
+        // context onto a component that is halfway through being destroyed.
+        stopTimer();
+
         if (openGLContext.isAttached())
             openGLContext.detach();
 
@@ -1538,7 +2489,6 @@ public:
     {
         pinPeerScale();
         attachOpenGLWhenReady();
-        logUiState ("parentHierarchyChanged");
     }
 
     void visibilityChanged() override
@@ -1657,6 +2607,70 @@ public:
         // UI is now genuinely static.
         openGLContext.setContinuousRepainting(false);
         openGLContext.attachTo(*this);
+
+        // Start the suspend watchdog only once there is a context to rescue.
+        startTimer (kWatchdogMs);
+        lastWatchdogTickMs = juce::Time::getMillisecondCounter();
+       #endif
+    }
+
+    //==========================================================================
+    // SLEEP / WAKE: THE GUI FREEZES UNTIL THE WINDOW IS CLOSED AND REOPENED.
+    //
+    // On resume the OpenGL context this editor attached before the machine went
+    // down is no longer valid - the driver tears down GL contexts across a
+    // suspend, and juce::OpenGLContext has no way to notice or rebuild itself.
+    // Rendering is EVENT-DRIVEN here (setContinuousRepainting is false), so
+    // there is no render loop to fail loudly either: repaint() requests are
+    // simply handed to a dead context and nothing more happens.  The component
+    // tree is alive the whole time, which is why closing the window with the X
+    // and reopening it fixes it - that builds a new editor and a new context.
+    //
+    // DETECTING THE SUSPEND WITHOUT ANY PLATFORM API.
+    //
+    // Timers do not fire while the machine is asleep.  So if two ticks of a
+    // one-second timer are separated by far more than one second of WALL CLOCK,
+    // the gap is time the process was not running - a suspend, a hibernate, or
+    // a host that froze the message thread hard enough to have the same effect
+    // on the context.  That single observation is the whole detector, and it
+    // works identically on Windows and macOS with no WM_POWERBROADCAST and no
+    // NSWorkspace notification.
+    //
+    // The threshold is deliberately far above any legitimate stall.  A busy
+    // message thread, a big style load, a modal file chooser - all of those can
+    // eat a second or two and none of them kills the context.  Only a real
+    // suspend produces a gap this size.
+    //
+    // Re-attaching is done on a LATER message, not inline: detach() shuts the
+    // GL render thread down, and asking for a new context in the same callback
+    // that killed the old one is how this turns into a hang instead of a fix.
+    //==========================================================================
+    void timerCallback() override
+    {
+       #if GREX_EDITOR_USE_OPENGL
+        const auto now  = juce::Time::getMillisecondCounter();
+        const auto prev = lastWatchdogTickMs;
+        lastWatchdogTickMs = now;
+
+        if (prev == 0 || now < prev) return;              // first tick, or counter wrap
+
+        if (now - prev < kSuspendGapMs) return;           // ordinary tick
+
+        if (! glAttached || ! isShowing() || getPeer() == nullptr) return;
+
+        // Rebuild. glAttached is cleared here so attachOpenGLWhenReady's own
+        // guard lets the re-attach through; every other precondition it checks
+        // is re-checked there rather than duplicated.
+        openGLContext.detach();
+        glAttached = false;
+
+        juce::Component::SafePointer<BetelgeuseEditor> safe (this);
+        juce::MessageManager::callAsync ([safe]
+        {
+            if (safe == nullptr) return;
+            safe->attachOpenGLWhenReady();
+            safe->repaint();
+        });
        #endif
     }
 
@@ -1701,93 +2715,6 @@ public:
     // When the size is legitimate this is exactly getLocalBounds() and nothing
     // changes, so a real 2560x1364 window on a big monitor is untouched.
     //==========================================================================
-    //==========================================================================
-    // WHERE THE DIAGNOSTIC FILE GOES.  One definition, used by both the
-    // delete-on-open and the append, so the two can never drift apart.
-    //
-    // Forward slashes deliberately: juce::File normalises them on Windows, and
-    // they keep the string free of backslash escaping.  createDirectory() is
-    // there so a missing folder produces a file rather than a silent no-op -
-    // appendText into a non-existent directory just fails and says nothing,
-    // which is the last thing this particular file should do.
-    //==========================================================================
-    static juce::File grexDebugFile()
-    {
-        auto dir = juce::File ("D:/workspace/BetelgeuseArranger/Grex VSTI");
-        dir.createDirectory();
-        return dir.getChildFile ("grex_ui_debug.txt");
-    }
-
-    //==========================================================================
-    // WRITE THE REAL GEOMETRY TO A FILE.  Remove with GREX_UI_DIAGNOSTICS 0.
-    //
-    // Every line here is a number one of the last six fixes ASSUMED.  If the
-    // assumption was right the file will say so; if it was not, the file says
-    // which one was wrong, which is the thing no amount of further reasoning
-    // was going to produce.
-    //==========================================================================
-    void logUiState (const char* when)
-    {
-       #if GREX_UI_DIAGNOSTICS
-        juce::String t;
-        t << "---- " << when << " ----\n";
-
-        // WHICH FORMAT AND WHICH HOST.  Never established in six rounds, and
-        // half the reasoning depended on it.
-        t << "wrapper       : " << juce::AudioProcessor::getWrapperTypeDescription (processor.wrapperType) << "\n";
-        t << "host          : " << juce::PluginHostType().getHostDescription() << "\n";
-
-        // THE EDITOR ITSELF.
-        t << "editor size   : " << getWidth() << " x " << getHeight() << "\n";
-        t << "editor xform  : mat00=" << juce::String (getTransform().mat00, 4)
-          << "  mat11=" << juce::String (getTransform().mat11, 4)
-          << "  identity=" << (getTransform().isIdentity() ? "yes" : "NO") << "\n";
-
-        // THE PARENT THE WRAPPER OWNS.
-        if (auto* parent = getParentComponent())
-            t << "wrapper size  : " << parent->getWidth() << " x " << parent->getHeight() << "\n";
-        else
-            t << "wrapper size  : (no parent component)\n";
-
-        // THE PEER.  This is the layer rounds 4 and 5 argued about.
-        if (auto* peer = getPeer())
-        {
-            t << "peer scale    : " << juce::String (peer->getPlatformScaleFactor(), 4) << "\n";
-            t << "peer bounds   : " << peer->getBounds().toString() << "\n";
-        }
-        else
-        {
-            t << "peer          : (none)\n";
-        }
-
-        // THE DISPLAY, as JUCE sees it.
-        if (auto* d = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
-        {
-            t << "display scale : " << juce::String (d->scale, 4) << "  dpi=" << juce::String (d->dpi, 1) << "\n";
-            t << "display area  : total=" << d->totalArea.toString() << "  user=" << d->userArea.toString() << "\n";
-        }
-        t << "global scale  : " << juce::String (juce::Desktop::getInstance().getGlobalScaleFactor(), 4) << "\n";
-
-        // OPENGL.  getRenderingScale() is the multiplier the GL renderer
-        // rasterises the component tree at - the one suspect never tested.
-        t << "opengl build  : " << (GREX_EDITOR_USE_OPENGL ? "ON" : "OFF") << "\n";
-        t << "opengl attach : " << (openGLContext.isAttached() ? "yes" : "no") << "\n";
-        if (openGLContext.isAttached())
-            t << "opengl scale  : " << juce::String (openGLContext.getRenderingScale(), 4) << "\n";
-
-        // WHAT MainComponent WILL ACTUALLY DRAW AT.
-        const double uiScale = juce::jmin ((double) mainComponent.getWidth()  / (double) kDesignW,
-                                           (double) mainComponent.getHeight() / (double) kDesignH);
-        t << "maincomp size : " << mainComponent.getWidth() << " x " << mainComponent.getHeight() << "\n";
-        t << "maincomp scale: " << juce::String (uiScale, 4) << "   (design "
-          << kDesignW << "x" << kDesignH << ")\n\n";
-
-        grexDebugFile().appendText (t);
-       #else
-        juce::ignoreUnused (when);
-       #endif
-    }
-
     void resized() override
     {
         const auto b = getLocalBounds();
@@ -1796,8 +2723,6 @@ public:
         const int h = juce::jmin (b.getHeight(), juce::jmax (1, constrainer.getMaximumHeight()));
 
         mainComponent.setBounds (0, 0, w, h);
-
-        logUiState ("resized");
     }
 
     juce::OpenGLContext& getOpenGLContext() { return openGLContext; }
@@ -1809,6 +2734,12 @@ private:
     juce::OpenGLContext     openGLContext;
     bool                    glAttached = false;
     bool                    peerPinned = false;
+
+    // Suspend watchdog - see timerCallback.  kSuspendGapMs is the wall-clock gap
+    // between two watchdog ticks that counts as "the machine was asleep".
+    static constexpr int    kWatchdogMs   = 1000;
+    static constexpr int    kSuspendGapMs = 10000;
+    juce::uint32            lastWatchdogTickMs = 0;
 };
 
 juce::AudioProcessorEditor* BetelgeuseProcessor::createEditor()
@@ -1820,6 +2751,3 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new BetelgeuseProcessor();
 }
-
-
-

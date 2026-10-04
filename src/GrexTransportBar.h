@@ -1,4 +1,7 @@
+
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 #include <JuceHeader.h>
 
 //==============================================================================
@@ -64,7 +67,7 @@ public:
         auto r = getLocalBounds().toFloat();
         g.setColour (juce::Colour (0xFF101010));
         g.fillRoundedRectangle (r, 6.0f);
-        g.setColour (juce::Colour (0xFF3A3322));
+        g.setColour (juce::Colour (Betel::Pal::kTintPanel));
         g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
     }
 
@@ -88,7 +91,7 @@ public:
 private:
     static constexpr juce::uint32 kRedRaw   = 0xFFD50000;
     static constexpr juce::uint32 kGreenRaw = 0xFF00C853;
-    static constexpr juce::uint32 kAmberRaw = 0xFFCC6600;
+    static constexpr juce::uint32 kAmberRaw = Betel::Pal::kAccent;
     inline static const juce::Colour kRed   { kRedRaw };
     inline static const juce::Colour kGreen { kGreenRaw };
     inline static const juce::Colour kAmber { kAmberRaw };
@@ -205,3 +208,7 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GrexTransportBar)
 };
+
+
+
+

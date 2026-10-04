@@ -1,3 +1,4 @@
+
 // =============================================================================
 //  SlotParamConvert.h
 //
@@ -13,6 +14,34 @@
 #include "InstrEditPanel.h"   // SlotParams
 #include "Channel.h"          // Betel::Channel::ChannelParams
 
+//==============================================================================
+// IF YOU ADD A FIELD TO SlotParams, IT MUST BE ADDED IN FOUR PLACES.
+//
+// This file is the one that gets forgotten, because forgetting it is SILENT.
+// Miss BetelStateXml::saveSlot and the value does not survive a save - obvious
+// within a minute.  Miss THIS function and the value saves perfectly, loads
+// perfectly, displays perfectly on the control, and simply never reaches the
+// audio.  Nothing is wrong on screen, so nothing looks wrong.
+//
+// That is exactly what happened to delayDry, delayWetBase and reverbWetBase:
+// added to SlotParams, to Channel::ChannelParams, to Channel's atomics, to the
+// editor and to the set file - and never copied across here.  Channel read them
+// from a ChannelParams that never carried anything but its own struct defaults,
+// so the DRY slider and both WET BASE dialogs had never once changed the sound.
+// They looked like a set-restore bug because the value was visibly right.
+//
+// THE FOUR PLACES:
+//   1. BetelStateXml::saveSlot        - so it survives a save
+//   2. BetelStateXml::loadSlot        - so it comes back
+//   3. slotParamsToChannelParams      - THIS FILE, so it reaches the audio
+//   4. Betel::Channel::ChannelParams  - so there is somewhere for it to land
+//
+// And if it does NOT belong in ChannelParams because the engine is not its
+// owner (the allowed-notes window lives in StylePlayer, the band filter has its
+// own per-channel route), then it needs its own explicit push beside the bulk
+// one in MainComponent's onSlotParamsChanged handler - which is where those two
+// already are.  There is no fifth option where it just works.
+//==============================================================================
 inline Betel::Channel::ChannelParams slotParamsToChannelParams (const SlotParams& sp)
 {
     Betel::Channel::ChannelParams cp;
@@ -29,7 +58,13 @@ inline Betel::Channel::ChannelParams slotParamsToChannelParams (const SlotParams
     // in, driven by a sound load or the GAIN slider.  See the note on
     // Channel::instrumentGain.
     cp.ampRelease  = sp.release * 1000.0f;
-    cp.ampCurve    = sp.ampCurve;
+    cp.ampCurve    = sp.ampCurve;    // legacy trio, still carried
+    cp.ampCurveK   = sp.ampCurveK;   // the continuous shape the envelope reads
+
+    // BOTH, and this is the line the whole SHAPE knob depends on.  This
+    // converter is the ONLY road from a slot's params to a channel's — every
+    // slot in both hands goes through it — so a field missing here is a
+    // control that moves and reaches nothing.
 
     // ── Filter: SlotParams.filterCutoff is 0..1 normalised; the engine wants
     //   Hz.  Use a log mapping 20 Hz .. 20 kHz so the slider feels musical
@@ -41,6 +76,11 @@ inline Betel::Channel::ChannelParams slotParamsToChannelParams (const SlotParams
     }
     cp.filterReson    = sp.filterReson;
     cp.filterKeytrack = sp.filterKeytrack;
+
+    // Melodic pseudo round robin. Travels the bulk push like the filter does,
+    // so a style program change re-stamps it along with everything else rather
+    // than leaving the slot varying by an amount the new sound never asked for.
+    cp.variationAmount = sp.variationAmount;
 
     // ── Band filter: NOT converted here, and that is the point.
     //
@@ -72,6 +112,15 @@ inline Betel::Channel::ChannelParams slotParamsToChannelParams (const SlotParams
     cp.pitchRelease  = sp.pEnvR * 1000.0f;
     cp.pitchEnvDepth = sp.pEnvDepth;
 
+    // ── Attack glide (solo slots; Channel::noteOn refuses the rest) ─────────
+    cp.glideMode   = sp.glideMode;
+    cp.glideDepth  = sp.glideDepth;
+    cp.glideTimeMs = sp.glideTimeMs;
+    cp.glideShapeK = sp.glideShapeK;
+    cp.glideEveryN = sp.glideEveryN;
+    cp.glideOdds   = sp.glideOdds;
+    cp.glideVelMin = sp.glideVelMin;
+
     // ── Mono / portamento ───────────────────────────────────────────────────
     cp.playMode         = sp.playMode;
     cp.monoHoldStolen   = sp.monoHoldStolen;
@@ -79,6 +128,7 @@ inline Betel::Channel::ChannelParams slotParamsToChannelParams (const SlotParams
     cp.monoRetrigStolen = sp.monoRetrigStolen;
     cp.portamentoTime   = sp.portamentoTime;
     cp.octaveOffset   = sp.octaveOffset;
+    cp.engineSpec     = sp.engineSpec;     // SOUND ENGINE (Synth Bass 1 / 2)
 
     // ── LFOs (units already match: Hz / 0..1 / ms) ─────────────────────────
     cp.ampLfoEnabled  = sp.ampLfoEnabled;
@@ -114,6 +164,7 @@ inline Betel::Channel::ChannelParams slotParamsToChannelParams (const SlotParams
     cp.reverbWet  = sp.reverbWet;
     cp.reverbDry  = sp.reverbDry;
     cp.reverbTail = sp.reverbTail;
+    cp.reverbWetBase = sp.reverbWetBase;
     cp.reverbHpNorm = sp.reverbHpNorm;
     cp.reverbLpNorm = sp.reverbLpNorm;
     cp.reverbPreDelay = sp.reverbPreDelay;
@@ -123,6 +174,11 @@ inline Betel::Channel::ChannelParams slotParamsToChannelParams (const SlotParams
     cp.delayTimeSig  = sp.delayTimeSig;
     cp.delayDiv      = sp.delayDiv;
     cp.delayFeedback = sp.delayFeedback;
+    cp.delayDampHz   = sp.delayDampHz;
+    cp.delayHpHz     = sp.delayHpHz;
+    cp.delaySmoothMs = sp.delaySmoothMs;
+    cp.delayDry      = sp.delayDry;
+    cp.delayWetBase  = sp.delayWetBase;
     cp.delayWet      = sp.delayWet;
 
     // ── Sounds-path insert FX (direct copy) ────────────────────────────────

@@ -1,11 +1,17 @@
 
 
+
+
+
 #pragma once
+#include "BalladaPalette.h"   // Betel::Pal - the pool-blue accent scheme
 //==============================================================================
 // MixerTab.h  —  Mixing console for Betelgeuse.
 //
 // Three framed sections (formation unchanged):
 //   • LEFT HAND / STYLE  : 8 horizontal channel faders + STYLE VOLUME under them
+//                          (double-click STYLE VOLUME for its base unity, as on
+//                           SOLO VOLUME -- what the 127 detent is worth in dB)
 //   • RIGHT HAND / SOLO  : 8 horizontal channel faders + SOLO  VOLUME under them
 //   • MASTER             : a single VERTICAL fader
 //
@@ -21,6 +27,7 @@
 // master fader is vertical (name on top, value at bottom).
 //==============================================================================
 
+#include "AssignPopup.h"
 #include <JuceHeader.h>
 #include "InstrEditPanel.h"   // for InstrEditStyle::paintComponentFrame
 
@@ -149,7 +156,7 @@ namespace Betel
             paintTrack (g, track, true);
 
             const float unityX = x0 + w * 0.5f;
-            g.setColour (juce::Colour (0xFFE6A059).withAlpha (0.55f));
+            g.setColour (juce::Colour (Betel::Pal::kAccentSoft).withAlpha (0.55f));
             g.drawLine (unityX, midY - kTrackT * 0.5f - 4.0f, unityX, midY + kTrackT * 0.5f + 4.0f, 1.0f);
 
             const float handleX = x0 + pos * w;
@@ -181,7 +188,7 @@ namespace Betel
             paintTrack (g, track, false);
 
             const float unityY = y0 + h * 0.5f;
-            g.setColour (juce::Colour (0xFFE6A059).withAlpha (0.55f));
+            g.setColour (juce::Colour (Betel::Pal::kAccentSoft).withAlpha (0.55f));
             g.drawLine (midX - kTrackT * 0.5f - 4.0f, unityY, midX + kTrackT * 0.5f + 4.0f, unityY, 1.0f);
 
             const float handleY = y0 + (1.0f - pos) * h;   // pos 1 = top
@@ -212,9 +219,9 @@ namespace Betel
             if (r.getWidth() <= 0.0f || r.getHeight() <= 0.0f) return;
             const float a = horiz ? r.getY() - 1.0f : r.getX() - 1.0f;
             const float b = horiz ? r.getBottom() + 1.0f : r.getRight() + 1.0f;
-            juce::ColourGradient grad (juce::Colour (0xFFF0B265), horiz ? 0.0f : a, horiz ? a : 0.0f,
-                                       juce::Colour (0xFF6E4419), horiz ? 0.0f : b, horiz ? b : 0.0f, false);
-            grad.addColour (0.5, juce::Colour (0xFFB87A36));
+            juce::ColourGradient grad (juce::Colour (Betel::Pal::kAccentLight), horiz ? 0.0f : a, horiz ? a : 0.0f,
+                                       juce::Colour (Betel::Pal::kAccentDark), horiz ? 0.0f : b, horiz ? b : 0.0f, false);
+            grad.addColour (0.5, juce::Colour (Betel::Pal::kAccent));
             g.setGradientFill (grad);
             g.fillRoundedRectangle (r, kTrackT * 0.5f);
         }
@@ -223,9 +230,9 @@ namespace Betel
             const float hR = juce::jmin (12.0f, radius);
             g.setColour (juce::Colour (0xFF101010));
             g.fillEllipse (cx - hR, cy - hR, hR * 2.0f, hR * 2.0f);
-            g.setColour (juce::Colour (0xFFE6A059).withAlpha (0.55f));
+            g.setColour (juce::Colour (Betel::Pal::kAccentSoft).withAlpha (0.55f));
             g.drawEllipse (cx - hR + 0.5f, cy - hR + 0.5f, hR * 2.0f - 1.0f, hR * 2.0f - 1.0f, 1.0f);
-            g.setColour (juce::Colour (0xFFD89855));
+            g.setColour (juce::Colour (Betel::Pal::kAccentMid));
             g.fillEllipse (cx - kInnerR, cy - kInnerR, kInnerR * 2.0f, kInnerR * 2.0f);
         }
 
@@ -252,6 +259,10 @@ namespace Betel
     {
     public:
         std::function<void(int slot, float linearGain)> onStyleChannelGainChanged;
+
+        /** Left double-click on a style fader - the host opens the base-trim
+            dialog for that slot. */
+        std::function<void(int slot)> onStyleSlotBaseDbRequested;
         std::function<void(int slot, float linearGain)> onSoloChannelGainChanged;
         std::function<void(float linearGain)>           onMasterGainChanged;
         std::function<void(float boostDb)>              onMasterBoostChanged;    // MASTER boost tickboxes
@@ -286,8 +297,20 @@ namespace Betel
                         onStyleChannelGainChanged (i, styleFaders[i].getLinearGain());
                 };
 
+                // LEFT DOUBLE-CLICK = the POST BASE TRIM for this slot, in dB.
+                // Same gesture the two bus faders beside it already use, so it
+                // needs no new vocabulary - and it is the escape hatch for a
+                // style part sent so loud or so quiet that the fader's own range
+                // cannot rescue it.
+                styleFaders[i].onLeftDoubleClick = [this, i]
+                { if (onStyleSlotBaseDbRequested) onStyleSlotBaseDbRequested (i); };
+
                 addAndMakeVisible (soloFaders[i]);
-                soloFaders[i].setLabel ("SOLO " + juce::String (i + 1));
+                // SOLO 8 IS THE HARMONY CHANNEL - named, not numbered, and
+                // blue, so the fader that is not part of the lead layer says so
+                // in the one place a player goes to balance it.
+                soloFaders[i].setLabel (i == 7 ? juce::String ("HARMONY")
+                                               : "SOLO " + juce::String (i + 1));
                 soloFaders[i].onChange = [this, i](float)
                 {
                     if (onSoloChannelGainChanged)
@@ -298,6 +321,8 @@ namespace Betel
             // ── Bus-volume faders (-10..+10 dB) ───────────────────────────────
             addAndMakeVisible (styleVolumeFader);
             styleVolumeFader.setLabel ("STYLE VOLUME");
+            styleVolumeFader.onLeftDoubleClick = [this]
+            { if (onStyleBaseUnityRequested) onStyleBaseUnityRequested(); };
             styleVolumeFader.onChange = [this](float)
             {
                 if (onStyleBusGainChanged) onStyleBusGainChanged (styleVolumeFader.getLinearGain());
@@ -392,6 +417,40 @@ namespace Betel
         {
             if (slot >= 0 && slot < 8) soloFaders[slot].setLinearGain (linearGain);
         }
+        //======================================================================
+        // REGISTER THIS TAB'S CONTROLS FOR MIDI ASSIGNMENT.
+        //
+        // The tab does it rather than MainComponent reaching in - the id belongs
+        // beside the widget, or the mapping drifts silently the first time one
+        // moves.
+        //
+        // All FIVE boost tickboxes share the MasterBoost id on purpose: they are
+        // one control wearing five hats, so a right double-click on any of them
+        // opens the same assignment rather than five that fight.
+        //
+        // PUBLIC, and anchored beside a public method deliberately: the first
+        // attempt anchored on timerCallback and landed under `private:`, where
+        // it compiled perfectly and could not be called.
+        //======================================================================
+        void attachRemotes (Betel::RemoteAssignHub& hub)
+        {
+            using R = Betel::RemoteId;
+
+            for (int i = 0; i < 8; ++i)
+            {
+                hub.attach (styleFaders[(size_t) i], (R) ((int) R::StyleCh1 + i));
+                hub.attach (soloFaders [(size_t) i], (R) ((int) R::SoloCh1  + i));
+            }
+
+            hub.attach (styleVolumeFader, R::StyleVolume);
+            hub.attach (soloVolumeFader,  R::SoloVolume);
+            hub.attach (masterFader,      R::MasterVolume);
+            hub.attach (finisherBtn,      R::FinisherOn);
+
+            for (auto& b : boostButtons)
+                hub.attach (b, R::MasterBoost);
+        }
+
         void setMasterGain   (float linearGain) { masterFader.setLinearGain (linearGain); }
         void setStyleBusGain (float linearGain) { styleVolumeFader.setLinearGain (linearGain); }
 
@@ -416,6 +475,15 @@ namespace Betel
             the 127 detent is worth in dB.  The mixer does not own the number and
             does not store it; it only reports the gesture. */
         std::function<void()> onSoloBaseUnityRequested;
+
+        /** The same gesture on STYLE VOLUME, and deliberately the same gesture:
+            two faders that answer the same question about their own detent
+            should not be asked in two different ways.
+
+            Where the two ANSWERS are kept differs -- the solo base is global and
+            the style base travels in the set -- but that is the host's business,
+            not the mixer's.  This reports the gesture and nothing else. */
+        std::function<void()> onStyleBaseUnityRequested;
 
         /** Light the tickbox matching the processor's current master boost
             (nearest of 0/+3/+6/+9/+12).  Silent — never fires onMasterBoostChanged.
@@ -455,7 +523,7 @@ namespace Betel
                     auto meterF = finisherMeterArea.toFloat();
                     auto bar    = meterF.removeFromRight (meterF.getWidth() * norm);
                     g.setColour (finisherGrDb >= kMeterHotDb ? juce::Colour (0xFFCC3322)
-                                                             : juce::Colour (0xFFD4AF37));
+                                                             : juce::Colour (Betel::Pal::kAccentBright));
                     g.fillRect (bar);
                 }
             }
@@ -582,3 +650,7 @@ namespace Betel
 } // namespace Betel
 
 using MixerTab = Betel::MixerTab;
+
+
+
+

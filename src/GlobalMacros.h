@@ -1,6 +1,8 @@
+
+
 #pragma once
 //==============================================================================
-// GlobalMacros.h — "FUNKEY MODE" and "BIG DRUMS".
+// GlobalMacros.h — "FUNKEY MODE".
 //
 // WHAT THESE ARE
 // --------------
@@ -19,12 +21,11 @@
 // therefore lossless and repeatable.
 //
 // FUNKEY MODE is keyed on GM FAMILY (flag >> 3).  There is no bus shared by
-// "all guitars" — the six-stage FX chain lives per channel — so a family preset
-// is a LOOKUP applied whenever a slot loads an instrument in that family, and
-// re-applied when the sounding program changes.  Seven families are covered,
+// "all guitars" — the FX chain lives per channel — so a family preset is a
+// LOOKUP applied whenever a slot loads an instrument in that family, and
+// re-applied when the sounding program changes.  Six families are covered,
 // chosen as the ones that carry a funk arrangement:
 //
-//      0  Piano                 (GM   0.. 7)
 //      1  Chromatic Percussion  (GM   8..15)
 //      2  Organ                 (GM  16..23)
 //      3  Guitar                (GM  24..31)
@@ -32,31 +33,52 @@
 //     13  Ethnic                (GM 104..111)
 //     14  Percussive            (GM 112..119)
 //
-// An instrument outside those seven keeps its own EQ / wah / phaser / delay
-// even while Funkey Mode is on.
+// PIANO WAS DROPPED.  It is the family a ballad arrangement leans on hardest as
+// itself, and a wah on it is a novelty rather than a voicing.
 //
-// Each family owns its WHOLE chain, chorus and reverb included.  A shared
-// "glue" pair applied on top of every family was tried and removed: one room
-// for seven families sounds tidy in principle, but it meant the chorus and
-// reverb a family was tuned with were never the ones it played through, so
-// tuning a family by ear was impossible.
+// ── FUNKEY OWNS WAH AND PHASER.  NOTHING ELSE.  ─────────────────────────────
 //
-// BIG DRUMS is simpler: one preset, applied to the rhythm slots, replacing the
-// loaded kit's own FX rack for as long as it is engaged.
+// It used to take the whole six-stage chain — EQ, chorus, wah, phaser, delay,
+// reverb — and that was the source of its one real defect, recorded here at the
+// time: a family's chorus and reverb "were never the ones it played through, so
+// tuning a family by ear was impossible."  A shared glue pair was tried against
+// that and removed; giving each family its own room did not fix it either,
+// because the room a family is tuned in is still not the room the arrangement
+// sits in.
+//
+// The answer was to stop taking the room at all.  Wah and phaser are the two
+// stages that ARE the funk character and that no instrument's own preset has a
+// strong opinion about; EQ, delay, chorus and reverb are placement and voicing,
+// and those belong to the instrument and to the section buses that were tuned
+// with the rest of the arrangement.  So the macro now overlays two stages on top
+// of a chain that is otherwise left exactly as it was, and what you tune in a
+// family editor is what you hear.
+//
+// An instrument outside the six keeps everything, wah and phaser included, even
+// while Funkey Mode is on.
+//
+// BIG DRUMS WAS REMOVED, and this is the whole note it gets: it replaced a
+// loaded kit's ENTIRE FX rack with one global one, which is backwards for a kit
+// voiced to sit in a particular style.  Editors, preset file and remote id went
+// with it.
 //
 // PERSISTENCE
 // -----------
 // One file each, deliberately separate so the two can be shared, replaced or
 // reverted independently:
 //
-//     grex_funkey.xml      the seven family presets
-//     grex_bigdrums.xml    the drum preset
+//     grex_funkey.xml      the six family presets
 //
-// Both are loaded at plugin start and written by the editors' SAVE buttons.
-// They are NOT part of a set: a set records whether the macros are ENGAGED,
-// while the macro presets themselves are global to the installation.  Loading
-// someone else's set therefore cannot silently redefine what your Funkey Mode
-// sounds like.
+// (grex_bigdrums.xml went with Big Drums.  Nothing reads or writes it.)
+//
+// It is loaded at plugin start and written by the editor's SAVE button.  It is
+// NOT part of a set: a set records whether the macro is ENGAGED, while the
+// macro preset itself is global to the installation.  Loading someone else's
+// set therefore cannot silently redefine what your Funkey Mode sounds like.
+//
+// A MISSING FILE IS NORMAL AND NO LONGER MEANS SILENCE: the six families are
+// SEEDED with working wah and phaser settings in the constructor, so the macro
+// does something the first time it is switched on.  See seedFamilyDefaults.
 //==============================================================================
 
 #include <juce_core/juce_core.h>
@@ -105,13 +127,52 @@ namespace Betel
     // would silently overwrite the other.  On disk the model code earns its
     // keep; on screen it does not.
     //==========================================================================
+    //==========================================================================
+    // prettyName - UNDERSCORES BECOME SPACES, and nothing else.
+    //
+    // Sound and style files are named for a filesystem, not for a reader:
+    // `1042_Accordion_Musette`, `126-000-036_Arabic Kit`, `8Beat_Pop_Rock`.
+    // The underscore is there because it survives every OS and every zip; it
+    // has no business on screen.
+    //
+    // DISPLAY ONLY.  NEVER call this on anything that is an IDENTITY:
+    //   * a style's `styleId` - the browser hands that string back on selection
+    //   * a set's filename, or SetBaker's .bset path
+    //   * a sound's FLAG (the leading digits) - a saved set stores that number
+    // Rewriting any of those turns a saved set into a dangling reference.  The
+    // safe sites are the ones whose value is only ever DRAWN, or only ever
+    // compared against other values from the same converted store.
+    //
+    // Doubles are collapsed, because `Grand__Piano` should not read as a gap,
+    // and the result is trimmed so a trailing `_` does not leave a hanging
+    // space that quietly breaks an equality test elsewhere.
+    //==========================================================================
+    inline juce::String prettyName (const juce::String& raw)
+    {
+        if (! raw.containsChar ('_')) return raw;
+
+        auto out = raw.replaceCharacter ('_', ' ');
+        while (out.contains ("  ")) out = out.replace ("  ", " ");
+        out = out.trim();
+
+        // A name that was nothing BUT underscores would come back empty, and a
+        // blank row in a selector is worse than an ugly one - the same guard
+        // displayNameFor already makes for a stem that begins with a dot.
+        return out.isEmpty() ? raw : out;
+    }
+
     inline juce::String displayNameFor (const juce::String& stem)
     {
+        // BOTH TRANSFORMS IN ONE PLACE.  This function is already documented as
+        // the single site where a style or set file becomes readable text, and
+        // sixteen callers go through it - so the underscore swap belongs here
+        // rather than at sixteen call sites, for exactly the reason the model-
+        // code cut did.
         const int dot = stem.indexOfChar ('.');
-        if (dot < 0) return stem;
+        if (dot < 0) return prettyName (stem);
 
         const auto head = stem.substring (0, dot).trim();
-        return head.isNotEmpty() ? head : stem;
+        return prettyName (head.isNotEmpty() ? head : stem);
     }
 
     inline juce::String displayNameFor (const juce::File& f)
@@ -142,9 +203,26 @@ namespace Betel
                        .getParentDirectory();
         }
 
+        // ── EVERY FILE NAME HERE CARRIES THE grex_ PREFIX, NOT ballada_ ───
+        //
+        // Grex and Ballada can be installed side by side, and a player who owns
+        // both will point them at DIFFERENT root folders - but nothing stops
+        // him pointing them at the same one, and if he does, a shared file name
+        // means the free plugin silently rewrites the paid plugin's settings.
+        // The prefix is what makes that impossible.
+        //
+        // THE ValueTree TAG NAMES INSIDE THESE FILES ARE UNCHANGED on purpose
+        // ("GrexMaster", "GrexCrash", "GrexFunkey"): a tuned ballada_master.xml
+        // can be seeded into Grex by copying it and renaming it grex_master.xml.
+        // Changing the tags as well would have made that copy fail silently,
+        // which is a worse trade than it looks.
         static juce::File funkeyPreset()   { return root().getChildFile ("grex_funkey.xml");   }
-        static juce::File bigDrumsPreset() { return root().getChildFile ("grex_bigdrums.xml"); }
-        static juce::File favorites()      { return root().getChildFile ("favorites.xml");     }
+
+        /** THE GLOBAL STYLE-BUS BOOST, one number, written on every change.
+            Its own file so it can be copied, deleted or hand-edited alone -
+            deleting it restores StyleLevels::kForcedBoostDb.  See StyleLevels.h. */
+        static juce::File styleBoost()     { return root().getChildFile ("grex_boost.xml");    }
+        static juce::File favorites()      { return root().getChildFile ("favorites.xml");        }
         static juce::File registration()   { return root().getChildFile ("grex_registration.xml"); }
         static juce::File settings()       { return root().getChildFile ("grex_settings.xml"); }
         static juce::File styleLevels()    { return root().getChildFile ("grex_levels.xml");  }
@@ -152,6 +230,7 @@ namespace Betel
         // grex_settings.xml: it is per-STYLE data about the library, not a
         // preference about the plugin, and it grows with the library.
         static juce::File styleFavorites() { return root().getChildFile ("grex_style_favorites.xml"); }
+        static juce::File searchHistory()  { return root().getChildFile ("grex_searches.xml"); }
         // The two PLAYER-wide settings — chord mode and tempo free/synced.
         // Deliberately not part of a set: see MasterSettings.h.
         static juce::File master()         { return root().getChildFile ("grex_master.xml"); }
@@ -159,10 +238,12 @@ namespace Betel
         // that holds two flags about how the player plays, this is a HARDWARE
         // map with its own lifetime — re-learned when the controller changes.
         static juce::File ccMap()          { return root().getChildFile ("grex_cc_map.xml"); }
-        static juce::File crashSettings()  { return root().getChildFile ("grex_crash.xml");   }
-        static juce::File styleLog()       { return root().getChildFile ("grex_log.txt");      }
-        static juce::File perfLog()        { return root().getChildFile ("grex_perf.txt");     }
-        static juce::File drumLog()        { return root().getChildFile ("grex_drum.txt");     }
+        static juce::File crashSettings()  { return root().getChildFile ("grex_crash.xml"); }
+        // NO LOG PATHS HERE.  styleLog / perfLog / drumLog (grex_log.txt,
+        // grex_perf.txt, grex_drum.txt) are gone along with the tracing that
+        // wrote them.  If a future fault needs instrumentation, add it behind
+        // a #define that ships as 0 - a helper sitting here is an invitation to
+        // put file I/O back on a thread that cannot afford it.
     };
 
     //==========================================================================
@@ -174,7 +255,7 @@ namespace Betel
     //==========================================================================
     // DEFAULTS ARE A CLEAN SLATE: every stage disabled and every value zeroed,
     // so a fresh install starts silent and neutral.  The shipped voicing comes
-    // from grex_funkey.xml / grex_bigdrums.xml, not from these.
+    // from grex_funkey.xml, not from these.
     struct FamilyFxParams
     {
         // ── 5-band EQ ────────────────────────────────────────────────────────
@@ -211,6 +292,13 @@ namespace Betel
         int   delayTimeSig  = 0;
         int   delayDiv      = 0;
         float delayFeedback = 0.0f;
+        // Delay tone.  Present so EffectsPanel's templated loadFx / readFx sees
+        // the same field names on both types; the Funkey macro copies only wah
+        // and phaser, so these ride along unused on a family and are the section
+        // rack's real values everywhere else.
+        float delayDampHz   = 5000.0f;
+        float delayHpHz     = 20.0f;
+        float delaySmoothMs = 40.0f;
         float delayWet      = 0.0f;
         // THESE THREE EXIST FOR THE SAME REASON reverbDry BELOW DOES: loadFx /
         // readFx in EffectsPanel are TEMPLATED and shared with SlotParams, so a
@@ -247,80 +335,23 @@ namespace Betel
     };
 
     //==========================================================================
-    // BIG DRUMS — the kit FX rack, mirroring DrumKitFxParams field-for-field
-    // for the same reason FamilyFxParams mirrors the melodic slot params: the
-    // push is a straight member-for-member copy, so neither side can drift as
-    // the rack gains a stage.
+    // The six families Funkey Mode covers, as GM family indices (flag >> 3).
     //
-    // It is declared HERE rather than reusing DrumKitFxParams because that type
-    // lives in InstrEditPanel.h, a GUI header — and this file is included by
-    // Channel.cpp and StylePlayer.h, which must not drag juce_gui_basics into
-    // the engine.  The mirror keeps GlobalMacros.h juce_core-only.
-    //
-    // DEFAULTS MATCH DrumKitFxParams exactly, so an unsaved Big Drums preset is
-    // the same neutral rack a freshly-loaded kit gets: every stage off, unity
-    // wet, centred.
-    //==========================================================================
-    struct BigDrumsFxParams
-    {
-        bool  eqEnabled   = false;
-        bool  satEnabled  = false;
-        bool  compEnabled = false;
-        bool  revEnabled  = false;
-        bool  delEnabled  = false;
-
-        // 10-band EQ at 31/62/125/250/500/1k/2k/4k/8k/16k Hz, [-60..+20] dB.
-        float eqGainDb [10] = { 0,0,0,0,0,0,0,0,0,0 };
-
-        float satDrive     = 0.0f;      // 0..1
-        float satMix       = 1.0f;      // 0..1
-
-        float compThreshDb = 0.0f;      // -60..0 dB
-        float compRatio    = 1.0f;      // 1..20
-        float compAttackMs = 5.0f;      // 0.1..200 ms
-        float compReleaseMs= 50.0f;     // 5..2000 ms
-        float compMakeupDb = 0.0f;      // 0..24 dB
-
-        // MUST MIRROR DrumKitFxParams FIELD FOR FIELD - overrideDrumFx copies
-        // between them by name, so a field that exists on one side and not the
-        // other is silently dropped on the way through.  It already was: revDry
-        // lived on the kit rack and never on the Big Drums preset, so switching
-        // the macro on reset every kit's reverb dry to 1.0 without saying so.
-        float revSize      = 0.5f;      // 0..1
-        float revDamp      = 0.5f;      // 0..1
-        float revWet       = 0.0f;      // 0..1
-        float revDry       = 1.0f;      // 0..1  — was MISSING, see above
-        float revTail      = 0.5f;
-        float revPreDelay  = 0.0f;
-        float revHpNorm    = 0.2917f;
-        float revLpNorm    = 1.0f;
-        int   revAlgo      = 0;         // 0 = HALL/ROOM (FDN), 1 = PLATE
-        float revWetBase   = 1.0f;
-
-        bool  delSync      = false;     // false = free ms, true = tempo-synced
-        int   delTimeSig   = 0;         // 0 = 4/4, 1 = 3/4
-        int   delDiv       = 2;         // index into the active division table
-        float delTimeMs    = 250.0f;    // 1..2000 ms (free mode)
-        float delFb        = 0.3f;      // 0..0.95
-        float delWet       = 0.0f;      // 0..1
-        float delDry       = 1.0f;      // 0..1
-        float delWetBase   = 0.5f;
-
-        float pan          = 0.0f;      // -1..+1
-        float fxWet        = 1.0f;      // rack dry/wet
-    };
-
-    //==========================================================================
-    // The seven families Funkey Mode covers, as GM family indices (flag >> 3).
+    // SLOT NUMBERS ARE NOT A STABLE KEY, and dropping Piano is what proved it:
+    // every family below shifted down by one, so a preset file written before
+    // that would have loaded Organ's settings into Chromatic Percussion and so
+    // on down the list — silently, with no error anywhere.  loadFunkey now
+    // matches on the NAME the file already carried and treats the slot index as
+    // a fallback, so this list can change again without corrupting anything.
     //==========================================================================
     struct FunkeyFamilies
     {
-        enum Slot { Piano = 0, ChromPerc, Organ, Guitar, SynthLead, Ethnic, Percussive, Count };
+        enum Slot { ChromPerc = 0, Organ, Guitar, SynthLead, Ethnic, Percussive, Count };
 
         /** GM family index (flag >> 3) for each covered slot. */
         static constexpr int gmFamily (int slot) noexcept
         {
-            constexpr int f[Count] = { 0, 1, 2, 3, 10, 13, 14 };
+            constexpr int f[Count] = { 1, 2, 3, 10, 13, 14 };
             return (slot >= 0 && slot < Count) ? f[slot] : -1;
         }
 
@@ -328,7 +359,6 @@ namespace Betel
         {
             switch (slot)
             {
-                case Piano:      return "Piano";
                 case ChromPerc:  return "Chromatic Percussion";
                 case Organ:      return "Organ";
                 case Guitar:     return "Guitar";
@@ -337,6 +367,15 @@ namespace Betel
                 case Percussive: return "Percussive";
                 default:         return "?";
             }
+        }
+
+        /** The slot whose stored name matches, or -1.  loadFunkey's primary key
+            — see the note above on why the index is not one. */
+        static int slotForName (const juce::String& n) noexcept
+        {
+            for (int i = 0; i < Count; ++i)
+                if (n.equalsIgnoreCase (name (i))) return i;
+            return -1;
         }
 
         /** Which covered slot a GM program belongs to, or -1 when the program's
@@ -367,27 +406,38 @@ namespace Betel
         // Engaged state.  Saved WITH a set (the set records what was switched
         // on), unlike the presets, which are global to the installation.
         //----------------------------------------------------------------------
-        bool isFunkeyOn()   const noexcept { return funkeyOn.load(); }
-        bool isBigDrumsOn() const noexcept { return bigDrumsOn.load(); }
-        void setFunkeyOn   (bool b) noexcept { funkeyOn.store (b); }
-        void setBigDrumsOn (bool b) noexcept { bigDrumsOn.store (b); }
+        bool isFunkeyOn() const noexcept { return funkeyOn.load(); }
+        void setFunkeyOn (bool b) noexcept { funkeyOn.store (b); }
+
+        //----------------------------------------------------------------------
+        //  THE FUNKEY MIX - 0..1, the live value (the slider shows 0..100).
+        //
+        //  Blends the instrument's DRY signal with Funkey's finished output
+        //  (wah then phaser), right after the stage - see
+        //  Channel::applyFunkeyInPlace.  One value for every funkeyed
+        //  instrument at once, and it BELONGS TO THE SET, i.e. to the style:
+        //  it travels in the set's UiState next to funkeyMode and is put back
+        //  by MainComponent::applyMacroEngagedState.  That is the point of it -
+        //  one style wants Funkey barely there, another wants it soaked.
+        //
+        //  Like funkeyMode, silence from a set is an answer: a set that does
+        //  not mention it, and a style with no set at all, get the default -
+        //  never whatever the previous style was using.
+        //
+        //  DEFAULT 0.5 is Rob's call (2026-10), made knowing it leaves Funkey
+        //  half as wet as it was before the slider existed.
+        //----------------------------------------------------------------------
+        static constexpr float kFunkeyMixDefault = 0.5f;
+
+        float funkeyMix() const noexcept      { return funkeyMixVal.load(); }
+        void  setFunkeyMix (float mix01) noexcept
+        { funkeyMixVal.store (juce::jlimit (0.0f, 1.0f, mix01)); }
 
         //----------------------------------------------------------------------
         // Presets (message thread).
         //----------------------------------------------------------------------
         FamilyFxParams&       family (int slot)       { return fams[(size_t) clampSlot (slot)]; }
         const FamilyFxParams& family (int slot) const { return fams[(size_t) clampSlot (slot)]; }
-
-        BigDrumsFxParams&       bigDrums()       { return drums; }
-        const BigDrumsFxParams& bigDrums() const { return drums; }
-
-        /** The drum rack that should govern the rhythm slots, or nullptr when
-            Big Drums is off.  Same contract as presetForProgram: nullptr means
-            "use the kit's own FX". */
-        const BigDrumsFxParams* drumPreset() const
-        {
-            return bigDrumsOn.load() ? &drums : nullptr;
-        }
 
         /** The family preset that should govern a given GM program, or nullptr
             when Funkey Mode is off or the program's family is not covered.
@@ -399,11 +449,53 @@ namespace Betel
             return slot < 0 ? nullptr : &fams[(size_t) slot];
         }
 
+        /** THE TWELVE VALUES THE FUNKEY STAGE RUNS ON, for a given GM program.
+
+            Writes wah and phaser into `out` and returns true when the macro is
+            on AND the program's family is covered.  Returns false and leaves
+            `out` alone otherwise - a false answer means "bypass the stage", and
+            the caller pushes a default-constructed FunkeyFx to do exactly that.
+
+            TEMPLATED on the destination for the same reason overrideFx is: the
+            struct it fills is Betel::Channel::FunkeyFx, and this header knows
+            nothing about the engine and should not start now. */
+        template <typename FunkeyFxT>
+        bool funkeyFxForProgram (int gmProgram, FunkeyFxT& out) const
+        {
+            const FamilyFxParams* fx = presetForProgram (gmProgram);
+            if (fx == nullptr) return false;
+            toFunkeyFx (*fx, out);
+            return true;
+        }
+
+        /** Copy a family's twelve wah/phaser values into an engine-side struct.
+            Templated because this header knows nothing about the engine: the
+            destination is Betel::Channel::FunkeyFx and the only requirement is
+            that it carries these field names. */
+        template <typename FunkeyFxT>
+        static void toFunkeyFx (const FamilyFxParams& f, FunkeyFxT& out)
+        {
+            const FamilyFxParams* fx = &f;
+
+            out.wahEnabled     = fx->wahEnabled;
+            out.wahSensitivity = fx->wahSensitivity;
+            out.wahRate        = fx->wahRate;
+            out.wahLfoDepth    = fx->wahLfoDepth;
+            out.wahBaseHz      = fx->wahBaseHz;
+            out.wahQ           = fx->wahQ;
+            out.wahMix         = fx->wahMix;
+
+            out.phaserEnabled  = fx->phaserEnabled;
+            out.phaserRate     = fx->phaserRate;
+            out.phaserDepth    = fx->phaserDepth;
+            out.phaserFeedback = fx->phaserFeedback;
+            out.phaserMix      = fx->phaserMix;
+        }
+
         //----------------------------------------------------------------------
         // Files.  Separate on purpose — see the header note.
         //----------------------------------------------------------------------
         static juce::File funkeyFile()   { return GrexPaths::funkeyPreset();   }
-        static juce::File bigDrumsFile() { return GrexPaths::bigDrumsPreset(); }
 
         /** Written by the editor's SAVE button. */
         bool saveFunkey() const
@@ -433,33 +525,85 @@ namespace Betel
             {
                 const auto f = t.getChild (c);
                 if (f.hasType ("Glue")) continue;      // legacy shared-glue child
-                const int slot = (int) f.getProperty ("slot", -1);
+
+                // NAME FIRST, index only as a fallback.  Both are written, and
+                // the name is the one that survives the family list changing —
+                // a file from before Piano was dropped resolves every remaining
+                // family correctly, and its Piano block finds no home and is
+                // discarded, which is exactly right.
+                int slot = FunkeyFamilies::slotForName (f.getProperty ("name").toString());
+
+                if (slot < 0)
+                    slot = (int) f.getProperty ("slot", -1);
+
                 if (slot >= 0 && slot < FunkeyFamilies::Count)
                     readFamily (f, fams[(size_t) slot]);
             }
         }
 
-        /** Written by the Big Drums editor's SAVE button. */
-        bool saveBigDrums() const
-        {
-            juce::ValueTree t ("GrexBigDrums");
-            writeDrums (t, drums);
-            return writeTree (bigDrumsFile(), t);
-        }
-
-        /** Read at plugin start.  Missing / malformed file leaves the defaults
-            standing, exactly like loadFunkey. */
-        void loadBigDrums()
-        {
-            const auto xml = juce::XmlDocument::parse (bigDrumsFile());
-            if (xml == nullptr) return;
-            const auto t = juce::ValueTree::fromXml (*xml);
-            if (! t.isValid() || ! t.hasType ("GrexBigDrums")) return;
-            readDrums (t, drums);
-        }
-
     private:
-        GlobalMacros() = default;
+        //----------------------------------------------------------------------
+        //  SEEDED DEFAULTS — WHY THE MACRO USED TO DO NOTHING AT ALL.
+        //
+        //  FamilyFxParams defaults every field to 0/false, `fams` is
+        //  value-initialised from it, and grex_funkey.xml is only ever written
+        //  by a family editor's SAVE button.  On an install where nobody had
+        //  pressed SAVE, all six families were wah OFF and phaser OFF - so
+        //  switching Funkey Mode on copied "off" over "off" and was correctly,
+        //  silently inaudible.
+        //
+        //  These give each family something to BE the first time the button is
+        //  pressed.  They are a starting point, not a house style: the editor
+        //  overwrites any of them, and a SAVE makes the change permanent.
+        //----------------------------------------------------------------------
+        GlobalMacros() { seedFamilyDefaults(); }
+
+        void seedFamilyDefaults()
+        {
+            auto wah = [] (FamilyFxParams& f, float sens, float rate, float lfo,
+                           float base, float q, float mix)
+            {
+                f.wahEnabled = true;  f.wahSensitivity = sens; f.wahRate = rate;
+                f.wahLfoDepth = lfo;  f.wahBaseHz = base;      f.wahQ = q;
+                f.wahMix = mix;
+            };
+            auto phaser = [] (FamilyFxParams& f, float rate, float depth,
+                              float fb, float mix)
+            {
+                f.phaserEnabled = true; f.phaserRate = rate; f.phaserDepth = depth;
+                f.phaserFeedback = fb;  f.phaserMix = mix;
+            };
+
+            // GUITAR — the classic funk auto-wah: envelope-led, quick, narrow,
+            // low centre so a muted chord opens it and a held one closes.
+            wah    (fams[FunkeyFamilies::Guitar],     0.80f, 2.2f, 0.10f, 320.0f, 0.70f, 0.65f);
+            phaser (fams[FunkeyFamilies::Guitar],     0.30f, 0.70f, 0.45f, 0.30f);
+
+            // CHROMATIC PERCUSSION — clav and e-piano territory.  Mostly wah,
+            // higher centre so the attack keeps its bite.
+            wah    (fams[FunkeyFamilies::ChromPerc],  0.75f, 2.6f, 0.05f, 480.0f, 0.60f, 0.60f);
+            phaser (fams[FunkeyFamilies::ChromPerc],  0.25f, 0.55f, 0.35f, 0.20f);
+
+            // ORGAN — phaser-led, and slow.  The wah is a gentle LFO sweep
+            // rather than an envelope, because an organ holds notes flat and has
+            // almost no attack for a follower to track.
+            wah    (fams[FunkeyFamilies::Organ],      0.25f, 0.9f, 0.55f, 420.0f, 0.50f, 0.35f);
+            phaser (fams[FunkeyFamilies::Organ],      0.18f, 0.85f, 0.55f, 0.55f);
+
+            // SYNTH LEAD — wide phaser, deliberately more than the others: a
+            // lead is one line and can carry movement the others cannot.
+            wah    (fams[FunkeyFamilies::SynthLead],  0.55f, 1.8f, 0.30f, 500.0f, 0.65f, 0.45f);
+            phaser (fams[FunkeyFamilies::SynthLead],  0.35f, 0.90f, 0.60f, 0.50f);
+
+            // ETHNIC — light touch.  These are character instruments already and
+            // a heavy sweep buries what makes them recognisable.
+            wah    (fams[FunkeyFamilies::Ethnic],     0.45f, 1.4f, 0.20f, 380.0f, 0.55f, 0.30f);
+            phaser (fams[FunkeyFamilies::Ethnic],     0.22f, 0.50f, 0.30f, 0.20f);
+
+            // PERCUSSIVE — wah only, fast and dry-ish.  A phaser on a plucked
+            // transient smears the one thing it is there for.
+            wah    (fams[FunkeyFamilies::Percussive], 0.85f, 3.0f, 0.05f, 550.0f, 0.75f, 0.50f);
+        }
 
         static int clampSlot (int s) noexcept
             { return juce::jlimit (0, (int) FunkeyFamilies::Count - 1, s); }
@@ -523,46 +667,6 @@ namespace Betel
             }
         }
 
-        static void writeDrums (juce::ValueTree& t, const BigDrumsFxParams& p)
-        {
-            #define GDW(x) t.setProperty (#x, p.x, nullptr);
-            GDW(eqEnabled) GDW(satEnabled) GDW(compEnabled) GDW(revEnabled) GDW(delEnabled)
-            GDW(satDrive) GDW(satMix)
-            GDW(compThreshDb) GDW(compRatio) GDW(compAttackMs) GDW(compReleaseMs) GDW(compMakeupDb)
-            GDW(revSize) GDW(revDamp) GDW(revWet) GDW(revDry)
-            GDW(revTail) GDW(revPreDelay) GDW(revHpNorm) GDW(revLpNorm)
-            GDW(revAlgo) GDW(revWetBase)
-            GDW(delSync) GDW(delTimeSig) GDW(delDiv)
-            GDW(delTimeMs) GDW(delFb) GDW(delWet) GDW(delDry) GDW(delWetBase)
-            GDW(pan) GDW(fxWet)
-            #undef GDW
-            for (int i = 0; i < 10; ++i)
-                t.setProperty ("eqGainDb_" + juce::String (i), p.eqGainDb[i], nullptr);
-        }
-
-        static void readDrums (const juce::ValueTree& t, BigDrumsFxParams& p)
-        {
-            #define GDRB(x) p.x = (bool)  t.getProperty (#x, p.x);
-            #define GDRF(x) p.x = (float) t.getProperty (#x, p.x);
-            #define GDRI(x) p.x = (int)   t.getProperty (#x, p.x);
-            GDRB(eqEnabled) GDRB(satEnabled) GDRB(compEnabled) GDRB(revEnabled) GDRB(delEnabled)
-            GDRF(satDrive) GDRF(satMix)
-            GDRF(compThreshDb) GDRF(compRatio) GDRF(compAttackMs) GDRF(compReleaseMs) GDRF(compMakeupDb)
-            GDRF(revSize) GDRF(revDamp) GDRF(revWet) GDRF(revDry)
-            // Absent from an older grex_bigdrums.xml, so these fall back to the
-            // struct defaults - tail 0.5, band wide open, no pre-delay, HALL.
-            GDRF(revTail) GDRF(revPreDelay) GDRF(revHpNorm) GDRF(revLpNorm)
-            GDRI(revAlgo) GDRF(revWetBase)
-            GDRB(delSync) GDRI(delTimeSig) GDRI(delDiv)
-            GDRF(delTimeMs) GDRF(delFb) GDRF(delWet) GDRF(delDry) GDRF(delWetBase)
-            GDRF(pan) GDRF(fxWet)
-            #undef GDRB
-            #undef GDRF
-            #undef GDRI
-            for (int i = 0; i < 10; ++i)
-                p.eqGainDb[i] = (float) t.getProperty ("eqGainDb_" + juce::String (i), p.eqGainDb[i]);
-        }
-
     public:
         //----------------------------------------------------------------------
         // APPLICATION — "parallel and toggled" in one function.
@@ -591,92 +695,28 @@ namespace Betel
             if (isDrumSlot)       return;                 // Big Drums handles those
             if (! funkeyOn.load()) return;                // private FX stay in charge
 
-            // The family's whole chain, when this program's family is covered.
-            // An instrument outside the seven keeps its private FX untouched.
-            if (const FamilyFxParams* fx = presetForProgram (gmProgram))
-            {
-                p.eqEnabled = fx->eqEnabled;
-                for (int i = 0; i < 5; ++i) { p.eqGain[i] = fx->eqGain[i]; p.eqFreq[i] = fx->eqFreq[i]; }
-
-                p.chorusEnabled = fx->chorusEnabled; p.chorusRate = fx->chorusRate;
-                p.chorusDepth   = fx->chorusDepth;   p.chorusMix  = fx->chorusMix;
-
-                p.wahEnabled = fx->wahEnabled; p.wahSensitivity = fx->wahSensitivity;
-                p.wahRate    = fx->wahRate;    p.wahLfoDepth    = fx->wahLfoDepth;
-                p.wahBaseHz  = fx->wahBaseHz;  p.wahQ           = fx->wahQ;
-                p.wahMix     = fx->wahMix;
-
-                p.phaserEnabled  = fx->phaserEnabled;  p.phaserRate = fx->phaserRate;
-                p.phaserDepth    = fx->phaserDepth;    p.phaserMix  = fx->phaserMix;
-                p.phaserFeedback = fx->phaserFeedback;
-
-                p.delayEnabled  = fx->delayEnabled;  p.delayTimeSig  = fx->delayTimeSig;
-                p.delayDiv      = fx->delayDiv;      p.delayFeedback = fx->delayFeedback;
-                p.delayWet      = fx->delayWet;      p.delayDry      = fx->delayDry;
-                p.delayWetBase  = fx->delayWetBase;
-
-                p.reverbEnabled  = fx->reverbEnabled;  p.reverbSize     = fx->reverbSize;
-                p.reverbDamp     = fx->reverbDamp;     p.reverbWet      = fx->reverbWet;
-                p.reverbPreDelay = fx->reverbPreDelay;
-                p.reverbDry      = fx->reverbDry;      p.reverbTail     = fx->reverbTail;
-                p.reverbHpNorm   = fx->reverbHpNorm;   p.reverbLpNorm   = fx->reverbLpNorm;
-                p.reverbWetBase  = fx->reverbWetBase;
-            }
-        }
-
-        //----------------------------------------------------------------------
-        // BIG DRUMS — the drum-side twin of overrideFx, and the same contract:
-        // takes the KIT's own rack and returns what should actually be sent.
-        //
-        //     macro off  ->  fx unchanged (the kit's private rack)
-        //     macro on   ->  fx replaced wholesale by the Big Drums preset
-        //
-        // The caller passes a COPY, so the kit's own rack is never written and
-        // switching Big Drums off restores it exactly.  Only the rack is
-        // swapped — per-key gain / pitch / round-robin and the kit's samples
-        // are untouched, because Big Drums is a rack character, not a kit.
-        //----------------------------------------------------------------------
-        template <typename DrumFxT>
-        void overrideDrumFx (DrumFxT& fx) const
-        {
-            const BigDrumsFxParams* d = drumPreset();
-            if (d == nullptr) return;                     // kit's own rack stays
-
-            fx.eqEnabled   = d->eqEnabled;   fx.satEnabled = d->satEnabled;
-            fx.compEnabled = d->compEnabled; fx.revEnabled = d->revEnabled;
-            fx.delEnabled  = d->delEnabled;
-
-            for (int i = 0; i < 10; ++i) fx.eqGainDb[i] = d->eqGainDb[i];
-
-            fx.satDrive = d->satDrive;  fx.satMix = d->satMix;
-
-            fx.compThreshDb  = d->compThreshDb;  fx.compRatio     = d->compRatio;
-            fx.compAttackMs  = d->compAttackMs;  fx.compReleaseMs = d->compReleaseMs;
-            fx.compMakeupDb  = d->compMakeupDb;
-
-            fx.revSize     = d->revSize;      fx.revDamp    = d->revDamp;
-            fx.revWet      = d->revWet;       fx.revDry     = d->revDry;
-            fx.revTail     = d->revTail;      fx.revPreDelay= d->revPreDelay;
-            fx.revHpNorm   = d->revHpNorm;    fx.revLpNorm  = d->revLpNorm;
-            fx.revAlgo     = d->revAlgo;      fx.revWetBase = d->revWetBase;
-
-            fx.delSync    = d->delSync;     fx.delTimeSig = d->delTimeSig;
-            fx.delDiv     = d->delDiv;      fx.delTimeMs  = d->delTimeMs;
-            fx.delFb      = d->delFb;       fx.delWet     = d->delWet;
-            fx.delDry     = d->delDry;      fx.delWetBase = d->delWetBase;
-
-            fx.pan   = d->pan;
-            fx.fxWet = d->fxWet;
+            // ── IT COPIES NOTHING NOW, AND THAT IS THE CHANGE ────────────────
+            //
+            //     STYLE INSTRUMENT  ->  FUNKEY  ->  CHANNEL EFFECTS
+            //
+            // Funkey's wah and phaser are a SEPARATE STAGE on the channel, ahead
+            // of the instrument's own chain - see Channel::applyFunkeyInPlace.
+            // They no longer overwrite the slot's own wah and phaser, so a slot
+            // KEEPS its private pair while the macro is on and the two run in
+            // series instead of one replacing the other.
+            //
+            // The function survives because it is the one place a caller asks
+            // "does the macro want to change this slot", and a future macro that
+            // DOES take a slot parameter over would live here.  Today it is a
+            // deliberate no-op.
+            juce::ignoreUnused (p, gmProgram);
         }
 
     private:
         std::array<FamilyFxParams, FunkeyFamilies::Count> fams {};
-        BigDrumsFxParams                                  drums {};
-        std::atomic<bool> funkeyOn   { false };
-        std::atomic<bool> bigDrumsOn { false };
+        std::atomic<bool> funkeyOn { false };
+        std::atomic<float> funkeyMixVal { kFunkeyMixDefault };
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GlobalMacros)
     };
 } // namespace Betel
-
-
