@@ -13,7 +13,7 @@
 //  Layout:
 //     +-------------------------------------------------------------------+
 //     |  [WELCOME][QUICK START][KEYBOARD][TEMPO][SECTIONS][STYLES][SOUNDS] |
-//     |  [MIXER  ][FINISHER   ][JUMPS   ][CRASH][SETS    ][SETTINGS]       |
+//     |  [DRUMS  ][MIXER      ][FINISHER][JUMPS][CRASH   ][SETS  ][SETTINGS]|
 //     |  +-------------------------------------------------------------+  |
 //     |  |  <chapter title>                                            |  |
 //     |  |  scrolling body text                                        |  |
@@ -355,7 +355,8 @@ private:
     // last slot is not squeezed or wrapped, it silently never gets a button.
     // Adding the FINISHER chapter took the count to 13 against 12 slots, which
     // would have made SETTINGS unreachable with nothing on screen to say why.
-    // 2 x 7 = 14 leaves a slot spare for the next one.
+    // DRUMS took the fourteenth and LAST slot of 2 x 7: the next chapter needs
+    // kSelectorCols raised to 8, or SETTINGS silently loses its button again.
     static constexpr int kSelectorCols   = 7;
     static constexpr int kSelectorRowGap = 4;
 
@@ -412,6 +413,16 @@ enough to perform with. The rest can wait until you want to change something.
 
     //--------------------------------------------------------------------------
     { "QUICK START", TutorialTab::parse (R"TXT(
+# First, the library
+
+Grex plays from a library folder that holds its sounds, styles and sets. On
+first launch it looks in Documents/Grex VSTI. The lamp in the banner at the top
+of the window tells you whether it found it: green is found, red is not.
+
+If it is red, press the yellow LOCATE SYSTEM FOLDER button under the lamp and
+point Grex at the folder that holds your library. The lamp turns green, and
+Grex remembers the place.
+
 # Five steps to your first sound
 
 - 1. Open the STYLES tab. Pick a genre from the row of folder buttons, then
@@ -765,12 +776,26 @@ If you want a slot to keep the sound YOU chose and ignore what the style asks
 for, use IGNORE PROGRAM CHANGE on that slot. Without it, loading a style is
 allowed to replace the voice.
 
-# The sound editor: four tabs
+# The sound editor: five tabs
 
+- SOUND ENGINE -- the built-in synthesizer behind the two synth basses.
 - SYNTHESIS -- envelopes, filter, allowed notes, and (on solo slots) GAIN.
 - MODULATION -- the LFOs, and ATTACK GLIDE.
 - EFFECT SENDS -- the five-band EQ, PAN, and three sends.
 - INSERTS -- wah, phaser and the sweetener.
+
+# The SOUND ENGINE
+
+Synth Bass 1 and Synth Bass 2 are not samples. Grex plays them on a built-in
+synthesizer, and the SOUND ENGINE tab is that synthesizer: two oscillators with
+FM, RING, SUB and NOISE, a DRIVE, and a filter -- CUTOFF, RESO, KEY, ENV and
+VEL -- with its own ATTACK, DECAY, SUSTAIN and RELEASE, then LEVEL.
+
+The other four tabs shape it exactly as they shape a sampled sound. On every
+other instrument the SOUND ENGINE tab simply tells you the sound plays samples.
+
+Your changes are saved with the set. A slot you never touch plays the factory
+sound, so it improves along with Grex.
 
 # Where the effects actually live
 
@@ -846,14 +871,10 @@ engineer's numbers:
 
 Each stage has its own button, so you can hear one at a time.
 
-# The drum rack
+# Drums
 
-A drum slot opens its own editor with six pages: EQ, SAT, COMP, SWEET, PAN and
-SENDS. Everything above about the global racks applies here too -- the drums
-have their own EQ, saturation, compressor, sweetener and pan, and they send to
-the same chorus, reverb and delay as the rest of the left hand.
-
-Right-click any key on the editor keyboard to hear that drum on its own.
+A drum slot opens its own editor instead of this window, and the drums have a
+chapter of their own: see DRUMS.
 
 # FUNKEY MODE
 
@@ -888,6 +909,16 @@ pages: WAH and PHASER. Nothing else, because nothing else is in this stage.
 There is no ON/OFF inside that window. The FUNKEY button on the play-control row
 is the only switch. To silence one effect for one family, set its MIX to zero.
 
+# FUNKEY MIX
+
+The small E in the top-left corner of the FUNKEY button opens one slider, MIX.
+It blends every funkeyed instrument's dry sound with its finished Funkey sound:
+0 is dry, 100 is full Funkey, and it starts at 50.
+
+It is saved with the SET, so every style keeps its own amount -- one style can
+want Funkey barely there and another soaked. A style that never saved one
+starts at 50. Clicking the E never switches Funkey on or off.
+
 # Presets
 
 - A solo sound saves as an .ins preset.
@@ -904,6 +935,75 @@ Everything you set on a style channel -- envelopes, filter, EQ, sends, inserts -
 belongs to the SET, not to the instrument that happens to be loaded. So when a
 style swaps an instrument mid-song, your voicing stays. The new sound arrives
 already shaped the way you shaped that channel.
+)TXT") },
+
+    //--------------------------------------------------------------------------
+    { "DRUMS", TutorialTab::parse (R"TXT(
+# Two kinds of kit
+
+- SAMPLED and COMPOSED kits are recorded drums. Most styles play one of these.
+- EDM KIT is synthesized, live. Dance styles that ask for an electronic kit get
+  it automatically, and you can choose it yourself in a drum slot's list.
+
+Press EDIT on a drum slot and the editor for the kit it holds opens.
+
+# The kit editor
+
+Across the top is one page per drum family: UNDER GM, LOWER GM, SOFT KICK,
+LOW KICK, KICK, STICK, SNARE, CLAP, CYMBALS, TOMS and REST GM. A page only
+appears when that family is in your library.
+
+On a family page:
+
+- GAIN and PITCH set the level and the tuning. The middle of each slider is the
+  drum exactly as recorded.
+- LENGTH shortens the drum's ring. At the top it rings in full.
+- FILTER is a band with two handles, one for the lows and one for the highs.
+- RR makes each hit slightly different from the last, so a fast part does not
+  sound machine-gunned. At zero every hit is identical.
+- The CURVE beside it decides how hard you have to hit for a loud drum.
+- REPLACE swaps the whole family for another set of samples.
+
+On a composed kit these settings apply to the family you are on. On a sampled
+kit they apply to the whole kit.
+
+Right-click any key on the editor's keyboard to hear that drum on its own.
+
+# KICK MIX
+
+On the kick pages, KICK MIX lays a second kick under the kit's own -- EDM for a
+tight electronic kick, WOOD for an acoustic one -- and MIX sets how much. It is
+OFF until you switch it on.
+
+# The kit rack
+
+Six pages act on the whole kit: EQ, SAT, COMP, SWEET, PAN and SENDS.
+
+The EQ has ten sliders, and each one owns its own octave of the kit, from 31 Hz
+to 16 kHz. The bottom of a slider silences its band, the middle leaves it as it
+is, and the top lifts it by up to 24 dB. With every slider in the middle the kit
+is untouched. It adds no delay at all.
+
+WET blends SAT and COMP against the dry kit. The EQ and the sweetener are not in
+that blend: they always act on the whole kit.
+
+SAVE AS DEFAULT keeps the kit as you have set it, as that kit's starting point.
+
+# The EDM KIT editor
+
+- KIT chooses one of the factory EDM kits. RELOAD FACTORY drops your edits.
+- The GRID shows every key as a pad, in its family's colour. Click a pad to hear
+  it, and press its E to edit it below. Its lamp lights whenever that key plays,
+  whether you or the style played it.
+- Below the grid, the pad's family, its sound and its CHOKE group, then a row of
+  tabs: MAIN with the eight macros and gain, the sound's own tabs, and FX for
+  its family's rack. Each tab's i button explains what it shapes.
+- HIT plays the selected pad. The higher you click on it, the harder it hits.
+
+Every change is live, and saved with the set.
+
+SAVE PAD AS BASE writes the pad, as it sounds now, into the kit itself -- so
+every set that uses this kit starts from it. Use it when you are sure.
 )TXT") },
 
     //--------------------------------------------------------------------------
@@ -1004,18 +1104,20 @@ finished mix, and DUCKER.
 
 # MASTER
 
-One chain, in order: a high-pass, a low shelf and an air shelf, a bass crossover
-with a weight control, stereo width, glue compression, auto level, drive, and a
-ceiling limiter with an output trim.
+The finished mix passes three stages, in this order:
 
-AMOUNT is a dry/wet across the whole chain, so you can dial the entire thing in
-and out with one control. Each stage also has its own tick to switch it off on
-its own.
+- PUSH drives the mix into the ceiling, 0 to 12 dB. It is the loudness control:
+  more push, a louder and denser mix.
+- COMP is a compressor on the whole mix, with THRESH, RATIO, ATTACK and RELEASE,
+  and a tick that switches it off. It starts at -14.9 dB, 2:1, 15 ms and 80 ms.
+- CEILING is the level the output never crosses, -3.0 to -0.1 dB. It cannot be
+  switched off: it is what keeps Grex from ever clipping.
 
-GR shows how much the chain is pulling the level down at any moment.
+OUTPUT trims the final level, plus or minus 12 dB, after everything else.
 
-A / B BYPASS compares the finished sound with the raw one. RESET puts every
-control back to the factory values.
+ON switches the Finisher in and out. GR shows how much it is pulling the level
+down at any moment. A / B BYPASS compares the finished sound with the raw one,
+and RESET puts every control back to the factory values.
 
 # DUCKER -- why it exists
 
@@ -1170,13 +1272,13 @@ not a property of one style.
 # What a set is
 
 A set is everything about how a style sounds in YOUR hands: the sounds on all
-sixteen channels, the mixer and its base trims, the jumps table, the style
-levels, ENERGY, the tempo offset, the ducker, and the global options saved with
+sixteen channels, the mixer and its base trims, the jumps table, ENERGY, the
+tempo offset, the ducker, FUNKEY and its MIX, and the global options saved with
 a song.
 
-Two things are deliberately NOT in it, because they describe your rig rather
-than a song: the SPLIT POINT and the SOLO VOLUME base unity. Those follow you
-from set to set and are saved on their own.
+Three things are deliberately NOT in it, because they describe your rig rather
+than a song: the SPLIT POINT, the SOLO VOLUME base unity and STYLE BOOST. Those
+follow you from set to set and are saved on their own.
 
 Every style ships with its own set, and loading a style loads it. This is why
 you did not have to configure anything to get a good sound in QUICK START.
@@ -1200,20 +1302,21 @@ not remember at the next gig.
 
 # The SET EDITOR
 
-The SET EDITOR is a page inside the SETTINGS tab now, alongside CONTROL NOTE MAP
-and the rest. It used to be a tab of its own; it is maintenance rather than
-performance, so it moved in with the other maintenance.
+The SET EDITOR is a page inside the SETTINGS tab, alongside CONTROL NOTE MAP and
+the rest. It is maintenance rather than performance, so it lives with the other
+maintenance.
 
-# BOOST
+# STYLE BOOST
 
-BOOST is the one level control that lives there: an overall gain for the whole
-band, 0 to 100, reaching up to +24 dB on the style bus. The default is 80.
+STYLE BOOST is the overall gain for the whole band, in dB: 0 to 24, in half-dB
+steps, starting at 12.5. It is ONE value for your whole installation rather than
+part of any set, so it sits on the GLOBAL SETTINGS page with the other rig
+settings. Moving it saves it -- there is nothing else to press.
 
-It is the only slider on that panel. FOLLOW PROGRAMMED GAINS is gone, and so are
-MAKEUP and IGNORE STYLE VOLUMES before it. All three existed to referee a fight
-between the style's levels and yours, and that fight no longer happens: the
-style states the base, your fader multiplies it afterwards, and there is nothing
-left to blend between. See the MIXER chapter.
+FOLLOW PROGRAMMED GAINS, MAKEUP and IGNORE STYLE VOLUMES are gone. All three
+existed to referee a fight between the style's levels and yours, and that fight
+no longer happens: the style states the base, your fader multiplies it
+afterwards, and there is nothing left to blend between. See the MIXER chapter.
 
 # BAKE MISSING and REBUILD ALL
 
@@ -1291,7 +1394,7 @@ mapping is never lost to a closed window.
 
 # GLOBAL SETTINGS
 
-Two buttons and two settings.
+Two buttons and three settings.
 
 - FUNKEY MODE opens the macro editor -- the six instrument families, each with
   its own wah and phaser. See the SOUNDS chapter. The button here only OPENS the
@@ -1303,19 +1406,18 @@ Two buttons and two settings.
 - LOW VELOCITY RESPONSE lifts your softest playing on the solo channels, 0 to
   100, where 0 is off. It is a correction for a keyboard that plays light, not a
   voicing, which is why it sits here and not in the sound editor.
+- STYLE BOOST is the overall gain for the whole band, 0 to 24 dB. See the SETS
+  chapter.
 
-Both settings apply to the RIGHT HAND only, and both belong to your rig rather
-than to a song.
+PITCH BEND RANGE and LOW VELOCITY RESPONSE apply to the RIGHT HAND only. All
+three belong to your rig rather than to a song.
 
 # Where things are saved
 
 - Set files hold everything that belongs to a SONG.
-- The split point, the solo base unity, the pitch bend range, the low velocity
-  response, the MIDI assignments, the crash settings and the global macros
-  belong to the RIG, and are saved once for the whole plugin.
+- The split point, the solo base unity, STYLE BOOST, the pitch bend range, the
+  low velocity response, the MIDI assignments, the crash settings and the
+  Funkey family presets belong to the RIG, and are saved once for the whole
+  plugin.
 )TXT") },
 };
-
-
-
-
